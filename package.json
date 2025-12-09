@@ -1,7 +1,7 @@
 {
   "name": "sl-vehicle-api",
   "version": "1.0.0",
-  "description": "Simple key-value API for Second Life vehicles using PostgreSQL",
+  "description": "Simple key-value API for Second Life vehicles",
   "type": "module",
   "main": "index.js",
   "scripts": {
