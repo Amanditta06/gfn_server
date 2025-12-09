@@ -1,39 +1,26 @@
-// index.js - simple REST API for SL vehicles
+// index.js - REST API para SL usando PostgreSQL
 import express from "express";
 import bodyParser from "body-parser";
-import fs from "fs";
-import path from "path";
 import cors from "cors";
+import pkg from "pg";
+
+const { Pool } = pkg;
 
 const app = express();
 app.use(bodyParser.json());
-app.use(cors()); // optional - allows browser testing
+app.use(cors());
 
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || "changeme";
-const DB_FILE = path.join(process.cwd(), "db.json");
+const DATABASE_URL = process.env.DATABASE_URL;
 
-// Load DB (simple file persistence)
-let db = {};
-try {
-  if (fs.existsSync(DB_FILE)) {
-    const content = fs.readFileSync(DB_FILE, "utf8");
-    db = content ? JSON.parse(content) : {};
-  }
-} catch (e) {
-  console.error("Error loading DB:", e);
-  db = {};
-}
+// Conexão com PostgreSQL
+const db = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+});
 
-function saveDB() {
-  try {
-    fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2), "utf8");
-  } catch (e) {
-    console.error("Error saving DB:", e);
-  }
-}
-
-// Middleware to require token in header 'x-api-token'
+// Middleware para validar token
 function requireToken(req, res, next) {
   const token = req.header("x-api-token");
   if (!token || token !== API_TOKEN) {
@@ -42,35 +29,66 @@ function requireToken(req, res, next) {
   next();
 }
 
-// GET /get?id=CARID  -> returns { id, value }
-app.get("/get", (req, res) => {
+// GET /get?id=xxx
+app.get("/get", async (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: "missing id" });
-  const value = db[id] === undefined ? null : db[id];
-  return res.json({ id, value });
+
+  try {
+    const q = await db.query(
+      "SELECT value FROM kvstore WHERE id=$1",
+      [id]
+    );
+
+    const value = q.rowCount === 0 ? null : q.rows[0].value;
+
+    res.json({ id, value });
+
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "db error" });
+  }
 });
 
-// POST /set  -> body { id, value }  (requires token)
-app.post("/set", requireToken, (req, res) => {
+// POST /set   → body { id, value }
+app.post("/set", requireToken, async (req, res) => {
   const { id, value } = req.body;
   if (!id) return res.status(400).json({ error: "missing id" });
-  db[id] = value;
-  saveDB();
-  return res.json({ status: "ok", id, value });
+
+  try {
+    await db.query(
+      `INSERT INTO kvstore (id, value)
+       VALUES ($1, $2)
+       ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`,
+      [id, value]
+    );
+
+    res.json({ status: "ok", id, value });
+
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "db error" });
+  }
 });
 
-// DELETE /del?id=CARID  (requires token)
-app.delete("/del", requireToken, (req, res) => {
+// DELETE /del?id=xxx
+app.delete("/del", requireToken, async (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: "missing id" });
-  delete db[id];
-  saveDB();
-  return res.json({ status: "deleted", id });
+
+  try {
+    await db.query("DELETE FROM kvstore WHERE id=$1", [id]);
+    res.json({ status: "deleted", id });
+
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "db error" });
+  }
 });
 
-// Health
+// Healthcheck
 app.get("/", (req, res) => res.json({ status: "ok" }));
 
 app.listen(PORT, () => {
-  console.log(`API running on port ${PORT}`);
+  console.log("API running on port", PORT);
 });
