@@ -14,11 +14,36 @@ const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || "changeme";
 const DATABASE_URL = process.env.DATABASE_URL;
 
+// Se DATABASE_URL não estiver setado, o app tenta rodar (útil p/ dev local)
+// mas as rotas que acessam DB vão falhar até você setar a variável.
+if (!DATABASE_URL) {
+  console.warn("WARNING: DATABASE_URL not set. DB calls will fail until it's configured.");
+}
+
 // Conexão com PostgreSQL
 const db = new Pool({
   connectionString: DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: DATABASE_URL ? { rejectUnauthorized: false } : undefined
 });
+
+// Cria a tabela kvstore caso não exista (id TEXT PRIMARY KEY, value TEXT)
+async function ensureTable() {
+  if (!DATABASE_URL) return;
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS kvstore (
+        id TEXT PRIMARY KEY,
+        value TEXT
+      );
+    `);
+    console.log("kvstore table ready");
+  } catch (e) {
+    console.error("Error ensuring kvstore table:", e);
+  }
+}
+
+// chama no startup
+ensureTable();
 
 // Middleware para validar token
 function requireToken(req, res, next) {
@@ -35,15 +60,9 @@ app.get("/get", async (req, res) => {
   if (!id) return res.status(400).json({ error: "missing id" });
 
   try {
-    const q = await db.query(
-      "SELECT value FROM kvstore WHERE id=$1",
-      [id]
-    );
-
+    const q = await db.query("SELECT value FROM kvstore WHERE id=$1", [id]);
     const value = q.rowCount === 0 ? null : q.rows[0].value;
-
     res.json({ id, value });
-
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "db error" });
@@ -64,7 +83,6 @@ app.post("/set", requireToken, async (req, res) => {
     );
 
     res.json({ status: "ok", id, value });
-
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "db error" });
@@ -79,7 +97,6 @@ app.delete("/del", requireToken, async (req, res) => {
   try {
     await db.query("DELETE FROM kvstore WHERE id=$1", [id]);
     res.json({ status: "deleted", id });
-
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "db error" });
