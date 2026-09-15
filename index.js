@@ -106,6 +106,35 @@ app.delete("/del", requireToken, async (req, res) => {
 // Healthcheck
 app.get("/", (req, res) => res.json({ status: "ok" }));
 
+
+// ==========================================
+// SISTEMA DE VISITANTES ONLINE (EM MEMÓRIA)
+// ==========================================
+const activeVisitors = new Map();
+const VISITOR_TIMEOUT = 15000; // 15 segundos para expirar
+
+app.post("/ping-visitor", (req, res) => {
+  const { visitorId } = req.body;
+  if (!visitorId) return res.status(400).json({ error: "missing visitorId" });
+
+  const now = Date.now();
+  // Atualiza o "último visto" deste visitante
+  activeVisitors.set(visitorId, now);
+
+  // Limpa quem fechou o site (sem ping há mais de 15s) e conta os ativos
+  let currentCount = 0;
+  activeVisitors.forEach((lastSeen, id) => {
+    if (now - lastSeen > VISITOR_TIMEOUT) {
+      activeVisitors.delete(id);
+    } else {
+      currentCount++;
+    }
+  });
+
+  res.json({ count: currentCount });
+});
+
+
 app.listen(PORT, () => {
   console.log("API running on port", PORT);
 });
