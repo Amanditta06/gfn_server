@@ -22,9 +22,6 @@ const db = new Pool({
   ssl: DATABASE_URL ? { rejectUnauthorized: false } : undefined
 });
 
-// ==========================================
-// REGRAS DE NEGÓCIO GFN (LIMITES DINÂMICOS)
-// ==========================================
 let MAX_TC = 5000;
 let MAX_EV = 5000;
 let MAX_F = 2000;
@@ -34,11 +31,9 @@ async function loadGlobalSettings() {
     const res = await db.query("SELECT value FROM kvstore WHERE id=$1", ["GLOBAL_SETTINGS"]);
     if (res.rowCount > 0 && res.rows[0].value) {
       const parts = res.rows[0].value.split("|");
-      // Os índices 0 ao 5 são da carga, os índices 6, 7 e 8 são os limites do servidor!
       if (parts[6] !== undefined && !isNaN(parseInt(parts[6]))) MAX_TC = parseInt(parts[6]);
       if (parts[7] !== undefined && !isNaN(parseInt(parts[7]))) MAX_EV = parseInt(parts[7]);
       if (parts[8] !== undefined && !isNaN(parseInt(parts[8]))) MAX_F = parseInt(parts[8]);
-      console.log(`Global limits synced: TC=${MAX_TC}, EV=${MAX_EV}, F=${MAX_F}`);
     }
   } catch (e) {
     console.error("Error loading settings:", e);
@@ -55,7 +50,6 @@ async function ensureTable() {
       );
     `);
     console.log("kvstore table ready");
-    // Carrega as configurações na memória após o DB estar pronto
     await loadGlobalSettings(); 
   } catch (e) {
     console.error("Error ensuring kvstore table:", e);
@@ -71,9 +65,6 @@ function requireToken(req, res, next) {
   next();
 }
 
-// ==========================================
-// SISTEMA DE FILA DE MENSAGENS (UUID + "_MSG")
-// ==========================================
 async function addPlayerMessage(uuid, msg) {
   const keyId = `${uuid}_MSG`;
   try {
@@ -88,7 +79,7 @@ async function addPlayerMessage(uuid, msg) {
       [keyId, JSON.stringify(messages)]
     );
   } catch (e) {
-    console.error("Error adding message to queue:", e);
+    console.error("Error adding message:", e);
   }
 }
 
@@ -101,7 +92,6 @@ app.get("/get-msg", async (req, res) => {
     const messages = (q.rowCount > 0 && q.rows[0].value) ? JSON.parse(q.rows[0].value) : [];
     res.json({ messages });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ error: "db error" });
   }
 });
@@ -114,18 +104,18 @@ app.post("/ack-msg", async (req, res) => {
     await db.query("DELETE FROM kvstore WHERE id=$1", [keyId]);
     res.json({ status: "cleared" });
   } catch (e) {
-    console.error(e);
     res.status(500).json({ error: "db error" });
   }
 });
 
+// SINCRONIZAÇÃO DE SEMANA (Offset de 345600 = Segunda-Feira)
 const getUnixTime = () => Math.floor(Date.now() / 1000);
-const getCurrentWeek = () => Math.floor((getUnixTime() + 259200) / 604800);
+const getCurrentWeek = () => Math.floor((getUnixTime() + 345600) / 604800);
 
 async function getPlayerData(uuid) {
   if (!uuid) return null;
   const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [`player_${uuid}`]);
-  let data = { M: 0, P: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0 };
+  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0 };
   if (res.rowCount > 0) {
     try { data = { ...data, ...JSON.parse(res.rows[0].value) }; } catch(e) {}
   }
@@ -150,6 +140,13 @@ app.post("/action", requireToken, async (req, res) => {
       let recebido = 0;
       let boost_m = 1.0;
       let now = getUnixTime();
+      let currentWeek = getCurrentWeek();
+
+      // ZERO OS PONTOS SE FOR UMA NOVA SEMANA! (Garante o Rank Semanal)
+      if (player.P_W !== currentWeek) {
+        player.P = 0;
+        player.P_W = currentWeek;
+      }
 
       if (player.B_T > now) {
         boost_m = parseFloat(player.B_M) || 1.0;
@@ -181,9 +178,7 @@ app.post("/action", requireToken, async (req, res) => {
         await addPlayerMessage(user, `You have now ${player.M} F₵.`);
       } 
       else if (plan === "TEST_CARGO") {
-        let currentWeek = getCurrentWeek();
         if (player.TC_W !== currentWeek) { player.TC_V = 0; player.TC_W = currentWeek; }
-
         if (player.TC_V >= MAX_TC) {
           await addPlayerMessage(user, `You have reached the limit of ${MAX_TC} F₵ in your test cargo plan this week, please use non-TEST_CARGO cargos to have no limits.`);
         } else {
@@ -207,9 +202,7 @@ app.post("/action", requireToken, async (req, res) => {
         await addPlayerMessage(user, `You have now ${player.M} F₵.`);
       } 
       else if (plan === "EVENT") {
-        let currentWeek = getCurrentWeek();
         if (player.EV_W !== currentWeek) { player.EV_V = 0; player.EV_W = currentWeek; }
-
         if (player.EV_V >= MAX_EV) {
           await addPlayerMessage(user, `You have reached the limit of ${MAX_EV} F₵ in your event plan this week, please use non-EVENT cargos to have no limits.`);
         } else {
@@ -283,7 +276,38 @@ app.post("/action", requireToken, async (req, res) => {
   }
 });
 
-// Rotas clássicas GET/SET
+// ==========================================
+// NOVA ROTA: O NODE.JS CALCULA O RANKING SOZINHO!
+// ==========================================
+app.get("/get-rank", async (req, res) => {
+  try {
+    const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
+    let players = [];
+    let currentWeek = getCurrentWeek();
+
+    for (let row of q.rows) {
+      try {
+        let data = JSON.parse(row.value);
+        // Filtra EXATAMENTE quem tem pontos E se os pontos são dessa semana
+        if (data.P_W === currentWeek && data.P && data.P > 0) {
+          let uuid = row.id.replace("player_", "");
+          players.push({ uuid, points: data.P });
+        }
+      } catch(e) {}
+    }
+
+    // Ordena do maior pro menor
+    players.sort((a, b) => b.points - a.points);
+    
+    // Retorna apenas os top 5 para o SL (corta o processamento do LSL pra zero!)
+    let top5 = players.slice(0, 5);
+    res.json({ status: "success", top: top5 });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "db error" });
+  }
+});
+
 app.get("/get", async (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: "missing id" });
@@ -304,12 +328,9 @@ app.post("/set", requireToken, async (req, res) => {
       `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`,
       [id, value]
     );
-    
-    // MÁGICA: Se o que salvou foi o GLOBAL_SETTINGS, recarrega a RAM do Node na mesma hora!
     if (id === "GLOBAL_SETTINGS") {
         await loadGlobalSettings();
     }
-    
     res.json({ status: "ok", id, value });
   } catch (e) {
     res.status(500).json({ error: "db error" });
