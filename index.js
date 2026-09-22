@@ -110,7 +110,6 @@ app.post("/ack-msg", async (req, res) => {
   }
 });
 
-// CÁLCULO DE SEMANA: Offset 345600 faz a virada exata aos Domingos 00:00 UTC
 const getUnixTime = () => Math.floor(Date.now() / 1000);
 const getCurrentWeek = () => Math.floor((getUnixTime() + 345600) / 604800);
 
@@ -133,6 +132,7 @@ async function savePlayerData(uuid, data) {
 
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime } = req.body;
+  let targetUuid = target || plan; // Captura o alvo enviado pelo HUD (tanto em target quanto em plan)
   let responsePayload = { status: "success" };
 
   try {
@@ -144,7 +144,6 @@ app.post("/action", requireToken, async (req, res) => {
       let now = getUnixTime();
       let currentWeek = getCurrentWeek();
 
-      // Zera os pontos automaticamente se virou a semana (Domingo 00:00)
       if (player.P_W !== currentWeek) {
         player.P = 0;
         player.P_W = currentWeek;
@@ -246,7 +245,7 @@ app.post("/action", requireToken, async (req, res) => {
     } 
     else if (topic === "addBoost") {
       let add_mult = parseFloat(content) || 1.0;
-      let add_time = parseInt(target) || 0;
+      let add_time = parseInt(targetUuid) || 0;
       let player = await getPlayerData(user);
       let now = getUnixTime();
       let current_time = player.B_T;
@@ -261,6 +260,33 @@ app.post("/action", requireToken, async (req, res) => {
       await addPlayerMessage(user, `You have ${player.M} F₵.`);
       await addPlayerMessage(user, `You have ${player.P} GFN points this week.`);
     }
+    // --- NOVOS TÓPICOS PARA O ADMIN HUD ---
+    else if (topic === "godCheck") {
+      let tPlayer = await getPlayerData(targetUuid);
+      await addPlayerMessage(user, `Target (${targetUuid}) Balance: ${tPlayer.M} F₵ | Points: ${tPlayer.P}`);
+    }
+    else if (topic === "M_RESET") {
+      let tPlayer = await getPlayerData(targetUuid);
+      tPlayer.M = parseInt(content) || 0;
+      await savePlayerData(targetUuid, tPlayer);
+      await addPlayerMessage(user, `Money reset for ${targetUuid}. New balance: ${tPlayer.M} F₵`);
+      await addPlayerMessage(targetUuid, `Your money balance was reset by an administrator.`);
+    }
+    else if (topic === "P_RESET") {
+      let tPlayer = await getPlayerData(targetUuid);
+      tPlayer.P = parseInt(content) || 0;
+      await savePlayerData(targetUuid, tPlayer);
+      await addPlayerMessage(user, `Points reset for ${targetUuid}. New points: ${tPlayer.P}`);
+      await addPlayerMessage(targetUuid, `Your GFN points were reset by an administrator.`);
+    }
+    else if (topic === "pay") {
+      let amountVal = parseInt(content) || 0;
+      let tPlayer = await getPlayerData(targetUuid);
+      tPlayer.M += amountVal;
+      await savePlayerData(targetUuid, tPlayer);
+      await addPlayerMessage(user, `Successfully adjusted balance of ${targetUuid} by ${amountVal} F₵. New balance: ${tPlayer.M} F₵`);
+      await addPlayerMessage(targetUuid, `Your balance was adjusted by ${amountVal} F₵ by an administrator. Current balance: ${tPlayer.M} F₵`);
+    }
 
     res.json(responsePayload);
   } catch (err) {
@@ -269,7 +295,6 @@ app.post("/action", requireToken, async (req, res) => {
   }
 });
 
-// ROTA EXCLUSIVA PARA A PLACA MESH BUSCAR O TOP 5 ATUAL DA SEMANA
 app.get("/get-rank", async (req, res) => {
   try {
     const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
