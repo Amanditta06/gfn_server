@@ -296,6 +296,41 @@ app.post("/action", requireToken, async (req, res) => {
       await addPlayerMessage(user, `Successfully adjusted balance of ${targetUuid} by ${amountVal} F₵. New balance: ${tPlayer.M} F₵`);
       await addPlayerMessage(targetUuid, `Your balance was adjusted by ${amountVal} F₵ by an administrator. Current balance: ${tPlayer.M} F₵`);
     }
+    // --- RESET EM MASSA CUSTOMIZÁVEL COM MENSAGEM ---
+    else if (topic === "MASS_MONEY_RESET_CUSTOM") {
+      const maxValue = parseInt(content) || 0;
+      const alertMessage = plan;
+      
+      const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
+      let affected = 0;
+      
+      for (let row of q.rows) {
+        try {
+          let pData = JSON.parse(row.value);
+          
+          if (pData.M > maxValue) {
+              pData.M = maxValue;
+              
+              // 1. Salva a correção no banco de dados
+              await db.query("UPDATE kvstore SET value = $1 WHERE id = $2", [JSON.stringify(pData), row.id]);
+              
+              // 2. Extrai a UUID do jogador (removendo o "player_")
+              let playerUuid = row.id.replace("player_", "");
+              
+              // 3. Coloca a mensagem na fila de recados DESTE jogador afetado
+              await addPlayerMessage(playerUuid, alertMessage);
+              
+              affected++;
+          }
+        } catch(e) {
+          console.error("Erro ao analisar dados do jogador no RESET:", e);
+        }
+      }
+      
+      // Envia o aviso de finalização para a SUA fila de mensagens (Admin)
+      await addPlayerMessage(user, `VARREDURA CONCLUÍDA! ${affected} contas foram limitadas a ${maxValue} F₵ e notificadas.`);
+      responsePayload.status = "success";
+    }
     // ==========================================
     // --- LÓGICA DO VENDOR E REFILL AQUI ---
     // ==========================================
