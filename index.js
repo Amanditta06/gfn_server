@@ -25,6 +25,7 @@ const db = new Pool({
 let MAX_TC = 5000;
 let MAX_EV = 5000;
 let MAX_F = 2000;
+let MAX_TRANSACTION = 1000000; // Limite global de segurança contra hackers (1 Milhão)
 
 async function loadGlobalSettings() {
   try {
@@ -138,6 +139,10 @@ app.post("/action", requireToken, async (req, res) => {
   try {
     if (topic === "cargo sell") {
       let price = parseInt(content) || 0;
+      
+      // TRAVA DE SEGURANÇA (Evita hacks de HUD enviando valores bilionários)
+      if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
+
       let player = await getPlayerData(user);
       let recebido = 0;
       let boost_m = 1.0;
@@ -281,11 +286,71 @@ app.post("/action", requireToken, async (req, res) => {
     }
     else if (topic === "pay") {
       let amountVal = parseInt(content) || 0;
+      
+      // TRAVA DE SEGURANÇA NO PAGAMENTO (Admin não pode dar mais de 1M por vez)
+      if (amountVal > MAX_TRANSACTION) amountVal = MAX_TRANSACTION;
+      
       let tPlayer = await getPlayerData(targetUuid);
       tPlayer.M += amountVal;
       await savePlayerData(targetUuid, tPlayer);
       await addPlayerMessage(user, `Successfully adjusted balance of ${targetUuid} by ${amountVal} F₵. New balance: ${tPlayer.M} F₵`);
       await addPlayerMessage(targetUuid, `Your balance was adjusted by ${amountVal} F₵ by an administrator. Current balance: ${tPlayer.M} F₵`);
+    }
+    // ==========================================
+    // --- LÓGICA DO VENDOR E REFILL AQUI ---
+    // ==========================================
+    else if (topic === "buy") {
+      let price = parseInt(content) || 0;
+      
+      // Impede compra acima do limite de 1 milhão
+      if (price > MAX_TRANSACTION) {
+        responsePayload.status = "denied";
+        await addPlayerMessage(user, `Purchase blocked! You cannot spend more than ${MAX_TRANSACTION} F₵ in a single transaction.`);
+        return res.json(responsePayload);
+      }
+      
+      let buyer = await getPlayerData(user);
+      let ownerUuid = targetUuid;
+      
+      if (buyer.M < price) {
+        await addPlayerMessage(user, `You don't have enough F₵. Required: ${price}, You have: ${buyer.M}`);
+        responsePayload.status = "denied";
+      } else {
+        buyer.M -= price;
+        await savePlayerData(user, buyer);
+        await addPlayerMessage(user, `You successfully bought ${plan} for ${price} F₵. Balance: ${buyer.M} F₵`);
+        
+        // Repassa o valor para o dono da máquina
+        if (ownerUuid && ownerUuid !== user) {
+          let ownerData = await getPlayerData(ownerUuid);
+          ownerData.M += price;
+          await savePlayerData(ownerUuid, ownerData);
+          await addPlayerMessage(ownerUuid, `Your vending machine sold ${plan} for ${price} F₵. Balance: ${ownerData.M} F₵`);
+        }
+        responsePayload.status = "success";
+      }
+    }
+    else if (topic === "refillPay") {
+      let cost = parseInt(content) || 0;
+      
+      // Impede recarga acima do limite de 1 milhão
+      if (cost > MAX_TRANSACTION) {
+        responsePayload.status = "denied";
+        await addPlayerMessage(user, `Refill blocked! Cost exceeds the single transaction limit of ${MAX_TRANSACTION} F₵.`);
+        return res.json(responsePayload);
+      }
+      
+      let owner = await getPlayerData(user);
+      
+      if (owner.M < cost) {
+        await addPlayerMessage(user, `You don't have enough F₵ to refill. Required: ${cost}, You have: ${owner.M}`);
+        responsePayload.status = "denied";
+      } else {
+        owner.M -= cost;
+        await savePlayerData(user, owner);
+        await addPlayerMessage(user, `Refill paid: ${cost} F₵. Balance: ${owner.M} F₵`);
+        responsePayload.status = "ok";
+      }
     }
 
     res.json(responsePayload);
