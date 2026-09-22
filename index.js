@@ -92,6 +92,7 @@ app.get("/get-msg", async (req, res) => {
     const messages = (q.rowCount > 0 && q.rows[0].value) ? JSON.parse(q.rows[0].value) : [];
     res.json({ messages });
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: "db error" });
   }
 });
@@ -104,11 +105,12 @@ app.post("/ack-msg", async (req, res) => {
     await db.query("DELETE FROM kvstore WHERE id=$1", [keyId]);
     res.json({ status: "cleared" });
   } catch (e) {
+    console.error(e);
     res.status(500).json({ error: "db error" });
   }
 });
 
-// SINCRONIZAÇÃO DE SEMANA (Offset de 345600 = Segunda-Feira)
+// CÁLCULO DE SEMANA: Offset 345600 faz a virada exata aos Domingos 00:00 UTC
 const getUnixTime = () => Math.floor(Date.now() / 1000);
 const getCurrentWeek = () => Math.floor((getUnixTime() + 345600) / 604800);
 
@@ -142,7 +144,7 @@ app.post("/action", requireToken, async (req, res) => {
       let now = getUnixTime();
       let currentWeek = getCurrentWeek();
 
-      // ZERO OS PONTOS SE FOR UMA NOVA SEMANA! (Garante o Rank Semanal)
+      // Zera os pontos automaticamente se virou a semana (Domingo 00:00)
       if (player.P_W !== currentWeek) {
         player.P = 0;
         player.P_W = currentWeek;
@@ -180,21 +182,18 @@ app.post("/action", requireToken, async (req, res) => {
       else if (plan === "TEST_CARGO") {
         if (player.TC_W !== currentWeek) { player.TC_V = 0; player.TC_W = currentWeek; }
         if (player.TC_V >= MAX_TC) {
-          await addPlayerMessage(user, `You have reached the limit of ${MAX_TC} F₵ in your test cargo plan this week, please use non-TEST_CARGO cargos to have no limits.`);
+          await addPlayerMessage(user, `You have reached the limit of ${MAX_TC} F₵ in your test cargo plan this week.`);
         } else {
           if (player.TC_V + price >= MAX_TC) {
             let resto = MAX_TC - player.TC_V;
             player.TC_V = MAX_TC;
             player.M += resto;
             recebido = resto;
-            if (boost_m > 1.0) await addPlayerMessage(user, `Cargo value boosted by ${boost_m}X!`);
             await addPlayerMessage(user, `You won ${resto} F₵.`);
-            await addPlayerMessage(user, `You have reached the limit of ${MAX_TC} F₵ in your test cargo plan this week, please use non-TEST_CARGO cargos to have no limits.`);
           } else {
             player.TC_V += price;
             player.M += price;
             recebido = price;
-            if (boost_m > 1.0) await addPlayerMessage(user, `Cargo value boosted by ${boost_m}X!`);
             await addPlayerMessage(user, `You won ${price} F₵.`);
           }
         }
@@ -204,21 +203,18 @@ app.post("/action", requireToken, async (req, res) => {
       else if (plan === "EVENT") {
         if (player.EV_W !== currentWeek) { player.EV_V = 0; player.EV_W = currentWeek; }
         if (player.EV_V >= MAX_EV) {
-          await addPlayerMessage(user, `You have reached the limit of ${MAX_EV} F₵ in your event plan this week, please use non-EVENT cargos to have no limits.`);
+          await addPlayerMessage(user, `You have reached the limit of ${MAX_EV} F₵ in your event plan this week.`);
         } else {
           if (player.EV_V + price >= MAX_EV) {
             let resto = MAX_EV - player.EV_V;
             player.EV_V = MAX_EV;
             player.M += resto;
             recebido = resto;
-            if (boost_m > 1.0) await addPlayerMessage(user, `Cargo value boosted by ${boost_m}X!`);
             await addPlayerMessage(user, `You won ${resto} F₵.`);
-            await addPlayerMessage(user, `You have reached the limit of ${MAX_EV} F₵ in your event plan this week, please use non-EVENT cargos to have no limits.`);
           } else {
             player.EV_V += price;
             player.M += price;
             recebido = price;
-            if (boost_m > 1.0) await addPlayerMessage(user, `Cargo value boosted by ${boost_m}X!`);
             await addPlayerMessage(user, `You won ${price} F₵.`);
           }
         }
@@ -227,21 +223,18 @@ app.post("/action", requireToken, async (req, res) => {
       } 
       else if (plan === "FREE") {
         if (player.RE >= MAX_F) {
-          await addPlayerMessage(user, `You have reached the limit of ${MAX_F} F₵ in your free plan, please use non-FREE cargos to have no limits.`);
+          await addPlayerMessage(user, `You have reached the limit of ${MAX_F} F₵ in your free plan.`);
         } else {
           if (player.RE + price >= MAX_F) {
             let resto = MAX_F - player.RE;
             player.RE = MAX_F;
             player.M += resto;
             recebido = resto;
-            if (boost_m > 1.0) await addPlayerMessage(user, `Cargo value boosted by ${boost_m}X!`);
             await addPlayerMessage(user, `You won ${resto} F₵.`);
-            await addPlayerMessage(user, `You have reached the limit of ${MAX_F} F₵ in your free plan, please use non-FREE cargos to have no limits.`);
           } else {
             player.RE += price;
             player.M += price;
             recebido = price;
-            if (boost_m > 1.0) await addPlayerMessage(user, `Cargo value boosted by ${boost_m}X!`);
             await addPlayerMessage(user, `You won ${price} F₵.`);
           }
         }
@@ -276,9 +269,7 @@ app.post("/action", requireToken, async (req, res) => {
   }
 });
 
-// ==========================================
-// NOVA ROTA: O NODE.JS CALCULA O RANKING SOZINHO!
-// ==========================================
+// ROTA EXCLUSIVA PARA A PLACA MESH BUSCAR O TOP 5 ATUAL DA SEMANA
 app.get("/get-rank", async (req, res) => {
   try {
     const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
@@ -288,7 +279,6 @@ app.get("/get-rank", async (req, res) => {
     for (let row of q.rows) {
       try {
         let data = JSON.parse(row.value);
-        // Filtra EXATAMENTE quem tem pontos E se os pontos são dessa semana
         if (data.P_W === currentWeek && data.P && data.P > 0) {
           let uuid = row.id.replace("player_", "");
           players.push({ uuid, points: data.P });
@@ -296,10 +286,7 @@ app.get("/get-rank", async (req, res) => {
       } catch(e) {}
     }
 
-    // Ordena do maior pro menor
     players.sort((a, b) => b.points - a.points);
-    
-    // Retorna apenas os top 5 para o SL (corta o processamento do LSL pra zero!)
     let top5 = players.slice(0, 5);
     res.json({ status: "success", top: top5 });
   } catch (e) {
