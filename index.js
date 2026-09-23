@@ -172,6 +172,25 @@ app.post("/action", requireToken, async (req, res) => {
           responsePayload.newBuyer = true;
         }
 
+        // --- ADICIONAR O JOGADOR À LISTA DE BUYERS (GFN_BUYERS) ---
+        try {
+          const buyersRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["GFN_BUYERS"]);
+          let buyersList = [];
+          if (buyersRes.rowCount > 0 && buyersRes.rows[0].value) {
+            buyersList = buyersRes.rows[0].value.split(",").filter(Boolean);
+          }
+          if (!buyersList.includes(user)) {
+            buyersList.push(user);
+            await db.query(
+              `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`,
+              ["GFN_BUYERS", buyersList.join(",")]
+            );
+          }
+        } catch (e) {
+          console.error("Error updating GFN_BUYERS:", e);
+        }
+        // -----------------------------------------------------------
+
         let premiumBonus = 0;
         if (plan === "PREMIUM") {
           if (price <= 0) price = 1;
