@@ -41,6 +41,18 @@ async function loadGlobalSettings() {
   }
 }
 
+// === NOVO: Limpa todas as filas de mensagens ao iniciar o servidor ===
+async function clearAllMessageQueues() {
+  if (!DATABASE_URL) return;
+  try {
+    const res = await db.query("DELETE FROM kvstore WHERE id LIKE '%_MSG'");
+    console.log(`🧹 Limpeza de Boot: ${res.rowCount} filas de mensagens antigas foram apagadas com sucesso!`);
+  } catch (e) {
+    console.error("Error clearing message queues on reboot:", e);
+  }
+}
+// ======================================================================
+
 async function ensureTable() {
   if (!DATABASE_URL) return;
   try {
@@ -52,6 +64,9 @@ async function ensureTable() {
     `);
     console.log("kvstore table ready");
     await loadGlobalSettings(); 
+    
+    // Executa a limpeza geral de mensagens sempre que o servidor ligar
+    await clearAllMessageQueues();
   } catch (e) {
     console.error("Error ensuring kvstore table:", e);
   }
@@ -169,7 +184,14 @@ async function addPlayerMessage(uuid, msg) {
     if (res.rowCount > 0 && res.rows[0].value) {
       try { messages = JSON.parse(res.rows[0].value); } catch(e) {}
     }
+    
     messages.push(msg);
+    
+    // OTIMIZAÇÃO: Trava de segurança para não "entupir" a fila do jogador e quebrar o JSON no Second Life
+    if (messages.length > 20) {
+        messages = messages.slice(-20); // Mantém apenas as 20 mais recentes
+    }
+    
     await db.query(
       `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`,
       [keyId, JSON.stringify(messages)]
