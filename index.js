@@ -58,6 +58,78 @@ async function ensureTable() {
 }
 ensureTable();
 
+const getUnixTime = () => Math.floor(Date.now() / 1000);
+const getCurrentWeek = () => Math.floor((getUnixTime() + 345600) / 604800);
+
+// ========================================================
+// --- GFN AUTO WEEKLY ROLLOVER & GLOBAL HALL OF FAME ---
+// ========================================================
+let activeServerWeek = getCurrentWeek();
+
+setInterval(async () => {
+  let currentNowWeek = getCurrentWeek();
+  
+  if (currentNowWeek !== activeServerWeek) {
+    try {
+      console.log("Week Rollover Detected! Archiving Last Week and processing Global Hall of Fame...");
+      
+      const oldRankRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["weeklyTopFive"]);
+      let oldRank = oldRankRes.rowCount > 0 ? oldRankRes.rows[0].value : "";
+
+      if (oldRank && oldRank.length > 5 && !oldRank.includes("Waiting")) {
+        await db.query(
+          `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, 
+          ["lastWeekTopFive", oldRank]
+        );
+
+        let hofRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["HALL_OF_FAME"]);
+        let hofList = [];
+        if (hofRes.rowCount > 0 && hofRes.rows[0].value) {
+           try { hofList = JSON.parse(hofRes.rows[0].value); } catch(e){}
+        }
+
+        const lines = oldRank.split('\n');
+        lines.forEach(line => {
+           let match = line.match(/(?:[\d]+[°\.]\s*:?\s*)?(.+?)\s*(?:\(([\d,\.]+)\)|-\s*([\d,\.]+))/);
+           if (match) {
+             let playerName = match[1].trim();
+             let scoreStr = match[2] || match[3];
+             let weeklyScore = parseInt(scoreStr.replace(/\D/g, ''));
+             
+             if (!isNaN(weeklyScore)) {
+               let existing = hofList.find(p => p.name === playerName);
+               if (existing) {
+                 if (weeklyScore > existing.score) existing.score = weeklyScore;
+               } else {
+                 hofList.push({ name: playerName, score: weeklyScore });
+               }
+             }
+           }
+        });
+
+        hofList.sort((a, b) => b.score - a.score);
+        hofList = hofList.slice(0, 3);
+        
+        await db.query(
+          `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, 
+          ["HALL_OF_FAME", JSON.stringify(hofList)]
+        );
+      }
+
+      await db.query(
+        `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, 
+        ["weeklyTopFive", "Waiting for new deliveries..."]
+      );
+
+      activeServerWeek = currentNowWeek;
+      console.log("Rollover complete!");
+    } catch (e) {
+      console.error("Error during week rollover:", e);
+    }
+  }
+}, 60000);
+// ========================================================
+
 function requireToken(req, res, next) {
   const token = req.header("x-api-token");
   if (!token || token !== API_TOKEN) {
@@ -110,9 +182,6 @@ app.post("/ack-msg", async (req, res) => {
     res.status(500).json({ error: "db error" });
   }
 });
-
-const getUnixTime = () => Math.floor(Date.now() / 1000);
-const getCurrentWeek = () => Math.floor((getUnixTime() + 345600) / 604800);
 
 async function getPlayerData(uuid) {
   if (!uuid) return null;
@@ -284,7 +353,6 @@ app.post("/action", requireToken, async (req, res) => {
       await addPlayerMessage(user, `You have ${player.M} F₵.`);
       await addPlayerMessage(user, `You have ${player.P} GFN points this week.`);
     }
-    // --- NOVOS TÓPICOS PARA O ADMIN HUD ---
     else if (topic === "godCheck") {
       let tPlayer = await getPlayerData(targetUuid);
       await addPlayerMessage(user, `Target (${targetUuid}) Balance: ${tPlayer.M} F₵ | Points: ${tPlayer.P}`);
@@ -346,17 +414,12 @@ app.post("/action", requireToken, async (req, res) => {
         }
       }
       
-      // Envia o aviso de finalização para a SUA fila de mensagens (Admin)
       await addPlayerMessage(user, `VARREDURA CONCLUÍDA! ${affected} contas foram limitadas a ${maxValue} F₵ e notificadas.`);
       responsePayload.status = "success";
     }
-    // ==========================================
-    // --- LÓGICA DO VENDOR E REFILL AQUI ---
-    // ==========================================
     else if (topic === "buy") {
       let price = parseInt(content) || 0;
       
-      // Impede compra acima do limite de 1 milhão
       if (price > MAX_TRANSACTION) {
         responsePayload.status = "denied";
         await addPlayerMessage(user, `Purchase blocked! You cannot spend more than ${MAX_TRANSACTION} F₵ in a single transaction.`);
@@ -374,7 +437,6 @@ app.post("/action", requireToken, async (req, res) => {
         await savePlayerData(user, buyer);
         await addPlayerMessage(user, `You successfully bought ${plan} for ${price} F₵. Balance: ${buyer.M} F₵`);
         
-        // Repassa o valor para o dono da máquina
         if (ownerUuid && ownerUuid !== user) {
           let ownerData = await getPlayerData(ownerUuid);
           ownerData.M += price;
@@ -387,7 +449,6 @@ app.post("/action", requireToken, async (req, res) => {
     else if (topic === "refillPay") {
       let cost = parseInt(content) || 0;
       
-      // Impede recarga acima do limite de 1 milhão
       if (cost > MAX_TRANSACTION) {
         responsePayload.status = "denied";
         await addPlayerMessage(user, `Refill blocked! Cost exceeds the single transaction limit of ${MAX_TRANSACTION} F₵.`);
