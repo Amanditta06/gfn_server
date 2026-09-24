@@ -138,6 +138,29 @@ function requireToken(req, res, next) {
   next();
 }
 
+// --- Funções Auxiliares para DB (Simplificam o código) ---
+async function dbGet(id) {
+  try {
+    const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [id]);
+    return res.rowCount > 0 ? res.rows[0].value : null;
+  } catch (e) {
+    console.error("dbGet error:", e);
+    return null;
+  }
+}
+
+async function dbSet(id, value) {
+  try {
+    await db.query(
+      `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`,
+      [id, value]
+    );
+  } catch (e) {
+    console.error("dbSet error:", e);
+  }
+}
+// ---------------------------------------------------------
+
 async function addPlayerMessage(uuid, msg) {
   const keyId = `${uuid}_MSG`;
   try {
@@ -199,6 +222,114 @@ async function savePlayerData(uuid, data) {
     [`player_${uuid}`, JSON.stringify(data)]
   );
 }
+
+// ========================================================
+// --- NOVO SISTEMA CENTRALIZADO: GERENCIADOR DE PARCELAS ---
+// ========================================================
+app.post('/admin/parcel', requireToken, async (req, res) => {
+  const { action, serverId, uuid, pos, regionName, num, newPos } = req.body;
+  if (!serverId) return res.status(400).json({ error: "serverId obrigatório" });
+
+  try {
+    // 1. CARREGA OS DADOS ATUAIS DO BANCO
+    let mainData = await dbGet(serverId) || ""; 
+    let n1 = await dbGet(`${serverId}_NAMES_1`) || "";
+    let n2 = await dbGet(`${serverId}_NAMES_2`) || "";
+    let n3 = await dbGet(`${serverId}_NAMES_3`) || "";
+    let n4 = await dbGet(`${serverId}_NAMES_4`) || "";
+    let n5 = await dbGet(`${serverId}_NAMES_5`) || "";
+
+    // 2. CONVERTE PARA ARRAYS
+    let mainList = mainData ? mainData.split("ç") : [];
+    let namesRaw = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
+    let namesList = namesRaw ? namesRaw.split("ç") : [];
+
+    // Garante que a lista de nomes acompanhe a lista principal
+    while (namesList.length < mainList.length) namesList.push("NULL");
+
+    // Formatação e Correção Automática de Região ("royie" -> "Royier")
+    const formatRegion = (name) => {
+      if (!name) return "NULL";
+      let clean = name.trim();
+      if (clean.toLowerCase() === "royie" || clean.toLowerCase() === "royier") return "Royier";
+      return clean;
+    };
+
+    // 3. EXECUTA A AÇÃO SOLICITADA PELO HUD
+    if (action === "SET_PARCEL") {
+      const newItem = `${uuid}#${pos}`;
+      const cleanRegion = formatRegion(regionName);
+      const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
+      
+      if (idx !== -1) {
+        mainList[idx] = newItem;
+        namesList[idx] = cleanRegion;
+      } else {
+        mainList.push(newItem);
+        namesList.push(cleanRegion);
+      }
+    } 
+    else if (action === "DEL_PARCEL") {
+      const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
+      if (idx !== -1) {
+        mainList.splice(idx, 1);
+        namesList.splice(idx, 1);
+      }
+    } 
+    else if (action === "DEL_NUM") {
+      if (num >= 0 && num < mainList.length) {
+        mainList.splice(num, 1);
+        namesList.splice(num, 1);
+      }
+    } 
+    else if (action === "REORDER") {
+      const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
+      if (idx !== -1) {
+        let targetPos = newPos < 0 ? 0 : (newPos > mainList.length ? mainList.length : newPos);
+        const item = mainList.splice(idx, 1)[0];
+        const name = namesList.splice(idx, 1)[0];
+        mainList.splice(targetPos, 0, item);
+        namesList.splice(targetPos, 0, name);
+      }
+    }
+    else if (action === "UPDATE_REGION") {
+      const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
+      if (idx !== -1) {
+        namesList[idx] = formatRegion(regionName);
+      }
+      // Varredura de segurança: limpa qualquer "royie" preso nos arrays em todas as posições
+      namesList = namesList.map(name => formatRegion(name));
+    }
+
+    // 4. PREPARA OS DADOS PARA SALVAR (CHUNKING AUTOMÁTICO DE 20 EM 20)
+    const newMainStr = mainList.join("ç");
+    const chunks = ["", "", "", "", ""];
+    
+    for (let i = 0; i < namesList.length; i++) {
+      let chunkIdx = Math.floor(i / 20);
+      if (chunkIdx < 5) {
+        if (chunks[chunkIdx] !== "") chunks[chunkIdx] += "ç";
+        chunks[chunkIdx] += namesList[i];
+      }
+    }
+
+    // 5. SALVA DE VOLTA NO BANCO
+    await dbSet(serverId, newMainStr);
+    await dbSet(`${serverId}_NAMES_1`, chunks[0]);
+    await dbSet(`${serverId}_NAMES_2`, chunks[1]);
+    await dbSet(`${serverId}_NAMES_3`, chunks[2]);
+    await dbSet(`${serverId}_NAMES_4`, chunks[3]);
+    await dbSet(`${serverId}_NAMES_5`, chunks[4]);
+
+    res.status(200).json({ success: true, message: `Ação ${action} concluída com sucesso.` });
+
+  } catch (error) {
+    console.error("Erro no processamento de parcelas:", error);
+    res.status(500).json({ error: "Erro interno no servidor de parcelas" });
+  }
+});
+// ========================================================
+
 
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime } = req.body;
