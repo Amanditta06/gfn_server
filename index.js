@@ -231,20 +231,52 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
   if (!serverId) return res.status(400).json({ error: "serverId obrigatório" });
 
   try {
-    // 1. CARREGA OS DADOS ATUAIS DO BANCO
-    let mainData = await dbGet(serverId) || ""; 
-    let n1 = await dbGet(`${serverId}_NAMES_1`) || "";
-    let n2 = await dbGet(`${serverId}_NAMES_2`) || "";
-    let n3 = await dbGet(`${serverId}_NAMES_3`) || "";
-    let n4 = await dbGet(`${serverId}_NAMES_4`) || "";
-    let n5 = await dbGet(`${serverId}_NAMES_5`) || "";
+    let targetServer = serverId;
+    let mainList = [];
+    let namesList = [];
 
-    // 2. CONVERTE PARA ARRAYS
-    let mainList = mainData ? mainData.split("ç") : [];
+    // --- 1. DETECÇÃO AUTOMÁTICA DE CONTINENTE (O MÁGICO) ---
+    // A HUD envia "AUTO" para UPD_REG, DEL_PARCEL e REORDER
+    if (serverId === "AUTO") {
+      let serversData = await dbGet("SERVERS");
+      let servers = serversData ? serversData.split("ç") : [];
+      let found = false;
+
+      // O servidor varre todos os continentes ativos no banco de dados buscando a UUID informada
+      for (let srv of servers) {
+        let mData = await dbGet(srv) || "";
+        let mList = mData ? mData.split("ç") : [];
+        let idx = mList.findIndex(item => item.startsWith(uuid + "#"));
+        
+        if (idx !== -1) {
+          targetServer = srv; // Achou! Define o servidor correto silenciosamente.
+          mainList = mList;
+          found = true;
+          break; 
+        }
+      }
+
+      if (!found) {
+        return res.status(404).json({ error: "Parcela não encontrada em nenhum continente ativo." });
+      }
+    } 
+    else {
+      // Se a HUD NÃO mandar "AUTO" (ex: "SET_PARCEL" novo), carrega apenas o server específico
+      let mainData = await dbGet(targetServer) || ""; 
+      mainList = mainData ? mainData.split("ç") : [];
+    }
+
+    // 2. CARREGA AS LISTAS DE NOMES DO SERVIDOR DEFINIDO
+    let n1 = await dbGet(`${targetServer}_NAMES_1`) || "";
+    let n2 = await dbGet(`${targetServer}_NAMES_2`) || "";
+    let n3 = await dbGet(`${targetServer}_NAMES_3`) || "";
+    let n4 = await dbGet(`${targetServer}_NAMES_4`) || "";
+    let n5 = await dbGet(`${targetServer}_NAMES_5`) || "";
+
     let namesRaw = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
-    let namesList = namesRaw ? namesRaw.split("ç") : [];
+    namesList = namesRaw ? namesRaw.split("ç") : [];
 
-    // Garante que a lista de nomes acompanhe a lista principal
+    // Garante que a lista de nomes acompanhe a lista principal (Alinhamento Perfeito)
     while (namesList.length < mainList.length) namesList.push("NULL");
 
     // Formatação e Correção Automática de Região ("royie" -> "Royier")
@@ -256,6 +288,7 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
     };
 
     // 3. EXECUTA A AÇÃO SOLICITADA PELO HUD
+    // As ações agem IDENTICAMENTE nas duas listas garantindo que o Index seja mantido
     if (action === "SET_PARCEL") {
       const newItem = `${uuid}#${pos}`;
       const cleanRegion = formatRegion(regionName);
@@ -313,15 +346,15 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       }
     }
 
-    // 5. SALVA DE VOLTA NO BANCO
-    await dbSet(serverId, newMainStr);
-    await dbSet(`${serverId}_NAMES_1`, chunks[0]);
-    await dbSet(`${serverId}_NAMES_2`, chunks[1]);
-    await dbSet(`${serverId}_NAMES_3`, chunks[2]);
-    await dbSet(`${serverId}_NAMES_4`, chunks[3]);
-    await dbSet(`${serverId}_NAMES_5`, chunks[4]);
+    // 5. SALVA DE VOLTA NO BANCO NO SERVIDOR ENCONTRADO/DEFINIDO
+    await dbSet(targetServer, newMainStr);
+    await dbSet(`${targetServer}_NAMES_1`, chunks[0]);
+    await dbSet(`${targetServer}_NAMES_2`, chunks[1]);
+    await dbSet(`${targetServer}_NAMES_3`, chunks[2]);
+    await dbSet(`${targetServer}_NAMES_4`, chunks[3]);
+    await dbSet(`${targetServer}_NAMES_5`, chunks[4]);
 
-    res.status(200).json({ success: true, message: `Ação ${action} concluída com sucesso.` });
+    res.status(200).json({ success: true, message: `Ação ${action} processada perfeitamente no servidor: ${targetServer}.` });
 
   } catch (error) {
     console.error("Erro no processamento de parcelas:", error);
