@@ -591,27 +591,39 @@ app.post("/action", requireToken, async (req, res) => {
     }
     else if (topic === "buy") {
       let price = parseInt(content) || 0;
+      
       if (price > MAX_TRANSACTION) {
         responsePayload.status = "denied";
         await addPlayerMessage(user, `Purchase blocked! You cannot spend more than ${MAX_TRANSACTION} F₵ in a single transaction.`);
         return res.json(responsePayload);
       }
+      
       let buyer = await getPlayerData(user);
       let ownerUuid = targetUuid;
+      
       if (buyer.M < price) {
         await addPlayerMessage(user, `You don't have enough F₵. Required: ${price}, You have: ${buyer.M}`);
         responsePayload.status = "denied";
       } else {
-        buyer.M -= price;
-        await savePlayerData(user, buyer);
-        await addPlayerMessage(user, `You successfully bought ${plan} for ${price} F₵. Balance: ${buyer.M} F₵`);
-        if (ownerUuid && ownerUuid !== user) {
-          let ownerData = await getPlayerData(ownerUuid);
-          ownerData.M += price;
-          await savePlayerData(ownerUuid, ownerData);
-          await addPlayerMessage(ownerUuid, `Your vending machine sold ${plan} for ${price} F₵. Balance: ${ownerData.M} F₵`);
+        // Correção: Se o dono compra dele mesmo, a transação vira custo zero
+        if (ownerUuid === user) {
+          await addPlayerMessage(user, `You bought your own product (${plan}). Your balance remains ${buyer.M} F₵.`);
+          responsePayload.status = "success";
+        } 
+        // Compras reais de outros jogadores
+        else {
+          buyer.M -= price;
+          await savePlayerData(user, buyer);
+          await addPlayerMessage(user, `You successfully bought ${plan} for ${price} F₵. Balance: ${buyer.M} F₵`);
+          
+          if (ownerUuid) {
+            let ownerData = await getPlayerData(ownerUuid);
+            ownerData.M += price;
+            await savePlayerData(ownerUuid, ownerData);
+            await addPlayerMessage(ownerUuid, `Your vending machine sold ${plan} for ${price} F₵. Balance: ${ownerData.M} F₵`);
+          }
+          responsePayload.status = "success";
         }
-        responsePayload.status = "success";
       }
     }
     else if (topic === "refillPay") {
