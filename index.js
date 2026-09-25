@@ -229,15 +229,41 @@ app.post("/ack-msg", async (req, res) => {
   }
 });
 
+// ========================================================
+// --- FUNÇÃO CORRIGIDA E BLINDADA CONTRA STRING CONCATENATION ---
+// ========================================================
 async function getPlayerData(uuid) {
   if (!uuid) return null;
   const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [`player_${uuid}`]);
   let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0 };
+  
   if (res.rowCount > 0) {
-    try { data = { ...data, ...JSON.parse(res.rows[0].value) }; } catch(e) {}
+    try { 
+      let parsedData = JSON.parse(res.rows[0].value);
+      data = { ...data, ...parsedData }; 
+      
+      // Converte todas as variáveis matemáticas para números absolutos garantidos.
+      // Contas "bugadas" da migração ("50") viram números (50).
+      // Contas corretas (50) continuam sendo números (50).
+      data.M = parseInt(data.M, 10) || 0;
+      data.P = parseInt(data.P, 10) || 0;
+      data.P_W = parseInt(data.P_W, 10) || 0;
+      data.TC_V = parseInt(data.TC_V, 10) || 0;
+      data.TC_W = parseInt(data.TC_W, 10) || 0;
+      data.EV_V = parseInt(data.EV_V, 10) || 0;
+      data.EV_W = parseInt(data.EV_W, 10) || 0;
+      data.RE = parseInt(data.RE, 10) || 0;
+      data.B_M = parseFloat(data.B_M) || 1.0;
+      data.B_T = parseInt(data.B_T, 10) || 0;
+      // AT não entra aqui porque é texto mesmo (Ex: "A")
+
+    } catch(e) {
+      console.error(`Error parsing player data for ${uuid}:`, e);
+    }
   }
   return data;
 }
+// ========================================================
 
 async function savePlayerData(uuid, data) {
   await db.query(
