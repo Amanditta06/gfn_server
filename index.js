@@ -25,7 +25,7 @@ const db = new Pool({
 let MAX_TC = 5000;
 let MAX_EV = 5000;
 let MAX_F = 2000;
-let MAX_TRANSACTION = 1000000; // Limite global de segurança contra hackers (1 Milhão)
+let MAX_TRANSACTION = 1000000;
 
 async function loadGlobalSettings() {
   try {
@@ -41,7 +41,6 @@ async function loadGlobalSettings() {
   }
 }
 
-// === NOVO: Limpa todas as filas de mensagens ao iniciar o servidor ===
 async function clearAllMessageQueues() {
   if (!DATABASE_URL) return;
   try {
@@ -51,7 +50,6 @@ async function clearAllMessageQueues() {
     console.error("Error clearing message queues on reboot:", e);
   }
 }
-// ======================================================================
 
 async function ensureTable() {
   if (!DATABASE_URL) return;
@@ -64,8 +62,6 @@ async function ensureTable() {
     `);
     console.log("kvstore table ready");
     await loadGlobalSettings(); 
-    
-    // Executa a limpeza geral de mensagens sempre que o servidor ligar
     await clearAllMessageQueues();
   } catch (e) {
     console.error("Error ensuring kvstore table:", e);
@@ -76,18 +72,13 @@ ensureTable();
 const getUnixTime = () => Math.floor(Date.now() / 1000);
 const getCurrentWeek = () => Math.floor((getUnixTime() + 345600) / 604800);
 
-// ========================================================
-// --- GFN AUTO WEEKLY ROLLOVER & GLOBAL HALL OF FAME ---
-// ========================================================
 let activeServerWeek = getCurrentWeek();
 
 setInterval(async () => {
   let currentNowWeek = getCurrentWeek();
-  
   if (currentNowWeek !== activeServerWeek) {
     try {
       console.log("Week Rollover Detected! Archiving Last Week and processing Global Hall of Fame...");
-      
       const oldRankRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["weeklyTopFive"]);
       let oldRank = oldRankRes.rowCount > 0 ? oldRankRes.rows[0].value : "";
 
@@ -110,7 +101,6 @@ setInterval(async () => {
              let playerName = match[1].trim();
              let scoreStr = match[2] || match[3];
              let weeklyScore = parseInt(scoreStr.replace(/\D/g, ''));
-             
              if (!isNaN(weeklyScore)) {
                let existing = hofList.find(p => p.name === playerName);
                if (existing) {
@@ -124,7 +114,6 @@ setInterval(async () => {
 
         hofList.sort((a, b) => b.score - a.score);
         hofList = hofList.slice(0, 3);
-        
         await db.query(
           `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, 
           ["HALL_OF_FAME", JSON.stringify(hofList)]
@@ -143,7 +132,6 @@ setInterval(async () => {
     }
   }
 }, 60000);
-// ========================================================
 
 function requireToken(req, res, next) {
   const token = req.header("x-api-token");
@@ -153,7 +141,6 @@ function requireToken(req, res, next) {
   next();
 }
 
-// --- Funções Auxiliares para DB (Simplificam o código) ---
 async function dbGet(id) {
   try {
     const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [id]);
@@ -174,7 +161,25 @@ async function dbSet(id, value) {
     console.error("dbSet error:", e);
   }
 }
-// ---------------------------------------------------------
+
+// Helper para salvar os chunks de nomes e coordenadas de forma sincronizada
+async function saveServerChunks(srvName, mainList, namesList) {
+  const newMainStr = mainList.join("ç");
+  const chunks = ["", "", "", "", ""];
+  for (let i = 0; i < namesList.length; i++) {
+    let chunkIdx = Math.floor(i / 20);
+    if (chunkIdx < 5) {
+      if (chunks[chunkIdx] !== "") chunks[chunkIdx] += "ç";
+      chunks[chunkIdx] += namesList[i];
+    }
+  }
+  await dbSet(srvName, newMainStr);
+  await dbSet(`${srvName}_NAMES_1`, chunks[0]);
+  await dbSet(`${srvName}_NAMES_2`, chunks[1]);
+  await dbSet(`${srvName}_NAMES_3`, chunks[2]);
+  await dbSet(`${srvName}_NAMES_4`, chunks[3]);
+  await dbSet(`${srvName}_NAMES_5`, chunks[4]);
+}
 
 async function addPlayerMessage(uuid, msg) {
   const keyId = `${uuid}_MSG`;
@@ -184,14 +189,10 @@ async function addPlayerMessage(uuid, msg) {
     if (res.rowCount > 0 && res.rows[0].value) {
       try { messages = JSON.parse(res.rows[0].value); } catch(e) {}
     }
-    
     messages.push(msg);
-    
-    // OTIMIZAÇÃO: Trava de segurança para não "entupir" a fila do jogador e quebrar o JSON no Second Life
     if (messages.length > 20) {
-        messages = messages.slice(-20); // Mantém apenas as 20 mais recentes
+        messages = messages.slice(-20);
     }
-    
     await db.query(
       `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`,
       [keyId, JSON.stringify(messages)]
@@ -246,7 +247,7 @@ async function savePlayerData(uuid, data) {
 }
 
 // ========================================================
-// --- NOVO SISTEMA CENTRALIZADO: GERENCIADOR DE PARCELAS ---
+// --- GERENCIADOR DE PARCELAS INTELIGENTE (PURGE & RE-SET) ---
 // ========================================================
 app.post('/admin/parcel', requireToken, async (req, res) => {
   const { action, serverId, uuid, pos, regionName, num, newPos } = req.body;
@@ -254,54 +255,8 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
 
   try {
     let targetServer = serverId;
-    let mainList = [];
-    let namesList = [];
 
-    // --- 1. DETECÇÃO AUTOMÁTICA DE CONTINENTE (O MÁGICO) ---
-    // A HUD envia "AUTO" para UPD_REG, DEL_PARCEL e REORDER
-    if (serverId === "AUTO") {
-      let serversData = await dbGet("SERVERS");
-      let servers = serversData ? serversData.split("ç") : [];
-      let found = false;
-
-      // O servidor varre todos os continentes ativos no banco de dados buscando a UUID informada
-      for (let srv of servers) {
-        let mData = await dbGet(srv) || "";
-        let mList = mData ? mData.split("ç") : [];
-        let idx = mList.findIndex(item => item.startsWith(uuid + "#"));
-        
-        if (idx !== -1) {
-          targetServer = srv; // Achou! Define o servidor correto silenciosamente.
-          mainList = mList;
-          found = true;
-          break; 
-        }
-      }
-
-      if (!found) {
-        return res.status(404).json({ error: "Parcela não encontrada em nenhum continente ativo." });
-      }
-    } 
-    else {
-      // Se a HUD NÃO mandar "AUTO" (ex: "SET_PARCEL" novo), carrega apenas o server específico
-      let mainData = await dbGet(targetServer) || ""; 
-      mainList = mainData ? mainData.split("ç") : [];
-    }
-
-    // 2. CARREGA AS LISTAS DE NOMES DO SERVIDOR DEFINIDO
-    let n1 = await dbGet(`${targetServer}_NAMES_1`) || "";
-    let n2 = await dbGet(`${targetServer}_NAMES_2`) || "";
-    let n3 = await dbGet(`${targetServer}_NAMES_3`) || "";
-    let n4 = await dbGet(`${targetServer}_NAMES_4`) || "";
-    let n5 = await dbGet(`${targetServer}_NAMES_5`) || "";
-
-    let namesRaw = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
-    namesList = namesRaw ? namesRaw.split("ç") : [];
-
-    // Garante que a lista de nomes acompanhe a lista principal (Alinhamento Perfeito)
-    while (namesList.length < mainList.length) namesList.push("NULL");
-
-    // Formatação e Correção Automática de Região ("royie" -> "Royier")
+    // Formatação e Correção Automática de Região
     const formatRegion = (name) => {
       if (!name) return "NULL";
       let clean = name.trim();
@@ -309,72 +264,123 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       return clean;
     };
 
-    // 3. EXECUTA A AÇÃO SOLICITADA PELO HUD
-    // As ações agem IDENTICAMENTE nas duas listas garantindo que o Index seja mantido
+    // Auto-Detect para ações automáticas
+    if (serverId === "AUTO") {
+      let serversData = await dbGet("SERVERS");
+      let servers = serversData ? serversData.split("ç") : [];
+      let found = false;
+
+      for (let srv of servers) {
+        let mData = await dbGet(srv) || "";
+        let mList = mData ? mData.split("ç") : [];
+        let idx = mList.findIndex(item => item.startsWith(uuid + "#"));
+        if (idx !== -1) {
+          targetServer = srv;
+          found = true;
+          break; 
+        }
+      }
+
+      if (!found && action !== "SET_PARCEL") {
+        return res.status(404).json({ error: "Parcela não encontrada em nenhum continente ativo." });
+      }
+      if (!found) targetServer = servers[0] || "Satori"; // Fallback padrão
+    }
+
+    // Carrega a lista de servidores globais para limpeza cruzada
+    let serversData = await dbGet("SERVERS");
+    let servers = serversData ? serversData.split("ç") : [];
+
+    // EXECUTA A AÇÃO SOLICITADA
     if (action === "SET_PARCEL") {
       const newItem = `${uuid}#${pos}`;
       const cleanRegion = formatRegion(regionName);
-      const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
+
+      // PURGE GLOBAL: Remove esta UUID de QUALQUER continente antes de inserir no destino.
+      // Isso impede duplicidade, lixo corrompido ou dessincronização de listas!
+      for (let srv of servers) {
+        let mData = await dbGet(srv) || "";
+        let mList = mData ? mData.split("ç") : [];
+        
+        let n1 = await dbGet(`${srv}_NAMES_1`) || "";
+        let n2 = await dbGet(`${srv}_NAMES_2`) || "";
+        let n3 = await dbGet(`${srv}_NAMES_3`) || "";
+        let n4 = await dbGet(`${srv}_NAMES_4`) || "";
+        let n5 = await dbGet(`${srv}_NAMES_5`) || "";
+        let nList = [n1, n2, n3, n4, n5].filter(Boolean).join("ç").split("ç");
+        while (nList.length < mList.length) nList.push("NULL");
+
+        let idx = mList.findIndex(item => item.startsWith(uuid + "#"));
+        if (idx !== -1) {
+          mList.splice(idx, 1);
+          nList.splice(idx, 1);
+          await saveServerChunks(srv, mList, nList);
+        }
+      }
+
+      // Adiciona limpo e recadastrado no targetServer escolhido
+      let targetMainData = await dbGet(targetServer) || ""; 
+      let targetMainList = targetMainData ? targetMainData.split("ç") : [];
       
-      if (idx !== -1) {
-        mainList[idx] = newItem;
-        namesList[idx] = cleanRegion;
-      } else {
-        mainList.push(newItem);
-        namesList.push(cleanRegion);
-      }
-    } 
-    else if (action === "DEL_PARCEL") {
-      const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
-      if (idx !== -1) {
-        mainList.splice(idx, 1);
-        namesList.splice(idx, 1);
-      }
-    } 
-    else if (action === "DEL_NUM") {
-      if (num >= 0 && num < mainList.length) {
-        mainList.splice(num, 1);
-        namesList.splice(num, 1);
-      }
-    } 
-    else if (action === "REORDER") {
-      const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
-      if (idx !== -1) {
-        let targetPos = newPos < 0 ? 0 : (newPos > mainList.length ? mainList.length : newPos);
-        const item = mainList.splice(idx, 1)[0];
-        const name = namesList.splice(idx, 1)[0];
-        mainList.splice(targetPos, 0, item);
-        namesList.splice(targetPos, 0, name);
-      }
-    }
-    else if (action === "UPDATE_REGION") {
-      const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
-      if (idx !== -1) {
-        namesList[idx] = formatRegion(regionName);
-      }
-      // Varredura de segurança: limpa qualquer "royie" preso nos arrays em todas as posições
-      namesList = namesList.map(name => formatRegion(name));
-    }
+      let tN1 = await dbGet(`${targetServer}_NAMES_1`) || "";
+      let tN2 = await dbGet(`${targetServer}_NAMES_2`) || "";
+      let tN3 = await dbGet(`${targetServer}_NAMES_3`) || "";
+      let tN4 = await dbGet(`${targetServer}_NAMES_4`) || "";
+      let tN5 = await dbGet(`${targetServer}_NAMES_5`) || "";
+      let targetNamesList = [tN1, tN2, tN3, tN4, tN5].filter(Boolean).join("ç").split("ç");
+      while (targetNamesList.length < targetMainList.length) targetNamesList.push("NULL");
 
-    // 4. PREPARA OS DADOS PARA SALVAR (CHUNKING AUTOMÁTICO DE 20 EM 20)
-    const newMainStr = mainList.join("ç");
-    const chunks = ["", "", "", "", ""];
-    
-    for (let i = 0; i < namesList.length; i++) {
-      let chunkIdx = Math.floor(i / 20);
-      if (chunkIdx < 5) {
-        if (chunks[chunkIdx] !== "") chunks[chunkIdx] += "ç";
-        chunks[chunkIdx] += namesList[i];
-      }
-    }
+      targetMainList.push(newItem);
+      targetNamesList.push(cleanRegion);
 
-    // 5. SALVA DE VOLTA NO BANCO NO SERVIDOR ENCONTRADO/DEFINIDO
-    await dbSet(targetServer, newMainStr);
-    await dbSet(`${targetServer}_NAMES_1`, chunks[0]);
-    await dbSet(`${targetServer}_NAMES_2`, chunks[1]);
-    await dbSet(`${targetServer}_NAMES_3`, chunks[2]);
-    await dbSet(`${targetServer}_NAMES_4`, chunks[3]);
-    await dbSet(`${targetServer}_NAMES_5`, chunks[4]);
+      await saveServerChunks(targetServer, targetMainList, targetNamesList);
+    } 
+    else {
+      // Para outras ações (DEL_PARCEL, DEL_NUM, REORDER, UPDATE_REGION), carrega o servidor alvo
+      let mainData = await dbGet(targetServer) || ""; 
+      let mainList = mainData ? mainData.split("ç") : [];
+
+      let n1 = await dbGet(`${targetServer}_NAMES_1`) || "";
+      let n2 = await dbGet(`${targetServer}_NAMES_2`) || "";
+      let n3 = await dbGet(`${targetServer}_NAMES_3`) || "";
+      let n4 = await dbGet(`${targetServer}_NAMES_4`) || "";
+      let n5 = await dbGet(`${targetServer}_NAMES_5`) || "";
+      let namesList = [n1, n2, n3, n4, n5].filter(Boolean).join("ç").split("ç");
+      while (namesList.length < mainList.length) namesList.push("NULL");
+
+      if (action === "DEL_PARCEL") {
+        const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
+        if (idx !== -1) {
+          mainList.splice(idx, 1);
+          namesList.splice(idx, 1);
+        }
+      } 
+      else if (action === "DEL_NUM") {
+        if (num >= 0 && num < mainList.length) {
+          mainList.splice(num, 1);
+          namesList.splice(num, 1);
+        }
+      } 
+      else if (action === "REORDER") {
+        const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
+        if (idx !== -1) {
+          let targetPos = newPos < 0 ? 0 : (newPos > mainList.length ? mainList.length : newPos);
+          const item = mainList.splice(idx, 1)[0];
+          const name = namesList.splice(idx, 1)[0];
+          mainList.splice(targetPos, 0, item);
+          namesList.splice(targetPos, 0, name);
+        }
+      }
+      else if (action === "UPDATE_REGION") {
+        const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
+        if (idx !== -1) {
+          namesList[idx] = formatRegion(regionName);
+        }
+        namesList = namesList.map(name => formatRegion(name));
+      }
+
+      await saveServerChunks(targetServer, mainList, namesList);
+    }
 
     res.status(200).json({ success: true, message: `Ação ${action} processada perfeitamente no servidor: ${targetServer}.` });
 
@@ -385,17 +391,14 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
 });
 // ========================================================
 
-
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime } = req.body;
-  let targetUuid = target || plan; // Captura o alvo enviado pelo HUD (tanto em target quanto em plan)
+  let targetUuid = target || plan; 
   let responsePayload = { status: "success" };
 
   try {
     if (topic === "cargo sell") {
       let price = parseInt(content) || 0;
-      
-      // TRAVA DE SEGURANÇA (Evita hacks de HUD enviando valores bilionários)
       if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
 
       let player = await getPlayerData(user);
@@ -427,7 +430,6 @@ app.post("/action", requireToken, async (req, res) => {
           responsePayload.newBuyer = true;
         }
 
-        // --- ADICIONAR O JOGADOR À LISTA DE BUYERS (GFN_BUYERS) ---
         try {
           const buyersRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["GFN_BUYERS"]);
           let buyersList = [];
@@ -444,7 +446,6 @@ app.post("/action", requireToken, async (req, res) => {
         } catch (e) {
           console.error("Error updating GFN_BUYERS:", e);
         }
-        // -----------------------------------------------------------
 
         let premiumBonus = 0;
         if (plan === "PREMIUM") {
@@ -559,62 +560,44 @@ app.post("/action", requireToken, async (req, res) => {
     }
     else if (topic === "pay") {
       let amountVal = parseInt(content) || 0;
-      
-      // TRAVA DE SEGURANÇA NO PAGAMENTO (Admin não pode dar mais de 1M por vez)
       if (amountVal > MAX_TRANSACTION) amountVal = MAX_TRANSACTION;
-      
       let tPlayer = await getPlayerData(targetUuid);
       tPlayer.M += amountVal;
       await savePlayerData(targetUuid, tPlayer);
       await addPlayerMessage(user, `Successfully adjusted balance of ${targetUuid} by ${amountVal} F₵. New balance: ${tPlayer.M} F₵`);
       await addPlayerMessage(targetUuid, `Your balance was adjusted by ${amountVal} F₵ by an administrator. Current balance: ${tPlayer.M} F₵`);
     }
-    // --- RESET EM MASSA CUSTOMIZÁVEL COM MENSAGEM ---
     else if (topic === "MASS_MONEY_RESET_CUSTOM") {
       const maxValue = parseInt(content) || 0;
       const alertMessage = plan;
-      
       const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
       let affected = 0;
-      
       for (let row of q.rows) {
         try {
           let pData = JSON.parse(row.value);
-          
           if (pData.M > maxValue) {
               pData.M = maxValue;
-              
-              // 1. Salva a correção no banco de dados
               await db.query("UPDATE kvstore SET value = $1 WHERE id = $2", [JSON.stringify(pData), row.id]);
-              
-              // 2. Extrai a UUID do jogador (removendo o "player_")
               let playerUuid = row.id.replace("player_", "");
-              
-              // 3. Coloca a mensagem na fila de recados DESTE jogador afetado
               await addPlayerMessage(playerUuid, alertMessage);
-              
               affected++;
           }
         } catch(e) {
           console.error("Erro ao analisar dados do jogador no RESET:", e);
         }
       }
-      
       await addPlayerMessage(user, `VARREDURA CONCLUÍDA! ${affected} contas foram limitadas a ${maxValue} F₵ e notificadas.`);
       responsePayload.status = "success";
     }
     else if (topic === "buy") {
       let price = parseInt(content) || 0;
-      
       if (price > MAX_TRANSACTION) {
         responsePayload.status = "denied";
         await addPlayerMessage(user, `Purchase blocked! You cannot spend more than ${MAX_TRANSACTION} F₵ in a single transaction.`);
         return res.json(responsePayload);
       }
-      
       let buyer = await getPlayerData(user);
       let ownerUuid = targetUuid;
-      
       if (buyer.M < price) {
         await addPlayerMessage(user, `You don't have enough F₵. Required: ${price}, You have: ${buyer.M}`);
         responsePayload.status = "denied";
@@ -622,7 +605,6 @@ app.post("/action", requireToken, async (req, res) => {
         buyer.M -= price;
         await savePlayerData(user, buyer);
         await addPlayerMessage(user, `You successfully bought ${plan} for ${price} F₵. Balance: ${buyer.M} F₵`);
-        
         if (ownerUuid && ownerUuid !== user) {
           let ownerData = await getPlayerData(ownerUuid);
           ownerData.M += price;
@@ -634,15 +616,12 @@ app.post("/action", requireToken, async (req, res) => {
     }
     else if (topic === "refillPay") {
       let cost = parseInt(content) || 0;
-      
       if (cost > MAX_TRANSACTION) {
         responsePayload.status = "denied";
         await addPlayerMessage(user, `Refill blocked! Cost exceeds the single transaction limit of ${MAX_TRANSACTION} F₵.`);
         return res.json(responsePayload);
       }
-      
       let owner = await getPlayerData(user);
-      
       if (owner.M < cost) {
         await addPlayerMessage(user, `You don't have enough F₵ to refill. Required: ${cost}, You have: ${owner.M}`);
         responsePayload.status = "denied";
@@ -666,7 +645,6 @@ app.get("/get-rank", async (req, res) => {
     const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
     let players = [];
     let currentWeek = getCurrentWeek();
-
     for (let row of q.rows) {
       try {
         let data = JSON.parse(row.value);
@@ -676,7 +654,6 @@ app.get("/get-rank", async (req, res) => {
         }
       } catch(e) {}
     }
-
     players.sort((a, b) => b.points - a.points);
     let top5 = players.slice(0, 5);
     res.json({ status: "success", top: top5 });
