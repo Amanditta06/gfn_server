@@ -33,7 +33,6 @@ let MAX_TRANSACTION = 1000000;
 const globalDebounce = new Set();
 const mutexes = {};
 
-// Função que cria uma "Fila Indiana" (Impede leitura/gravação simultânea no BD)
 async function withLock(key, fn) {
   if (!mutexes[key]) mutexes[key] = Promise.resolve();
   let release;
@@ -254,7 +253,7 @@ app.post("/ack-msg", async (req, res) => {
 async function getPlayerData(uuid) {
   if (!uuid) return null;
   const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [`player_${uuid}`]);
-  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0 };
+  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0, LAST_DEMAND_MULT: 1.0, LAST_DEMAND_TIME: 0 };
   
   if (res.rowCount > 0) {
     try { 
@@ -271,7 +270,6 @@ async function getPlayerData(uuid) {
       data.RE = parseInt(data.RE, 10) || 0;
       data.B_M = parseFloat(data.B_M) || 1.0;
       data.B_T = parseInt(data.B_T, 10) || 0;
-
     } catch(e) {
       console.error(`Error parsing player data for ${uuid}:`, e);
     }
@@ -295,7 +293,6 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
 
   try {
     let targetServer = serverId;
-
     const formatRegion = (name) => {
       if (!name) return "NULL";
       let clean = name.trim();
@@ -307,7 +304,6 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       let serversData = await dbGet("SERVERS");
       let servers = serversData ? serversData.split("ç") : [];
       let found = false;
-
       for (let srv of servers) {
         let mData = await dbGet(srv) || "";
         let mList = mData ? mData.split("ç") : [];
@@ -318,10 +314,7 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
           break; 
         }
       }
-
-      if (!found && action !== "SET_PARCEL") {
-        return res.status(404).json({ error: "Parcela não encontrada em nenhum continente ativo." });
-      }
+      if (!found && action !== "SET_PARCEL") return res.status(404).json({ error: "Parcela não encontrada em nenhum continente ativo." });
       if (!found) targetServer = servers[0] || "Satori";
     }
 
@@ -367,7 +360,6 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
 
       targetMainList.push(newItem);
       targetNamesList.push(cleanRegion);
-
       await saveServerChunks(targetServer, targetMainList, targetNamesList);
     } 
     else {
@@ -413,12 +405,9 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
         }
         namesList = namesList.map(name => formatRegion(name));
       }
-
       await saveServerChunks(targetServer, mainList, namesList);
     }
-
     res.status(200).json({ success: true, message: `Ação ${action} processada no servidor: ${targetServer}.` });
-
   } catch (error) {
     console.error("Erro no processamento de parcelas:", error);
     res.status(500).json({ error: "Erro interno no servidor de parcelas" });
@@ -430,7 +419,6 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
 // ========================================================
 app.post('/admin/sync-regions', requireToken, async (req, res) => {
   res.json({ status: "success", message: "Sincronização iniciada em segundo plano. Isso pode levar alguns minutos." });
-
   (async () => {
     try {
       console.log("[SYNC] Iniciando varredura automatizada das parcelas via Second Life Web...");
@@ -450,14 +438,12 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
         
         let originalNames = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
         let namesList = originalNames ? originalNames.split("ç") : [];
-        
         while (namesList.length < mainList.length) namesList.push("NULL");
 
         let updatedCount = 0;
 
         for (let i = 0; i < mainList.length; i++) {
           let uuid = mainList[i].split("#")[0];
-          
           if (uuid && uuid.length === 36) {
             try {
               const fetchOptions = {
@@ -466,16 +452,12 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
                   "Accept": "text/html,application/xhtml+xml,application/xml"
                 }
               };
-              
               let slRes = await fetch(`https://world.secondlife.com/parcel/${uuid}`, fetchOptions);
-              if (!slRes.ok) {
-                 slRes = await fetch(`https://world.secondlife.com/place/${uuid}`, fetchOptions);
-              }
+              if (!slRes.ok) slRes = await fetch(`https://world.secondlife.com/place/${uuid}`, fetchOptions);
 
               if (slRes.ok) {
                 const html = await slRes.text();
                 let extractedRegion = "";
-                
                 const mapMatch = html.match(/maps\.secondlife\.com\/secondlife\/([^\/"]+)/i);
                 
                 if (mapMatch && mapMatch[1]) {
@@ -493,11 +475,8 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
                 }
 
                 if (extractedRegion) {
-                  if (extractedRegion.toLowerCase() === "royie" || extractedRegion.toLowerCase() === "royier") {
-                    extractedRegion = "Royier";
-                  }
+                  if (extractedRegion.toLowerCase() === "royie" || extractedRegion.toLowerCase() === "royier") extractedRegion = "Royier";
                   extractedRegion = extractedRegion.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
-
                   if (namesList[i] !== extractedRegion && extractedRegion.length > 0 && extractedRegion !== "Second Life") {
                     console.log(`[SYNC] Corrigindo banco: de "${namesList[i]}" para -> "${extractedRegion}"`);
                     namesList[i] = extractedRegion;
@@ -508,17 +487,13 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
             } catch (fetchErr) {
               console.error(`[SYNC] Erro HTTP ao processar UUID ${uuid}: ${fetchErr.message}`);
             }
-            
             await new Promise(resolve => setTimeout(resolve, 800));
           }
         }
-
         let newNames = namesList.join("ç");
         if (newNames !== originalNames) {
           await saveServerChunks(srv, mainList, namesList);
           console.log(`[SYNC] Continente ${srv} atualizado no BD! (Registros corrigidos: ${updatedCount})`);
-        } else {
-          console.log(`[SYNC] Continente ${srv} 100% verificado. Nenhuma alteração necessária.`);
         }
       }
       console.log("[SYNC] Varredura GLOBAL finalizada com sucesso!");
@@ -531,7 +506,7 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
 // ========================================================
 // --- NOVO SISTEMA DE DEMANDA DE HUB (SUPPLY & DEMAND) ---
 // ========================================================
-async function processDemand(hubUuid, basePrice) {
+async function processDemand(hubUuid) {
   let demandDataStr = await dbGet("GLOBAL_DEMAND") || "{}";
   let demandData = {};
   try { demandData = JSON.parse(demandDataStr); } catch(e) {}
@@ -557,17 +532,15 @@ async function processDemand(hubUuid, basePrice) {
   }
   
   loc.mult = Math.round(loc.mult * 10) / 10;
-  let finalPrice = Math.round(basePrice * loc.mult);
-
+  
   loc.history.push(now);
   loc.last_delivery = now;
   demandData[hubUuid] = loc;
   await dbSet("GLOBAL_DEMAND", JSON.stringify(demandData));
 
-  return { finalPrice, mult: loc.mult };
+  return { mult: loc.mult };
 }
 // ========================================================
-
 
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime } = req.body;
@@ -578,7 +551,6 @@ app.post("/action", requireToken, async (req, res) => {
   // ========================================================
   const txHash = `${user}_${topic}_${targetUuid}_${content}`;
   if (globalDebounce.has(txHash)) {
-      console.log(`[DEBOUNCE] Transação repetida bloqueada por segurança (Glitch Físico evitado): ${txHash}`);
       return res.json({ status: "ignored" });
   }
   globalDebounce.add(txHash);
@@ -592,26 +564,51 @@ app.post("/action", requireToken, async (req, res) => {
   // ========================================================
   await withLock("GLOBAL_TX", async () => {
     try {
-      if (topic === "cargo sell") {
+      
+      // ========================================================
+      // DETECTA O AVISO DE "DELIVERED" (LOCALIZAÇÃO DA CARGA)
+      // ========================================================
+      if (topic === "delivered" || topic === "delivery") {
+          if (targetUuid && targetUuid.length >= 32 && targetUuid.includes("-")) {
+              let demandResult = await processDemand(targetUuid);
+              
+              let player = await getPlayerData(user);
+              player.LAST_DEMAND_MULT = demandResult.mult; // Guarda na memória do Player
+              player.LAST_DEMAND_TIME = getUnixTime();     // Marca a hora da entrega
+              await savePlayerData(user, player);
+          }
+          return res.json({ status: "success" });
+      }
+
+      // ========================================================
+      // DETECTA O PEDIDO DE PAGAMENTO DA CARGA (CARGO SELL)
+      // ========================================================
+      else if (topic === "cargo sell") {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
 
+        let player = await getPlayerData(user);
         let demandMult = 1.0;
-        if (targetUuid && targetUuid.length >= 32 && targetUuid.includes("-")) {
-           let demandResult = await processDemand(targetUuid, price);
-           price = demandResult.finalPrice;
-           demandMult = demandResult.mult;
-           
-           if (demandMult < 1.0) {
-              let lostPercent = Math.round((1.0 - demandMult) * 100);
-              await addPlayerMessage(user, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +20% every hour without deliveries.`);
-           }
+        let now = getUnixTime();
+
+        // Checa se o aviso de "delivered" aconteceu nos últimos 60 segundos
+        if (player.LAST_DEMAND_MULT && player.LAST_DEMAND_TIME && (now - player.LAST_DEMAND_TIME) < 60) {
+            demandMult = player.LAST_DEMAND_MULT;
         }
 
-        let player = await getPlayerData(user);
+        // Aplica o corte de demanda antes de injetar o dinheiro (Exceto planos Free/Test)
+        if (demandMult < 1.0 && plan !== "FREE" && plan !== "TEST_CARGO" && plan !== "EVENT") {
+            price = Math.round(price * demandMult);
+            let lostPercent = Math.round((1.0 - demandMult) * 100);
+            await addPlayerMessage(user, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +20% every hour without deliveries.`);
+        }
+        
+        // Limpa a memória para que a próxima entrega em outro lugar não sofra a mesma penalidade
+        player.LAST_DEMAND_MULT = 1.0;
+        player.LAST_DEMAND_TIME = 0;
+
         let recebido = 0;
         let boost_m = 1.0;
-        let now = getUnixTime();
         let currentWeek = getCurrentWeek();
 
         if (player.P_W !== currentWeek) {
@@ -767,7 +764,6 @@ app.post("/action", requireToken, async (req, res) => {
       }
       else if (topic === "pay") {
         let amountVal = parseInt(content) || 0;
-        
         if (amountVal <= 0) {
           await addPlayerMessage(user, "Transaction failed. Invalid amount.");
           return res.json({ status: "denied" });
@@ -775,19 +771,16 @@ app.post("/action", requireToken, async (req, res) => {
         if (amountVal > MAX_TRANSACTION) amountVal = MAX_TRANSACTION;
         
         let sender = await getPlayerData(user);
-        
         if (sender.M < amountVal) {
           await addPlayerMessage(user, `Transaction failed. You don't have enough F₵. Current balance: ${sender.M} F₵`);
           return res.json({ status: "denied" });
         }
-
         if (user === targetUuid) {
           await addPlayerMessage(user, "Transaction failed. You cannot pay yourself.");
           return res.json({ status: "denied" });
         }
 
         let tPlayer = await getPlayerData(targetUuid);
-        
         sender.M -= amountVal;
         tPlayer.M += amountVal;
         
@@ -824,16 +817,13 @@ app.post("/action", requireToken, async (req, res) => {
       }
       else if (topic === "buy") {
         let price = parseInt(content) || 0;
-        
         if (price > MAX_TRANSACTION) {
           responsePayload.status = "denied";
           await addPlayerMessage(user, `Purchase blocked! You cannot spend more than ${MAX_TRANSACTION} F₵ in a single transaction.`);
           return res.json(responsePayload);
         }
-        
         let buyer = await getPlayerData(user);
         let ownerUuid = targetUuid;
-        
         if (buyer.M < price) {
           await addPlayerMessage(user, `You don't have enough F₵. Required: ${price}, You have: ${buyer.M}`);
           responsePayload.status = "denied";
@@ -846,7 +836,6 @@ app.post("/action", requireToken, async (req, res) => {
             buyer.M -= price;
             await savePlayerData(user, buyer);
             await addPlayerMessage(user, `You successfully bought ${plan} for ${price} F₵. Balance: ${buyer.M} F₵`);
-            
             if (ownerUuid) {
               let ownerData = await getPlayerData(ownerUuid);
               ownerData.M += price;
