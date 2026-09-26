@@ -264,6 +264,7 @@ async function savePlayerData(uuid, data) {
   );
 }
 
+
 // ========================================================
 // --- GERENCIADOR DE PARCELAS INTELIGENTE ---
 // ========================================================
@@ -407,10 +408,10 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
 // --- AUTO-SINCER DAS PARCELAS (WEBSCRAPING NO BACKEND) ---
 // ========================================================
 app.post('/admin/sync-regions', requireToken, async (req, res) => {
-  // Responde imediatamente para liberar o LSL no SL
+  // Libera o Second Life IMEDIATAMENTE (Senão o LSL trava esperando o script terminar)
   res.json({ status: "success", message: "Sincronização iniciada em segundo plano. Isso pode levar alguns minutos." });
 
-  // Inicia o processo em background
+  // Inicia o processo Web Scraper protegido e otimizado
   (async () => {
     try {
       console.log("[SYNC] Iniciando varredura automatizada das parcelas via Second Life Web...");
@@ -427,9 +428,11 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
         let n3 = await dbGet(`${srv}_NAMES_3`) || "";
         let n4 = await dbGet(`${srv}_NAMES_4`) || "";
         let n5 = await dbGet(`${srv}_NAMES_5`) || "";
-        let joined = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
-        let namesList = joined ? joined.split("ç") : [];
         
+        let originalNames = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
+        let namesList = originalNames ? originalNames.split("ç") : [];
+        
+        // Se novos hubs foram adicionados, cria um slot pra eles
         while (namesList.length < mainList.length) namesList.push("NULL");
 
         let updatedCount = 0;
@@ -439,52 +442,76 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
           
           if (uuid && uuid.length === 36) {
             try {
-              const slRes = await fetch(`https://world.secondlife.com/parcel/${uuid}`);
+              // Burlar Cloudflare e LL com User-Agent Real
+              const fetchOptions = {
+                headers: {
+                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                  "Accept": "text/html,application/xhtml+xml,application/xml"
+                }
+              };
+              
+              // Tenta pelo /parcel/ (mais comum para HUBs), se falhar usa /place/
+              let slRes = await fetch(`https://world.secondlife.com/parcel/${uuid}`, fetchOptions);
+              if (!slRes.ok) {
+                 slRes = await fetch(`https://world.secondlife.com/place/${uuid}`, fetchOptions);
+              }
+
               if (slRes.ok) {
                 const html = await slRes.text();
-                // Busca a tag title via expressão regular
-                const titleMatch = html.match(/<title>(.*?)<\/title>/i);
+                
+                // Regex poderoso para ler <title> mesmo se houver quebra de linha interna
+                const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
                 
                 if (titleMatch && titleMatch[1]) {
                   let title = titleMatch[1];
                   
-                  // Corta o sulfixo padrão " - Second Life"
+                  // Limpa quebras de linhas, tabulações e espaços duplos
+                  title = title.replace(/\n/g, ' ').replace(/\r/g, '').replace(/\s+/g, ' ').trim();
+                  
+                  // Extrai o nome limpando a parte "- Second Life"
                   let idx = title.indexOf(" - Second Life");
                   if (idx !== -1) {
                     title = title.substring(0, idx).trim();
                   }
 
-                  // Regra antiga de formatação (mantida para compatibilidade)
+                  // Substituição manual (herdada)
                   if (title.toLowerCase() === "royie" || title.toLowerCase() === "royier") {
                     title = "Royier";
                   }
 
-                  // Apenas atualiza se o nome for diferente
-                  if (namesList[i] !== title) {
+                  // Transforma aspas e símbolos HTML para texto normal
+                  title = title.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+
+                  // Somente atualiza se mudou (Evita gravar desnecessariamente)
+                  if (namesList[i] !== title && title.length > 0) {
+                    console.log(`[SYNC] Encontrado: ${uuid} -> ${title}`);
                     namesList[i] = title;
                     updatedCount++;
                   }
                 }
+              } else {
+                 console.log(`[SYNC] UUID ${uuid} offline ou invisível (Status: ${slRes.status}).`);
               }
             } catch (fetchErr) {
-              console.error(`[SYNC] Erro ao buscar UUID ${uuid}: ${fetchErr.message}`);
+              console.error(`[SYNC] Erro HTTP ao processar UUID ${uuid}: ${fetchErr.message}`);
             }
             
-            // Pausa obrigatória de 500ms entre as requisições para evitar rate limit ou bloqueio de IP pela LL
-            await new Promise(resolve => setTimeout(resolve, 500));
+            // Pausa obrigatória de 800ms para evitar bloqueio de IP no Render
+            await new Promise(resolve => setTimeout(resolve, 800));
           }
         }
 
-        if (updatedCount > 0) {
+        let newNames = namesList.join("ç");
+        if (newNames !== originalNames) {
           await saveServerChunks(srv, mainList, namesList);
-          console.log(`[SYNC] Continente ${srv} atualizado! ${updatedCount} regiões foram renomeadas ou consertadas.`);
+          console.log(`[SYNC] Continente ${srv} atualizado no BD! (Registros alterados: ${updatedCount})`);
         } else {
-          console.log(`[SYNC] Continente ${srv} checado. Nenhuma alteração necessária.`);
+          console.log(`[SYNC] Continente ${srv} 100% verificado. Nenhuma alteração necessária.`);
         }
       }
-      console.log("[SYNC] Sincronização automática finalizada com sucesso!");
+      console.log("[SYNC] Varredura GLOBAL finalizada com sucesso!");
     } catch (err) {
-      console.error("[SYNC] Erro grave durante a varredura em background:", err);
+      console.error("[SYNC] Erro fatal durante a varredura:", err);
     }
   })();
 });
