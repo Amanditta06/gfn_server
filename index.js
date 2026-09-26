@@ -501,78 +501,87 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
 });
 
 // ========================================================
-// --- SISTEMA DE DEMANDA BLINDADO (SEM CONFLITO) ---
+// --- SISTEMA DE DEMANDA BLINDADO (ISOLADO POR PARCELA) ---
 // ========================================================
-async function processDemand(hubKey, user) {
+async function processDemand(hubKey) {
   try {
       let demandDataStr = await dbGet("GLOBAL_DEMAND") || "{}";
       let demandData = {};
       try { demandData = JSON.parse(demandDataStr); } catch(e) {}
 
-      let loc = demandData[hubKey] || { mult: 1.0, history: [], last_delivery: 0, user_history: {} };
-      if (!loc.user_history) loc.user_history = {}; 
-
+      let loc = demandData[hubKey] || { mult: 1.0, history: [], last_delivery: 0 };
       let now = getUnixTime();
 
       // Limpa o histórico de entregas (Apaga tudo mais velho que 3 Horas = 10800s)
       loc.history = loc.history.filter(ts => (now - ts) <= 10800);
 
-      // Proteção anti-duplo clique (10 segundos)
-      let lastUserTime = loc.user_history[user] || 0;
-      let alreadyCountedRecently = (now - lastUserTime) < 10;
-
-      if (!alreadyCountedRecently) {
-         // Recuperação de Demanda (+0.2 por cada Hora sem entregas)
-         if (loc.last_delivery > 0 && loc.mult < 1.0) {
-            let timeOffline = now - loc.last_delivery;
-            if (timeOffline >= 3600) {
-               let hoursRecovered = Math.floor(timeOffline / 3600);
-               loc.mult = Math.min(1.0, loc.mult + (hoursRecovered * 0.2));
-            }
+      // Recuperação de Demanda (+0.2 por cada Hora sem entregas)
+      if (loc.last_delivery > 0 && loc.mult < 1.0) {
+         let timeOffline = now - loc.last_delivery;
+         if (timeOffline >= 3600) {
+            let hoursRecovered = Math.floor(timeOffline / 3600);
+            loc.mult = Math.min(1.0, loc.mult + (hoursRecovered * 0.2));
          }
-
-         // Aplica Queda se Hub estiver Saturado (>= 3 entregas nas últimas 3h)
-         if (loc.history.length >= 3) {
-            loc.mult = Math.max(0.1, loc.mult - 0.1); 
-         }
-         
-         loc.mult = Math.round(loc.mult * 10) / 10;
-         
-         loc.history.push(now);
-         loc.last_delivery = now;
-         loc.user_history[user] = now;
-         
-         demandData[hubKey] = loc;
-         await dbSet("GLOBAL_DEMAND", JSON.stringify(demandData));
       }
 
-      return { mult: loc.mult };
+      // Adiciona a entrega atual ao histórico deste Hub específico
+      loc.history.push(now);
+      loc.last_delivery = now;
+
+      // Aplica Queda se Hub estiver Saturado (>= 3 entregas nas últimas 3h)
+      if (loc.history.length >= 3) {
+         loc.mult = Math.max(0.1, loc.mult - 0.1); 
+      }
+      
+      loc.mult = Math.round(loc.mult * 10) / 10;
+      
+      demandData[hubKey] = loc;
+      await dbSet("GLOBAL_DEMAND", JSON.stringify(demandData));
+
+      return { mult: loc.mult, count: loc.history.length };
   } catch (err) {
       console.error("Erro no processDemand:", err);
-      return { mult: 1.0 }; // Fallback seguro para nunca dar 500
+      return { mult: 1.0, count: 0 };
   }
 }
 // ========================================================
 
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime, action } = req.body;
-  let targetUuid = target || plan; 
   let safeTopic = (topic || action || "").toLowerCase().trim();
   
-  // Extração Cirúrgica de UUID
+  // ========================================================
+  // EXTRATOR BLINDADO DE DESTINO (NUNCA USA PLANO COMO HUB)
+  // ========================================================
   let rawData = `${target || ""} ${content || ""} ${plan || ""} ${productName || ""} ${action || ""}`;
-  let hubUuid = null;
+  let hubKey = "DEFAULT_HUB";
+
+  // 1. Tenta achar a UUID de 36 caracteres da parcela
   let uuidMatch = rawData.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
   if (uuidMatch) {
-      hubUuid = uuidMatch[1];
+      hubKey = uuidMatch[1];
   } else {
-      hubUuid = targetUuid;
+      // 2. Se não houver UUID, usa o target (se não for nome de plano)
+      let cleanTarget = (target || "").trim();
+      const invalidValues = ["free", "premium", "test_cargo", "event", "test", "0", ""];
+      if (cleanTarget && !invalidValues.includes(cleanTarget.toLowerCase())) {
+          hubKey = cleanTarget;
+      } else {
+          // 3. Fallback para productName ou nome genérico isolado
+          let cleanProduct = (productName || "").trim();
+          if (cleanProduct && !invalidValues.includes(cleanProduct.toLowerCase())) {
+              hubKey = cleanProduct;
+          } else {
+              hubKey = "GFN_MAIN_HUB";
+          }
+      }
   }
-  
   // ========================================================
-  // 1. DEBOUNCE ANTI-GLITCH
+
   // ========================================================
-  const txHash = `${user}_${safeTopic}_${hubUuid}_${content}`;
+  // 1. DEBOUNCE ANTI-GLITCH (BLOQUEIA DUPLAS COLISÕES DO SL)
+  // ========================================================
+  const txHash = `${user}_${safeTopic}_${hubKey}_${content}`;
   if (globalDebounce.has(txHash)) {
       return res.json({ status: "ignored" });
   }
@@ -588,7 +597,6 @@ app.post("/action", requireToken, async (req, res) => {
   await withLock(user, async () => {
     try {
       
-      // FILTRO ESTRITO: Apenas comandos reais de entrega ou venda passam por aqui
       if (safeTopic === "cargo sell" || safeTopic === "delivered" || safeTopic === "delivery") {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
@@ -597,10 +605,9 @@ app.post("/action", requireToken, async (req, res) => {
         let demandMult = 1.0;
         let now = getUnixTime();
 
-        if (hubUuid && hubUuid.length === 36 && hubUuid !== "00000000-0000-0000-0000-000000000000") {
-            let demandResult = await processDemand(hubUuid, user);
-            demandMult = demandResult.mult;
-        }
+        // Processa a demanda especificamente para esta chave de Hub/Parcela isolada
+        let demandResult = await processDemand(hubKey);
+        demandMult = demandResult.mult;
 
         if (safeTopic !== "cargo sell") {
             return res.json({ status: "success" });
@@ -734,7 +741,7 @@ app.post("/action", requireToken, async (req, res) => {
       } 
       else if (safeTopic === "addboost") {
         let add_mult = parseFloat(content) || 1.0;
-        let add_time = parseInt(targetUuid) || 0;
+        let add_time = parseInt(target) || 0;
         let player = await getPlayerData(user);
         let now = getUnixTime();
         let current_time = player.B_T;
@@ -750,22 +757,22 @@ app.post("/action", requireToken, async (req, res) => {
         await addPlayerMessage(user, `You have ${player.P} GFN points this week.`);
       }
       else if (safeTopic === "godcheck") {
-        let tPlayer = await getPlayerData(targetUuid);
-        await addPlayerMessage(user, `Target (${targetUuid}) Balance: ${tPlayer.M} F₵ | Points: ${tPlayer.P}`);
+        let tPlayer = await getPlayerData(target);
+        await addPlayerMessage(user, `Target (${target}) Balance: ${tPlayer.M} F₵ | Points: ${tPlayer.P}`);
       }
       else if (safeTopic === "m_reset") {
-        let tPlayer = await getPlayerData(targetUuid);
+        let tPlayer = await getPlayerData(target);
         tPlayer.M = parseInt(content) || 0;
-        await savePlayerData(targetUuid, tPlayer);
-        await addPlayerMessage(user, `Money reset for ${targetUuid}. New balance: ${tPlayer.M} F₵`);
-        await addPlayerMessage(targetUuid, `Your money balance was reset by an administrator.`);
+        await savePlayerData(target, tPlayer);
+        await addPlayerMessage(user, `Money reset for ${target}. New balance: ${tPlayer.M} F₵`);
+        await addPlayerMessage(target, `Your money balance was reset by an administrator.`);
       }
       else if (safeTopic === "p_reset") {
-        let tPlayer = await getPlayerData(targetUuid);
+        let tPlayer = await getPlayerData(target);
         tPlayer.P = parseInt(content) || 0;
-        await savePlayerData(targetUuid, tPlayer);
-        await addPlayerMessage(user, `Points reset for ${targetUuid}. New points: ${tPlayer.P}`);
-        await addPlayerMessage(targetUuid, `Your GFN points were reset by an administrator.`);
+        await savePlayerData(target, tPlayer);
+        await addPlayerMessage(user, `Points reset for ${target}. New points: ${tPlayer.P}`);
+        await addPlayerMessage(target, `Your GFN points were reset by an administrator.`);
       }
       else if (safeTopic === "pay") {
         let amountVal = parseInt(content) || 0;
@@ -780,23 +787,23 @@ app.post("/action", requireToken, async (req, res) => {
           await addPlayerMessage(user, `Transaction failed. You don't have enough F₵. Current balance: ${sender.M} F₵`);
           return res.json({ status: "denied" });
         }
-        if (user === targetUuid) {
+        if (user === target) {
           await addPlayerMessage(user, "Transaction failed. You cannot pay yourself.");
           return res.json({ status: "denied" });
         }
 
-        let tPlayer = await getPlayerData(targetUuid);
+        let tPlayer = await getPlayerData(target);
         sender.M -= amountVal;
         tPlayer.M += amountVal;
         
         await savePlayerData(user, sender);
-        await savePlayerData(targetUuid, tPlayer);
+        await savePlayerData(target, tPlayer);
 
         let senderProfile = `secondlife:///app/agent/${user}/about`;
-        let targetProfile = `secondlife:///app/agent/${targetUuid}/about`;
+        let targetProfile = `secondlife:///app/agent/${target}/about`;
 
         await addPlayerMessage(user, `You successfully paid ${amountVal} F₵ to ${targetProfile}. Your new balance: ${sender.M} F₵`);
-        await addPlayerMessage(targetUuid, `You received ${amountVal} F₵ from ${senderProfile}. Your new balance: ${tPlayer.M} F₵`);
+        await addPlayerMessage(target, `You received ${amountVal} F₵ from ${senderProfile}. Your new balance: ${tPlayer.M} F₵`);
       }
       else if (safeTopic === "mass_money_reset_custom") {
         const maxValue = parseInt(content) || 0;
@@ -828,7 +835,7 @@ app.post("/action", requireToken, async (req, res) => {
           return res.json(responsePayload);
         }
         let buyer = await getPlayerData(user);
-        let ownerUuid = targetUuid;
+        let ownerUuid = target;
         if (buyer.M < price) {
           await addPlayerMessage(user, `You don't have enough F₵. Required: ${price}, You have: ${buyer.M}`);
           responsePayload.status = "denied";
@@ -917,6 +924,7 @@ app.get("/get", async (req, res) => {
 
 app.post("/set", requireToken, async (req, res) => {
   const { id, value } = req.body;
+  id; // no-op
   if (!id) return res.status(400).json({ error: "missing id" });
   try {
     await db.query(
