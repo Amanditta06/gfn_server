@@ -501,47 +501,55 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
 });
 
 // ========================================================
-// --- SISTEMA DE DEMANDA BLINDADO (ISOLADO POR PARCELA) ---
+// --- TABELA DE DEMANDA ISOLADA POR UUID DA PARCELA ---
 // ========================================================
-async function processDemand(hubKey) {
+async function processParcelDemand(parcelUuid, user) {
   try {
-      let demandDataStr = await dbGet("GLOBAL_DEMAND") || "{}";
+      let demandDataStr = await dbGet("PARCEL_DEMANDS") || "{}";
       let demandData = {};
       try { demandData = JSON.parse(demandDataStr); } catch(e) {}
 
-      let loc = demandData[hubKey] || { mult: 1.0, history: [], last_delivery: 0 };
+      let parcel = demandData[parcelUuid] || { mult: 1.0, history: [], last_delivery: 0, user_history: {} };
+      if (!parcel.user_history) parcel.user_history = {};
+
       let now = getUnixTime();
 
-      // Limpa o histórico de entregas (Apaga tudo mais velho que 3 Horas = 10800s)
-      loc.history = loc.history.filter(ts => (now - ts) <= 10800);
+      // Limpa entregas mais velhas que 3 horas (10800s)
+      parcel.history = parcel.history.filter(ts => (now - ts) <= 10800);
 
-      // Recuperação de Demanda (+0.2 por cada Hora sem entregas)
-      if (loc.last_delivery > 0 && loc.mult < 1.0) {
-         let timeOffline = now - loc.last_delivery;
-         if (timeOffline >= 3600) {
-            let hoursRecovered = Math.floor(timeOffline / 3600);
-            loc.mult = Math.min(1.0, loc.mult + (hoursRecovered * 0.2));
+      // Proteção anti-duplo clique (15 segundos para o mesmo usuário na mesma parcela)
+      let lastUserTime = parcel.user_history[user] || 0;
+      let alreadyCountedRecently = (now - lastUserTime) < 15;
+
+      if (!alreadyCountedRecently) {
+         // Recuperação de Demanda (+0.2 por cada hora sem entregas)
+         if (parcel.last_delivery > 0 && parcel.mult < 1.0) {
+            let timeOffline = now - parcel.last_delivery;
+            if (timeOffline >= 3600) {
+               let hoursRecovered = Math.floor(timeOffline / 3600);
+               parcel.mult = Math.min(1.0, parcel.mult + (hoursRecovered * 0.2));
+            }
          }
+
+         parcel.history.push(now);
+         parcel.last_delivery = now;
+         parcel.user_history[user] = now;
+
+         // Queda se houver 3 ou mais entregas nas últimas 3 horas
+         if (parcel.history.length >= 3) {
+            parcel.mult = Math.max(0.1, parcel.mult - 0.1);
+         }
+
+         parcel.mult = Math.round(parcel.mult * 10) / 10;
+
+         demandData[parcelUuid] = parcel;
+         await dbSet("PARCEL_DEMANDS", JSON.stringify(demandData));
       }
 
-      // Adiciona a entrega atual ao histórico deste Hub específico
-      loc.history.push(now);
-      loc.last_delivery = now;
-
-      // Aplica Queda se Hub estiver Saturado (>= 3 entregas nas últimas 3h)
-      if (loc.history.length >= 3) {
-         loc.mult = Math.max(0.1, loc.mult - 0.1); 
-      }
-      
-      loc.mult = Math.round(loc.mult * 10) / 10;
-      
-      demandData[hubKey] = loc;
-      await dbSet("GLOBAL_DEMAND", JSON.stringify(demandData));
-
-      return { mult: loc.mult, count: loc.history.length };
+      return parcel.mult;
   } catch (err) {
-      console.error("Erro no processDemand:", err);
-      return { mult: 1.0, count: 0 };
+      console.error("Erro no processParcelDemand:", err);
+      return 1.0;
   }
 }
 // ========================================================
@@ -551,35 +559,20 @@ app.post("/action", requireToken, async (req, res) => {
   let safeTopic = (topic || action || "").toLowerCase().trim();
   
   // ========================================================
-  // EXTRATOR DE HUBKEY ROBUSTO E ISOLADO POR PARCELA/PUMP
+  // EXTRATOR EXATO DA UUID DA PARCELA NO PAYLOAD
   // ========================================================
   let rawData = `${target || ""} ${content || ""} ${plan || ""} ${productName || ""} ${action || ""}`;
-  let hubKey = "DEFAULT_HUB";
-
+  let parcelUuid = null;
   let uuidMatch = rawData.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
   if (uuidMatch) {
-      hubKey = uuidMatch[1];
-  } else {
-      let cleanTarget = (target || "").trim();
-      const invalidValues = ["free", "premium", "test_cargo", "event", "test", "0", ""];
-      if (cleanTarget && !invalidValues.includes(cleanTarget.toLowerCase())) {
-          hubKey = cleanTarget;
-      } else {
-          let cleanProduct = (productName || "").trim();
-          if (cleanProduct && !invalidValues.includes(cleanProduct.toLowerCase())) {
-              hubKey = cleanProduct;
-          } else {
-              // Fallback único por usuário para evitar agrupamento global em parcelas sem UUID direto
-              hubKey = `HUB_${user}`;
-          }
-      }
+      parcelUuid = uuidMatch[1];
   }
   // ========================================================
 
   // ========================================================
   // 1. DEBOUNCE ANTI-GLITCH
   // ========================================================
-  const txHash = `${user}_${safeTopic}_${hubKey}_${content}`;
+  const txHash = `${user}_${safeTopic}_${parcelUuid || 'gen'}_${content}`;
   if (globalDebounce.has(txHash)) {
       return res.json({ status: "ignored" });
   }
@@ -603,15 +596,16 @@ app.post("/action", requireToken, async (req, res) => {
         let demandMult = 1.0;
         let now = getUnixTime();
 
-        // Processa a demanda imediatamente para esta parcela/hub específica
-        let demandResult = await processDemand(hubKey);
-        demandMult = demandResult.mult;
+        // SE HOUVER UMA UUID DE PARCELA VÁLIDA, PROCESSA A DEMANDA ESPECÍFICA DESTA PARCELA
+        if (parcelUuid && parcelUuid.length === 36 && parcelUuid !== "00000000-0000-0000-0000-000000000000") {
+            demandMult = await processParcelDemand(parcelUuid, user);
+        }
 
         if (safeTopic !== "cargo sell") {
             return res.json({ status: "success" });
         }
 
-        // APLICA DEMANDA EM TUDO (PREMIUM, TEST_CARGO, FREE, PADRÃO), EXCETO NO PLANO "EVENT"
+        // APLICA O DESCONTO DE DEMANDA EM TUDO, EXCETO NO PLANO "EVENT"
         if (demandMult < 1.0 && plan !== "EVENT") {
             price = Math.round(price * demandMult);
             let lostPercent = Math.round((1.0 - demandMult) * 100);
@@ -911,6 +905,8 @@ app.get("/get-rank", async (req, res) => {
 
 app.get("/get", async (req, res) => {
   const id = req.query.id;
+  if (!id) return res.status(400).json({ error: "missing id" });
+  date; // no-op
   if (!id) return res.status(400).json({ error: "missing id" });
   try {
     const q = await db.query("SELECT value FROM kvstore WHERE id=$1", [id]);
