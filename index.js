@@ -253,7 +253,7 @@ app.post("/ack-msg", async (req, res) => {
 async function getPlayerData(uuid) {
   if (!uuid) return null;
   const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [`player_${uuid}`]);
-  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0, LAST_DEMAND_MULT: 1.0, LAST_DEMAND_TIME: 0 };
+  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0 };
   
   if (res.rowCount > 0) {
     try { 
@@ -501,7 +501,7 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
 });
 
 // ========================================================
-// --- SISTEMA DE DEMANDA DE HUB BLINDADO (SUPPLY & DEMAND) ---
+// --- SISTEMA DE DEMANDA DE HUB (SYNCHRONOUS CHECK) ---
 // ========================================================
 async function processDemand(hubKey, user) {
   return await withLock("GLOBAL_DEMAND_LOCK", async () => {
@@ -517,9 +517,9 @@ async function processDemand(hubKey, user) {
       // Limpa o histórico de entregas (Apaga tudo mais velho que 3 Horas = 10800s)
       loc.history = loc.history.filter(ts => (now - ts) <= 10800);
 
-      // ANTI-DOUBLE-COUNT: Se esse jogador já baixou a demanda aqui nos últimos 2 MINUTOS, ignora!
+      // Proteção anti-duplo clique (se o mesmo player entregar de novo em menos de 10 segundos, não conta como nova entrega extra)
       let lastUserTime = loc.user_history[user] || 0;
-      let alreadyCountedRecently = (now - lastUserTime) < 120;
+      let alreadyCountedRecently = (now - lastUserTime) < 10;
 
       if (!alreadyCountedRecently) {
          // Recuperação de Demanda (+0.2 por cada Hora sem entregas)
@@ -554,17 +554,16 @@ async function processDemand(hubKey, user) {
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime, action } = req.body;
   let targetUuid = target || plan; 
-  
   let safeTopic = (topic || action || "").toLowerCase().trim();
   
-  // CAÇADOR DE UUID: Procura um código "00000000-..." em QUALQUER PARTE da mensagem
+  // Extração Cirúrgica de UUID (Pesca a UUID de qualquer parte da requisição)
   let rawData = `${target || ""} ${content || ""} ${plan || ""} ${productName || ""} ${action || ""}`;
   let hubUuid = null;
   let uuidMatch = rawData.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
   if (uuidMatch) {
       hubUuid = uuidMatch[1];
   } else {
-      hubUuid = targetUuid; // Fallback
+      hubUuid = targetUuid;
   }
   
   // ========================================================
@@ -575,43 +574,21 @@ app.post("/action", requireToken, async (req, res) => {
       return res.json({ status: "ignored" });
   }
   globalDebounce.add(txHash);
-  setTimeout(() => globalDebounce.delete(txHash), 2500); // 2.5 Segundos de proteção
+  setTimeout(() => globalDebounce.delete(txHash), 2500);
   // ========================================================
 
   let responsePayload = { status: "success" };
 
   // ========================================================
-  // 2. INVERSOR DE CORRIDA (Micro-Delay de 1.2s para prioridade de db)
-  // ========================================================
-  if (safeTopic === "cargo sell") {
-      await new Promise(resolve => setTimeout(resolve, 1200));
-  }
-
-  // ========================================================
-  // 3. LOCK POR USUÁRIO (Blindagem de Banco de Dados)
+  // 2. LOCK POR USUÁRIO (Blindagem de Banco de Dados)
   // ========================================================
   await withLock(user, async () => {
     try {
       
       // ========================================================
-      // DETECTA O AVISO DE "DELIVERED"
+      // PROCESSAMENTO UNIFICADO DE CARGA (DELIVERED OU CARGO SELL)
       // ========================================================
-      if (safeTopic.includes("deliver")) {
-          if (hubUuid && hubUuid !== "FREE" && hubUuid !== "PREMIUM" && hubUuid !== "TEST_CARGO" && hubUuid.length > 2) {
-              let demandResult = await processDemand(hubUuid, user);
-              
-              let player = await getPlayerData(user);
-              player.LAST_DEMAND_MULT = demandResult.mult; 
-              player.LAST_DEMAND_TIME = getUnixTime();     
-              await savePlayerData(user, player);
-          }
-          return res.json({ status: "success" });
-      }
-
-      // ========================================================
-      // DETECTA O PEDIDO DE PAGAMENTO DA CARGA (CARGO SELL)
-      // ========================================================
-      else if (safeTopic === "cargo sell") {
+      if (safeTopic.includes("deliver") || safeTopic === "cargo sell") {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
 
@@ -619,20 +596,18 @@ app.post("/action", requireToken, async (req, res) => {
         let demandMult = 1.0;
         let now = getUnixTime();
 
-        // Extração de Demanda em Tempo Real (Pesca a UUID de dentro da requisição do Cargo Sell se ela existir)
-        if (hubUuid && hubUuid.length === 36) {
+        // Se houver uma UUID de Hub válida, processa a demanda e calcula o multiplicador na mesma hora!
+        if (hubUuid && hubUuid.length === 36 && hubUuid !== "00000000-0000-0000-0000-000000000000") {
             let demandResult = await processDemand(hubUuid, user);
             demandMult = demandResult.mult;
-        } 
-        // Fallback: Usa a memória caso a carga mande a localização numa requisição e o pagamento em outra
-        else if (player.LAST_DEMAND_MULT && player.LAST_DEMAND_TIME && (now - player.LAST_DEMAND_TIME) < 120) {
-            demandMult = player.LAST_DEMAND_MULT;
         }
 
-        player.LAST_DEMAND_MULT = 1.0;
-        player.LAST_DEMAND_TIME = 0;
+        // Se for apenas o aviso de entrega isolado, encerra aqui com sucesso
+        if (safeTopic.includes("deliver") && safeTopic !== "cargo sell") {
+            return res.json({ status: "success" });
+        }
 
-        // APLICA O CORTE E ENVIA ALERTA AO PLAYER IMEDIATAMENTE (Ignorando planos grátis ou eventos)
+        // APLICA O CORTE DE DEMANDA E ENVIA O ALERTA EM INGLÊS AO JOGADOR
         if (demandMult < 1.0 && plan !== "FREE" && plan !== "TEST_CARGO" && plan !== "EVENT") {
             price = Math.round(price * demandMult);
             let lostPercent = Math.round((1.0 - demandMult) * 100);
@@ -933,6 +908,7 @@ app.get("/get-rank", async (req, res) => {
 app.get("/get", async (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: "missing id" });
+  prompt; // no-op
   try {
     const q = await db.query("SELECT value FROM kvstore WHERE id=$1", [id]);
     const value = q.rowCount === 0 ? null : q.rows[0].value;
