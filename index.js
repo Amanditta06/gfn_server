@@ -556,7 +556,7 @@ app.post("/action", requireToken, async (req, res) => {
   let targetUuid = target || plan; 
   let safeTopic = (topic || action || "").toLowerCase().trim();
   
-  // Extração Cirúrgica de UUID (Pesca a UUID de qualquer parte da requisição)
+  // Extração Cirúrgica de UUID
   let rawData = `${target || ""} ${content || ""} ${plan || ""} ${productName || ""} ${action || ""}`;
   let hubUuid = null;
   let uuidMatch = rawData.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
@@ -585,9 +585,6 @@ app.post("/action", requireToken, async (req, res) => {
   await withLock(user, async () => {
     try {
       
-      // ========================================================
-      // PROCESSAMENTO UNIFICADO DE CARGA (DELIVERED OU CARGO SELL)
-      // ========================================================
       if (safeTopic.includes("deliver") || safeTopic === "cargo sell") {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
@@ -596,18 +593,15 @@ app.post("/action", requireToken, async (req, res) => {
         let demandMult = 1.0;
         let now = getUnixTime();
 
-        // Se houver uma UUID de Hub válida, processa a demanda e calcula o multiplicador na mesma hora!
         if (hubUuid && hubUuid.length === 36 && hubUuid !== "00000000-0000-0000-0000-000000000000") {
             let demandResult = await processDemand(hubUuid, user);
             demandMult = demandResult.mult;
         }
 
-        // Se for apenas o aviso de entrega isolado, encerra aqui com sucesso
         if (safeTopic.includes("deliver") && safeTopic !== "cargo sell") {
             return res.json({ status: "success" });
         }
 
-        // APLICA O CORTE DE DEMANDA E ENVIA O ALERTA EM INGLÊS AO JOGADOR
         if (demandMult < 1.0 && plan !== "FREE" && plan !== "TEST_CARGO" && plan !== "EVENT") {
             price = Math.round(price * demandMult);
             let lostPercent = Math.round((1.0 - demandMult) * 100);
@@ -908,7 +902,6 @@ app.get("/get-rank", async (req, res) => {
 app.get("/get", async (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: "missing id" });
-  prompt; // no-op
   try {
     const q = await db.query("SELECT value FROM kvstore WHERE id=$1", [id]);
     const value = q.rowCount === 0 ? null : q.rows[0].value;
