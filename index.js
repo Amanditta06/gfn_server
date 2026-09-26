@@ -681,12 +681,47 @@ app.post("/action", requireToken, async (req, res) => {
     }
     else if (topic === "pay") {
       let amountVal = parseInt(content) || 0;
+      
+      // Validações básicas de valor
+      if (amountVal <= 0) {
+        await addPlayerMessage(user, "Transaction failed. Invalid amount.");
+        return res.json({ status: "denied" });
+      }
       if (amountVal > MAX_TRANSACTION) amountVal = MAX_TRANSACTION;
+      
+      let sender = await getPlayerData(user);
+      
+      // Verifica se quem está pagando tem o dinheiro suficiente (Corrige o bug de gerar dinheiro infinito)
+      if (sender.M < amountVal) {
+        await addPlayerMessage(user, `Transaction failed. You don't have enough F₵. Current balance: ${sender.M} F₵`);
+        return res.json({ status: "denied" });
+      }
+
+      // Previne que o jogador pague a si mesmo
+      if (user === targetUuid) {
+        await addPlayerMessage(user, "Transaction failed. You cannot pay yourself.");
+        return res.json({ status: "denied" });
+      }
+
       let tPlayer = await getPlayerData(targetUuid);
+      
+      // Transferência real (Subtrai de quem paga, adiciona a quem recebe)
+      sender.M -= amountVal;
       tPlayer.M += amountVal;
+      
+      // Salva no banco de dados
+      await savePlayerData(user, sender);
       await savePlayerData(targetUuid, tPlayer);
-      await addPlayerMessage(user, `Successfully adjusted balance of ${targetUuid} by ${amountVal} F₵. New balance: ${tPlayer.M} F₵`);
-      await addPlayerMessage(targetUuid, `Your balance was adjusted by ${amountVal} F₵ by an administrator. Current balance: ${tPlayer.M} F₵`);
+
+      // Converte os UUIDs no formato de link nativo do Second Life (Aparecerá o nome do avatar na tela)
+      let senderProfile = `secondlife:///app/agent/${user}/about`;
+      let targetProfile = `secondlife:///app/agent/${targetUuid}/about`;
+
+      // Mensagem para quem PAGOU (Vê apenas o próprio saldo)
+      await addPlayerMessage(user, `You successfully paid ${amountVal} F₵ to ${targetProfile}. Your new balance: ${sender.M} F₵`);
+      
+      // Mensagem para quem RECEBEU (Vê de quem veio e o próprio saldo)
+      await addPlayerMessage(targetUuid, `You received ${amountVal} F₵ from ${senderProfile}. Your new balance: ${tPlayer.M} F₵`);
     }
     else if (topic === "MASS_MONEY_RESET_CUSTOM") {
       const maxValue = parseInt(content) || 0;
