@@ -501,20 +501,19 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
 });
 
 // ========================================================
-// --- TABELA DE DEMANDA ISOLADA POR UUID DA PARCELA ---
+// --- DEMANDA ISOLADA POR PARCELA (TABELA INDIVIDUAL) ---
 // ========================================================
 async function processParcelDemand(parcelUuid, user) {
+  if (!parcelUuid || parcelUuid.length !== 36) return 1.0;
+  const key = `PARCEL_${parcelUuid}`;
   try {
-      let demandDataStr = await dbGet("PARCEL_DEMANDS") || "{}";
-      let demandData = {};
-      try { demandData = JSON.parse(demandDataStr); } catch(e) {}
-
-      let parcel = demandData[parcelUuid] || { mult: 1.0, history: [], last_delivery: 0, user_history: {} };
+      let dataStr = await dbGet(key);
+      let parcel = dataStr ? JSON.parse(dataStr) : { mult: 1.0, history: [], last_delivery: 0, user_history: {} };
       if (!parcel.user_history) parcel.user_history = {};
 
       let now = getUnixTime();
 
-      // Limpa entregas mais velhas que 3 horas (10800s)
+      // Limpa histórico de entregas mais velho que 3 horas (10800s)
       parcel.history = parcel.history.filter(ts => (now - ts) <= 10800);
 
       // Proteção anti-duplo clique (15 segundos para o mesmo usuário na mesma parcela)
@@ -542,8 +541,7 @@ async function processParcelDemand(parcelUuid, user) {
 
          parcel.mult = Math.round(parcel.mult * 10) / 10;
 
-         demandData[parcelUuid] = parcel;
-         await dbSet("PARCEL_DEMANDS", JSON.stringify(demandData));
+         await dbSet(key, JSON.stringify(parcel));
       }
 
       return parcel.mult;
@@ -596,7 +594,7 @@ app.post("/action", requireToken, async (req, res) => {
         let demandMult = 1.0;
         let now = getUnixTime();
 
-        // SE HOUVER UMA UUID DE PARCELA VÁLIDA, PROCESSA A DEMANDA ESPECÍFICA DESTA PARCELA
+        // SE HOUVER UMA UUID DE PARCELA VÁLIDA, PROCESSA A DEMANDA EXCLUSIVA DESTA PARCELA
         if (parcelUuid && parcelUuid.length === 36 && parcelUuid !== "00000000-0000-0000-0000-000000000000") {
             demandMult = await processParcelDemand(parcelUuid, user);
         }
@@ -605,7 +603,7 @@ app.post("/action", requireToken, async (req, res) => {
             return res.json({ status: "success" });
         }
 
-        // APLICA O DESCONTO DE DEMANDA EM TUDO, EXCETO NO PLANO "EVENT"
+        // APLICA O DESCONTO DE DEMANDA EM TUDO (PREMIUM, TEST_CARGO, FREE, PADRÃO), EXCETO NO PLANO "EVENT"
         if (demandMult < 1.0 && plan !== "EVENT") {
             price = Math.round(price * demandMult);
             let lostPercent = Math.round((1.0 - demandMult) * 100);
