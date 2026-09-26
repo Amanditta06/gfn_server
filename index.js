@@ -253,7 +253,7 @@ app.post("/ack-msg", async (req, res) => {
 async function getPlayerData(uuid) {
   if (!uuid) return null;
   const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [`player_${uuid}`]);
-  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0 };
+  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0 };
   
   if (res.rowCount > 0) {
     try { 
@@ -270,6 +270,7 @@ async function getPlayerData(uuid) {
       data.RE = parseInt(data.RE, 10) || 0;
       data.B_M = parseFloat(data.B_M) || 1.0;
       data.B_T = parseInt(data.B_T, 10) || 0;
+      data.PARCEL_TIME = parseInt(data.PARCEL_TIME, 10) || 0;
     } catch(e) {
       console.error(`Error parsing player data for ${uuid}:`, e);
     }
@@ -555,22 +556,11 @@ async function processParcelDemand(parcelUuid, user) {
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime, action } = req.body;
   let safeTopic = (topic || action || "").toLowerCase().trim();
-  
-  // ========================================================
-  // EXTRATOR EXATO DA UUID DA PARCELA NO PAYLOAD
-  // ========================================================
-  let rawData = `${target || ""} ${content || ""} ${plan || ""} ${productName || ""} ${action || ""}`;
-  let parcelUuid = null;
-  let uuidMatch = rawData.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-  if (uuidMatch) {
-      parcelUuid = uuidMatch[1];
-  }
-  // ========================================================
 
   // ========================================================
   // 1. DEBOUNCE ANTI-GLITCH
   // ========================================================
-  const txHash = `${user}_${safeTopic}_${parcelUuid || 'gen'}_${content}`;
+  const txHash = `${user}_${safeTopic}_${content}`;
   if (globalDebounce.has(txHash)) {
       return res.json({ status: "ignored" });
   }
@@ -585,25 +575,30 @@ app.post("/action", requireToken, async (req, res) => {
   // ========================================================
   await withLock(user, async () => {
     try {
-      
-      if (safeTopic === "cargo sell" || safeTopic === "delivered" || safeTopic === "delivery") {
+      let player = await getPlayerData(user);
+      let now = getUnixTime();
+
+      if (safeTopic === "cargo sell") {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
 
-        let player = await getPlayerData(user);
         let demandMult = 1.0;
-        let now = getUnixTime();
 
-        // SE HOUVER UMA UUID DE PARCELA VÁLIDA, PROCESSA A DEMANDA EXCLUSIVA DESTA PARCELA
-        if (parcelUuid && parcelUuid.length === 36 && parcelUuid !== "00000000-0000-0000-0000-000000000000") {
-            demandMult = await processParcelDemand(parcelUuid, user);
+        // Pega a UUID da parcela associada a ESTE EXATO jogador pelo log recente (< 120 segundos)
+        let targetParcel = null;
+        if (player.ACTIVE_PARCEL && (now - player.PARCEL_TIME) < 120) {
+            targetParcel = player.ACTIVE_PARCEL;
         }
 
-        if (safeTopic !== "cargo sell") {
-            return res.json({ status: "success" });
+        if (targetParcel && targetParcel.length === 36 && targetParcel !== "00000000-0000-0000-0000-000000000000") {
+            demandMult = await processParcelDemand(targetParcel, user);
         }
 
-        // APLICA O DESCONTO DE DEMANDA EM TUDO (PREMIUM, TEST_CARGO, FREE, PADRÃO), EXCETO NO PLANO "EVENT"
+        // Limpa a memória temporária do player após o uso
+        player.ACTIVE_PARCEL = "";
+        player.PARCEL_TIME = 0;
+
+        // APLICA O DESCONTO DE DEMANDA EM TUDO, EXCETO NO PLANO "EVENT"
         if (demandMult < 1.0 && plan !== "EVENT") {
             price = Math.round(price * demandMult);
             let lostPercent = Math.round((1.0 - demandMult) * 100);
@@ -924,6 +919,24 @@ app.post("/set", requireToken, async (req, res) => {
     if (id === "GLOBAL_SETTINGS") {
         await loadGlobalSettings();
     }
+
+    // ========================================================
+    // --- INTERCEPTAÇÃO SEGURA VINCULADA AO AGENT (PLAYER) ---
+    // ========================================================
+    if (id === "gfn_admin_logs" && value && value.includes("Action: Cargo Delivered")) {
+        let agentMatch = value.match(/\/app\/agent\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+        let parcelMatch = value.match(/\/app\/parcel\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+        if (agentMatch && parcelMatch) {
+            let playerUuid = agentMatch[1];
+            let parcelUuid = parcelMatch[1];
+            let pData = await getPlayerData(playerUuid);
+            pData.ACTIVE_PARCEL = parcelUuid;
+            pData.PARCEL_TIME = getUnixTime();
+            await savePlayerData(playerUuid, pData);
+        }
+    }
+    // ========================================================
+
     res.json({ status: "ok", id, value });
   } catch (e) {
     res.status(500).json({ error: "db error" });
