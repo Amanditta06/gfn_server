@@ -556,18 +556,15 @@ app.post("/action", requireToken, async (req, res) => {
   let rawData = `${target || ""} ${content || ""} ${plan || ""} ${productName || ""} ${action || ""}`;
   let hubKey = "DEFAULT_HUB";
 
-  // 1. Tenta achar a UUID de 36 caracteres da parcela
   let uuidMatch = rawData.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
   if (uuidMatch) {
       hubKey = uuidMatch[1];
   } else {
-      // 2. Se não houver UUID, usa o target (se não for nome de plano)
       let cleanTarget = (target || "").trim();
       const invalidValues = ["free", "premium", "test_cargo", "event", "test", "0", ""];
       if (cleanTarget && !invalidValues.includes(cleanTarget.toLowerCase())) {
           hubKey = cleanTarget;
       } else {
-          // 3. Fallback para productName ou nome genérico isolado
           let cleanProduct = (productName || "").trim();
           if (cleanProduct && !invalidValues.includes(cleanProduct.toLowerCase())) {
               hubKey = cleanProduct;
@@ -579,7 +576,7 @@ app.post("/action", requireToken, async (req, res) => {
   // ========================================================
 
   // ========================================================
-  // 1. DEBOUNCE ANTI-GLITCH (BLOQUEIA DUPLAS COLISÕES DO SL)
+  // 1. DEBOUNCE ANTI-GLITCH
   // ========================================================
   const txHash = `${user}_${safeTopic}_${hubKey}_${content}`;
   if (globalDebounce.has(txHash)) {
@@ -592,7 +589,7 @@ app.post("/action", requireToken, async (req, res) => {
   let responsePayload = { status: "success" };
 
   // ========================================================
-  // 2. LOCK POR USUÁRIO (Blindagem de Banco de Dados)
+  // 2. LOCK POR USUÁRIO
   // ========================================================
   await withLock(user, async () => {
     try {
@@ -605,7 +602,6 @@ app.post("/action", requireToken, async (req, res) => {
         let demandMult = 1.0;
         let now = getUnixTime();
 
-        // Processa a demanda especificamente para esta chave de Hub/Parcela isolada
         let demandResult = await processDemand(hubKey);
         demandMult = demandResult.mult;
 
@@ -613,7 +609,8 @@ app.post("/action", requireToken, async (req, res) => {
             return res.json({ status: "success" });
         }
 
-        if (demandMult < 1.0 && plan !== "FREE" && plan !== "TEST_CARGO" && plan !== "EVENT") {
+        // APLICA DEMANDA EM TUDO, EXCETO NO PLANO "EVENT"
+        if (demandMult < 1.0 && plan !== "EVENT") {
             price = Math.round(price * demandMult);
             let lostPercent = Math.round((1.0 - demandMult) * 100);
             await addPlayerMessage(user, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +20% every hour without deliveries.`);
@@ -924,7 +921,6 @@ app.get("/get", async (req, res) => {
 
 app.post("/set", requireToken, async (req, res) => {
   const { id, value } = req.body;
-  id; // no-op
   if (!id) return res.status(400).json({ error: "missing id" });
   try {
     await db.query(
