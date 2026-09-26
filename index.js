@@ -263,7 +263,6 @@ async function savePlayerData(uuid, data) {
   );
 }
 
-
 // ========================================================
 // --- GERENCIADOR DE PARCELAS INTELIGENTE ---
 // ========================================================
@@ -404,13 +403,11 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
 });
 
 // ========================================================
-// --- AUTO-SINCER DAS PARCELAS CORRIGIDO PARA PEGAR APENAS A REGIÃO ---
+// --- AUTO-SINCER (WEBSCRAPING PELA URL DO TELEPORTE) ---
 // ========================================================
 app.post('/admin/sync-regions', requireToken, async (req, res) => {
-  // Libera o Second Life IMEDIATAMENTE (Senão o LSL trava esperando o script terminar)
   res.json({ status: "success", message: "Sincronização iniciada em segundo plano. Isso pode levar alguns minutos." });
 
-  // Inicia o processo Web Scraper protegido e otimizado
   (async () => {
     try {
       console.log("[SYNC] Iniciando varredura automatizada das parcelas via Second Life Web...");
@@ -431,7 +428,6 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
         let originalNames = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
         let namesList = originalNames ? originalNames.split("ç") : [];
         
-        // Se novos hubs foram adicionados, cria um slot pra eles
         while (namesList.length < mainList.length) namesList.push("NULL");
 
         let updatedCount = 0;
@@ -441,7 +437,6 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
           
           if (uuid && uuid.length === 36) {
             try {
-              // Burlar Cloudflare e LL com User-Agent Real
               const fetchOptions = {
                 headers: {
                   "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -449,7 +444,6 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
                 }
               };
               
-              // Tenta pelo /parcel/ (mais comum para HUBs), se falhar usa /place/
               let slRes = await fetch(`https://world.secondlife.com/parcel/${uuid}`, fetchOptions);
               if (!slRes.ok) {
                  slRes = await fetch(`https://world.secondlife.com/place/${uuid}`, fetchOptions);
@@ -457,54 +451,47 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
 
               if (slRes.ok) {
                 const html = await slRes.text();
+                let extractedRegion = "";
                 
-                // Regex poderoso para ler <title> mesmo se houver quebra de linha interna
-                const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+                // TÉCNICA INFALÍVEL: Procura pelo link de teleporte no código-fonte
+                // Padrão: maps.secondlife.com/secondlife/Nome_da_Regiao/X/Y/Z
+                const mapMatch = html.match(/maps\.secondlife\.com\/secondlife\/([^\/"]+)/i);
                 
-                if (titleMatch && titleMatch[1]) {
-                  let title = titleMatch[1];
-                  
-                  // Limpa quebras de linhas, tabulações e espaços duplos
-                  title = title.replace(/\n/g, ' ').replace(/\r/g, '').replace(/\s+/g, ' ').trim();
-                  
-                  // O formato é "Nome da Parcela - Nome da Região - Second Life"
-                  // 1) Retira o " - Second Life"
-                  let slIdx = title.indexOf(" - Second Life");
-                  if (slIdx !== -1) {
-                    let textSemSL = title.substring(0, slIdx).trim(); // "Nome da Parcela - Nome da Região"
-                    
-                    // 2) Retira o "Nome da Parcela - " pegando tudo após o ÚLTIMO hífen
-                    let lastDashIdx = textSemSL.lastIndexOf(" - ");
-                    if (lastDashIdx !== -1) {
-                        title = textSemSL.substring(lastDashIdx + 3).trim(); // Pega apenas a região
-                    } else {
-                        title = textSemSL; // Fallback se não tiver hífen extra
-                    }
+                if (mapMatch && mapMatch[1]) {
+                  // O mapMatch[1] já pega EXATAMENTE o nome da Região puro que tá na URL
+                  extractedRegion = decodeURIComponent(mapMatch[1]).replace(/\+/g, ' ').trim();
+                } else {
+                  // Fallback para a tag title caso o link não exista (Raro)
+                  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+                  if (titleMatch && titleMatch[1]) {
+                    let title = titleMatch[1].replace(/\n/g, ' ').replace(/\r/g, '').replace(/\s+/g, ' ').trim();
+                    let slIdx = title.indexOf(" - Second Life");
+                    if (slIdx !== -1) title = title.substring(0, slIdx).trim();
+                    let lastDashIdx = title.lastIndexOf(" - ");
+                    if (lastDashIdx !== -1) title = title.substring(lastDashIdx + 3).trim();
+                    extractedRegion = title;
                   }
+                }
 
-                  // Substituição manual (herdada)
-                  if (title.toLowerCase() === "royie" || title.toLowerCase() === "royier") {
-                    title = "Royier";
+                if (extractedRegion) {
+                  if (extractedRegion.toLowerCase() === "royie" || extractedRegion.toLowerCase() === "royier") {
+                    extractedRegion = "Royier";
                   }
+                  extractedRegion = extractedRegion.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
 
-                  // Transforma aspas e símbolos HTML para texto normal
-                  title = title.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
-
-                  // Somente atualiza se mudou (Evita gravar desnecessariamente)
-                  if (namesList[i] !== title && title.length > 0) {
-                    console.log(`[SYNC] Encontrado: ${uuid} -> ${title}`);
-                    namesList[i] = title;
+                  // Força a substituição se for diferente (Vai sobrescrever o nome da parcela antigo/errado)
+                  if (namesList[i] !== extractedRegion && extractedRegion.length > 0 && extractedRegion !== "Second Life") {
+                    console.log(`[SYNC] Corrigindo banco: de "${namesList[i]}" para -> "${extractedRegion}"`);
+                    namesList[i] = extractedRegion;
                     updatedCount++;
                   }
                 }
-              } else {
-                 console.log(`[SYNC] UUID ${uuid} offline ou invisível (Status: ${slRes.status}).`);
               }
             } catch (fetchErr) {
               console.error(`[SYNC] Erro HTTP ao processar UUID ${uuid}: ${fetchErr.message}`);
             }
             
-            // Pausa obrigatória de 800ms para evitar bloqueio de IP no Render
+            // Pausa de 800ms para a Linden Lab não nos bloquear
             await new Promise(resolve => setTimeout(resolve, 800));
           }
         }
@@ -512,7 +499,7 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
         let newNames = namesList.join("ç");
         if (newNames !== originalNames) {
           await saveServerChunks(srv, mainList, namesList);
-          console.log(`[SYNC] Continente ${srv} atualizado no BD! (Registros alterados: ${updatedCount})`);
+          console.log(`[SYNC] Continente ${srv} atualizado no BD! (Registros corrigidos: ${updatedCount})`);
         } else {
           console.log(`[SYNC] Continente ${srv} 100% verificado. Nenhuma alteração necessária.`);
         }
@@ -524,7 +511,6 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
   })();
 });
 // ========================================================
-
 
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime } = req.body;
