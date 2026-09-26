@@ -28,7 +28,7 @@ let MAX_F = 2000;
 let MAX_TRANSACTION = 1000000;
 
 // ========================================================
-// --- SISTEMAS DE SEGURANÇA BANCÁRIA (MUTEX & DEBOUNCE) ---
+// --- SISTEMA DE SEGURANÇA BANCÁRIA (MUTEX & DEBOUNCE) ---
 // ========================================================
 const globalDebounce = new Set();
 const mutexes = {};
@@ -501,10 +501,10 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
 });
 
 // ========================================================
-// --- SISTEMA DE DEMANDA DE HUB (SYNCHRONOUS CHECK) ---
+// --- SISTEMA DE DEMANDA BLINDADO (SEM CONFLITO) ---
 // ========================================================
 async function processDemand(hubKey, user) {
-  return await withLock("GLOBAL_DEMAND_LOCK", async () => {
+  try {
       let demandDataStr = await dbGet("GLOBAL_DEMAND") || "{}";
       let demandData = {};
       try { demandData = JSON.parse(demandDataStr); } catch(e) {}
@@ -517,7 +517,7 @@ async function processDemand(hubKey, user) {
       // Limpa o histórico de entregas (Apaga tudo mais velho que 3 Horas = 10800s)
       loc.history = loc.history.filter(ts => (now - ts) <= 10800);
 
-      // Proteção anti-duplo clique (se o mesmo player entregar de novo em menos de 10 segundos, não conta como nova entrega extra)
+      // Proteção anti-duplo clique (10 segundos)
       let lastUserTime = loc.user_history[user] || 0;
       let alreadyCountedRecently = (now - lastUserTime) < 10;
 
@@ -547,7 +547,10 @@ async function processDemand(hubKey, user) {
       }
 
       return { mult: loc.mult };
-  });
+  } catch (err) {
+      console.error("Erro no processDemand:", err);
+      return { mult: 1.0 }; // Fallback seguro para nunca dar 500
+  }
 }
 // ========================================================
 
@@ -567,7 +570,7 @@ app.post("/action", requireToken, async (req, res) => {
   }
   
   // ========================================================
-  // 1. DEBOUNCE ANTI-GLITCH (BLOQUEIA DUPLAS COLISÕES DO SL)
+  // 1. DEBOUNCE ANTI-GLITCH
   // ========================================================
   const txHash = `${user}_${safeTopic}_${hubUuid}_${content}`;
   if (globalDebounce.has(txHash)) {
@@ -585,7 +588,8 @@ app.post("/action", requireToken, async (req, res) => {
   await withLock(user, async () => {
     try {
       
-      if (safeTopic.includes("deliver") || safeTopic === "cargo sell") {
+      // FILTRO ESTRITO: Apenas comandos reais de entrega ou venda passam por aqui
+      if (safeTopic === "cargo sell" || safeTopic === "delivered" || safeTopic === "delivery") {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
 
@@ -598,7 +602,7 @@ app.post("/action", requireToken, async (req, res) => {
             demandMult = demandResult.mult;
         }
 
-        if (safeTopic.includes("deliver") && safeTopic !== "cargo sell") {
+        if (safeTopic !== "cargo sell") {
             return res.json({ status: "success" });
         }
 
