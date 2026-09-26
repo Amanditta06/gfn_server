@@ -453,15 +453,11 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
                 const html = await slRes.text();
                 let extractedRegion = "";
                 
-                // TÉCNICA INFALÍVEL: Procura pelo link de teleporte no código-fonte
-                // Padrão: maps.secondlife.com/secondlife/Nome_da_Regiao/X/Y/Z
                 const mapMatch = html.match(/maps\.secondlife\.com\/secondlife\/([^\/"]+)/i);
                 
                 if (mapMatch && mapMatch[1]) {
-                  // O mapMatch[1] já pega EXATAMENTE o nome da Região puro que tá na URL
                   extractedRegion = decodeURIComponent(mapMatch[1]).replace(/\+/g, ' ').trim();
                 } else {
-                  // Fallback para a tag title caso o link não exista (Raro)
                   const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
                   if (titleMatch && titleMatch[1]) {
                     let title = titleMatch[1].replace(/\n/g, ' ').replace(/\r/g, '').replace(/\s+/g, ' ').trim();
@@ -479,7 +475,6 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
                   }
                   extractedRegion = extractedRegion.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
 
-                  // Força a substituição se for diferente (Vai sobrescrever o nome da parcela antigo/errado)
                   if (namesList[i] !== extractedRegion && extractedRegion.length > 0 && extractedRegion !== "Second Life") {
                     console.log(`[SYNC] Corrigindo banco: de "${namesList[i]}" para -> "${extractedRegion}"`);
                     namesList[i] = extractedRegion;
@@ -491,7 +486,6 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
               console.error(`[SYNC] Erro HTTP ao processar UUID ${uuid}: ${fetchErr.message}`);
             }
             
-            // Pausa de 800ms para a Linden Lab não nos bloquear
             await new Promise(resolve => setTimeout(resolve, 800));
           }
         }
@@ -510,7 +504,51 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
     }
   })();
 });
+
 // ========================================================
+// --- NOVO SISTEMA DE DEMANDA DE HUB (SUPPLY & DEMAND) ---
+// ========================================================
+async function processDemand(hubUuid, basePrice) {
+  let demandDataStr = await dbGet("GLOBAL_DEMAND") || "{}";
+  let demandData = {};
+  try { demandData = JSON.parse(demandDataStr); } catch(e) {}
+
+  let loc = demandData[hubUuid] || { mult: 1.0, history: [], last_delivery: 0 };
+  let now = getUnixTime();
+
+  // 1. Limpa o histórico de entregas (Apaga tudo mais velho que 3 Horas = 10800s)
+  loc.history = loc.history.filter(ts => (now - ts) <= 10800);
+
+  // 2. Recuperação de Demanda (Ganha +0.2 por cada Hora = 3600s sem entregas)
+  if (loc.last_delivery > 0 && loc.mult < 1.0) {
+     let timeOffline = now - loc.last_delivery;
+     if (timeOffline >= 3600) {
+        let hoursRecovered = Math.floor(timeOffline / 3600);
+        loc.mult = Math.min(1.0, loc.mult + (hoursRecovered * 0.2));
+     }
+  }
+
+  // 3. Aplica Queda se Hub estiver Saturado (>= 3 entregas nas últimas 3h)
+  if (loc.history.length >= 3) {
+     loc.mult = Math.max(0.1, loc.mult - 0.1); // Limite mínimo de 0.1x (10% do valor)
+  }
+  
+  // Limpa possíveis bugs de precisão decimal de float do Javascript (ex: 0.900000001)
+  loc.mult = Math.round(loc.mult * 10) / 10;
+
+  // 4. Calcula Preço Final
+  let finalPrice = Math.round(basePrice * loc.mult);
+
+  // 5. Salva a entrega de agora no DB
+  loc.history.push(now);
+  loc.last_delivery = now;
+  demandData[hubUuid] = loc;
+  await dbSet("GLOBAL_DEMAND", JSON.stringify(demandData));
+
+  return { finalPrice, mult: loc.mult };
+}
+// ========================================================
+
 
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime } = req.body;
@@ -521,6 +559,23 @@ app.post("/action", requireToken, async (req, res) => {
     if (topic === "cargo sell") {
       let price = parseInt(content) || 0;
       if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
+
+      // ------------------------------------------------------------------
+      // APLICA O SISTEMA DINÂMICO DE DEMANDA PRIMEIRO!
+      // (Testa se o Target é mesmo um UUID de Hub, evitando planos "FREE")
+      let demandMult = 1.0;
+      if (targetUuid && targetUuid.length >= 32 && targetUuid.includes("-")) {
+         let demandResult = await processDemand(targetUuid, price);
+         price = demandResult.finalPrice;
+         demandMult = demandResult.mult;
+         
+         // Se a demanda abaixou, avisa o Player ANTES de entregar a quantia.
+         if (demandMult < 1.0) {
+            let lostPercent = Math.round((1.0 - demandMult) * 100);
+            await addPlayerMessage(user, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +20% every hour without deliveries.`);
+         }
+      }
+      // ------------------------------------------------------------------
 
       let player = await getPlayerData(user);
       let recebido = 0;
@@ -571,7 +626,7 @@ app.post("/action", requireToken, async (req, res) => {
         let premiumBonus = 0;
         if (plan === "PREMIUM") {
           if (price <= 0) price = 1;
-          premiumBonus = Math.floor(price * 0.2);
+          premiumBonus = Math.floor(price * 0.2); // Bônus calculado sob o preço já afetado pela demanda
           await addPlayerMessage(user, "You won 20% more for being premium.");
         }
 
@@ -682,7 +737,6 @@ app.post("/action", requireToken, async (req, res) => {
     else if (topic === "pay") {
       let amountVal = parseInt(content) || 0;
       
-      // Validações básicas de valor
       if (amountVal <= 0) {
         await addPlayerMessage(user, "Transaction failed. Invalid amount.");
         return res.json({ status: "denied" });
@@ -691,13 +745,11 @@ app.post("/action", requireToken, async (req, res) => {
       
       let sender = await getPlayerData(user);
       
-      // Verifica se quem está pagando tem o dinheiro suficiente (Corrige o bug de gerar dinheiro infinito)
       if (sender.M < amountVal) {
         await addPlayerMessage(user, `Transaction failed. You don't have enough F₵. Current balance: ${sender.M} F₵`);
         return res.json({ status: "denied" });
       }
 
-      // Previne que o jogador pague a si mesmo
       if (user === targetUuid) {
         await addPlayerMessage(user, "Transaction failed. You cannot pay yourself.");
         return res.json({ status: "denied" });
@@ -705,22 +757,16 @@ app.post("/action", requireToken, async (req, res) => {
 
       let tPlayer = await getPlayerData(targetUuid);
       
-      // Transferência real (Subtrai de quem paga, adiciona a quem recebe)
       sender.M -= amountVal;
       tPlayer.M += amountVal;
       
-      // Salva no banco de dados
       await savePlayerData(user, sender);
       await savePlayerData(targetUuid, tPlayer);
 
-      // Converte os UUIDs no formato de link nativo do Second Life (Aparecerá o nome do avatar na tela)
       let senderProfile = `secondlife:///app/agent/${user}/about`;
       let targetProfile = `secondlife:///app/agent/${targetUuid}/about`;
 
-      // Mensagem para quem PAGOU (Vê apenas o próprio saldo)
       await addPlayerMessage(user, `You successfully paid ${amountVal} F₵ to ${targetProfile}. Your new balance: ${sender.M} F₵`);
-      
-      // Mensagem para quem RECEBEU (Vê de quem veio e o próprio saldo)
       await addPlayerMessage(targetUuid, `You received ${amountVal} F₵ from ${senderProfile}. Your new balance: ${tPlayer.M} F₵`);
     }
     else if (topic === "MASS_MONEY_RESET_CUSTOM") {
