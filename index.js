@@ -229,9 +229,6 @@ app.post("/ack-msg", async (req, res) => {
   }
 });
 
-// ========================================================
-// --- FUNÇÃO CORRIGIDA E BLINDADA CONTRA STRING CONCATENATION ---
-// ========================================================
 async function getPlayerData(uuid) {
   if (!uuid) return null;
   const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [`player_${uuid}`]);
@@ -242,9 +239,6 @@ async function getPlayerData(uuid) {
       let parsedData = JSON.parse(res.rows[0].value);
       data = { ...data, ...parsedData }; 
       
-      // Converte todas as variáveis matemáticas para números absolutos garantidos.
-      // Contas "bugadas" da migração ("50") viram números (50).
-      // Contas corretas (50) continuam sendo números (50).
       data.M = parseInt(data.M, 10) || 0;
       data.P = parseInt(data.P, 10) || 0;
       data.P_W = parseInt(data.P_W, 10) || 0;
@@ -255,7 +249,6 @@ async function getPlayerData(uuid) {
       data.RE = parseInt(data.RE, 10) || 0;
       data.B_M = parseFloat(data.B_M) || 1.0;
       data.B_T = parseInt(data.B_T, 10) || 0;
-      // AT não entra aqui porque é texto mesmo (Ex: "A")
 
     } catch(e) {
       console.error(`Error parsing player data for ${uuid}:`, e);
@@ -263,7 +256,6 @@ async function getPlayerData(uuid) {
   }
   return data;
 }
-// ========================================================
 
 async function savePlayerData(uuid, data) {
   await db.query(
@@ -273,7 +265,7 @@ async function savePlayerData(uuid, data) {
 }
 
 // ========================================================
-// --- GERENCIADOR DE PARCELAS INTELIGENTE (PURGE & RE-SET) ---
+// --- GERENCIADOR DE PARCELAS INTELIGENTE ---
 // ========================================================
 app.post('/admin/parcel', requireToken, async (req, res) => {
   const { action, serverId, uuid, pos, regionName, num, newPos } = req.body;
@@ -282,7 +274,6 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
   try {
     let targetServer = serverId;
 
-    // Formatação e Correção Automática de Região
     const formatRegion = (name) => {
       if (!name) return "NULL";
       let clean = name.trim();
@@ -290,7 +281,6 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       return clean;
     };
 
-    // Auto-Detect para ações automáticas
     if (serverId === "AUTO") {
       let serversData = await dbGet("SERVERS");
       let servers = serversData ? serversData.split("ç") : [];
@@ -310,20 +300,16 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       if (!found && action !== "SET_PARCEL") {
         return res.status(404).json({ error: "Parcela não encontrada em nenhum continente ativo." });
       }
-      if (!found) targetServer = servers[0] || "Satori"; // Fallback padrão
+      if (!found) targetServer = servers[0] || "Satori";
     }
 
-    // Carrega a lista de servidores globais para limpeza cruzada
     let serversData = await dbGet("SERVERS");
     let servers = serversData ? serversData.split("ç") : [];
 
-    // EXECUTA A AÇÃO SOLICITADA
     if (action === "SET_PARCEL") {
       const newItem = `${uuid}#${pos}`;
       const cleanRegion = formatRegion(regionName);
 
-      // PURGE GLOBAL: Remove esta UUID de QUALQUER continente antes de inserir no destino.
-      // Isso impede duplicidade, lixo corrompido ou dessincronização de listas!
       for (let srv of servers) {
         let mData = await dbGet(srv) || "";
         let mList = mData ? mData.split("ç") : [];
@@ -333,7 +319,8 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
         let n3 = await dbGet(`${srv}_NAMES_3`) || "";
         let n4 = await dbGet(`${srv}_NAMES_4`) || "";
         let n5 = await dbGet(`${srv}_NAMES_5`) || "";
-        let nList = [n1, n2, n3, n4, n5].filter(Boolean).join("ç").split("ç");
+        let joined = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
+        let nList = joined ? joined.split("ç") : [];
         while (nList.length < mList.length) nList.push("NULL");
 
         let idx = mList.findIndex(item => item.startsWith(uuid + "#"));
@@ -344,7 +331,6 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
         }
       }
 
-      // Adiciona limpo e recadastrado no targetServer escolhido
       let targetMainData = await dbGet(targetServer) || ""; 
       let targetMainList = targetMainData ? targetMainData.split("ç") : [];
       
@@ -353,7 +339,8 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       let tN3 = await dbGet(`${targetServer}_NAMES_3`) || "";
       let tN4 = await dbGet(`${targetServer}_NAMES_4`) || "";
       let tN5 = await dbGet(`${targetServer}_NAMES_5`) || "";
-      let targetNamesList = [tN1, tN2, tN3, tN4, tN5].filter(Boolean).join("ç").split("ç");
+      let tJoined = [tN1, tN2, tN3, tN4, tN5].filter(Boolean).join("ç");
+      let targetNamesList = tJoined ? tJoined.split("ç") : [];
       while (targetNamesList.length < targetMainList.length) targetNamesList.push("NULL");
 
       targetMainList.push(newItem);
@@ -362,7 +349,6 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       await saveServerChunks(targetServer, targetMainList, targetNamesList);
     } 
     else {
-      // Para outras ações (DEL_PARCEL, DEL_NUM, REORDER, UPDATE_REGION), carrega o servidor alvo
       let mainData = await dbGet(targetServer) || ""; 
       let mainList = mainData ? mainData.split("ç") : [];
 
@@ -371,7 +357,8 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       let n3 = await dbGet(`${targetServer}_NAMES_3`) || "";
       let n4 = await dbGet(`${targetServer}_NAMES_4`) || "";
       let n5 = await dbGet(`${targetServer}_NAMES_5`) || "";
-      let namesList = [n1, n2, n3, n4, n5].filter(Boolean).join("ç").split("ç");
+      let joined = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
+      let namesList = joined ? joined.split("ç") : [];
       while (namesList.length < mainList.length) namesList.push("NULL");
 
       if (action === "DEL_PARCEL") {
@@ -408,14 +395,101 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       await saveServerChunks(targetServer, mainList, namesList);
     }
 
-    res.status(200).json({ success: true, message: `Ação ${action} processada perfeitamente no servidor: ${targetServer}.` });
+    res.status(200).json({ success: true, message: `Ação ${action} processada no servidor: ${targetServer}.` });
 
   } catch (error) {
     console.error("Erro no processamento de parcelas:", error);
     res.status(500).json({ error: "Erro interno no servidor de parcelas" });
   }
 });
+
 // ========================================================
+// --- AUTO-SINCER DAS PARCELAS (WEBSCRAPING NO BACKEND) ---
+// ========================================================
+app.post('/admin/sync-regions', requireToken, async (req, res) => {
+  // Responde imediatamente para liberar o LSL no SL
+  res.json({ status: "success", message: "Sincronização iniciada em segundo plano. Isso pode levar alguns minutos." });
+
+  // Inicia o processo em background
+  (async () => {
+    try {
+      console.log("[SYNC] Iniciando varredura automatizada das parcelas via Second Life Web...");
+      let serversData = await dbGet("SERVERS");
+      let servers = serversData ? serversData.split("ç").filter(Boolean) : [];
+
+      for (let srv of servers) {
+        let mainData = await dbGet(srv) || "";
+        let mainList = mainData ? mainData.split("ç").filter(Boolean) : [];
+        if (mainList.length === 0) continue;
+
+        let n1 = await dbGet(`${srv}_NAMES_1`) || "";
+        let n2 = await dbGet(`${srv}_NAMES_2`) || "";
+        let n3 = await dbGet(`${srv}_NAMES_3`) || "";
+        let n4 = await dbGet(`${srv}_NAMES_4`) || "";
+        let n5 = await dbGet(`${srv}_NAMES_5`) || "";
+        let joined = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
+        let namesList = joined ? joined.split("ç") : [];
+        
+        while (namesList.length < mainList.length) namesList.push("NULL");
+
+        let updatedCount = 0;
+
+        for (let i = 0; i < mainList.length; i++) {
+          let uuid = mainList[i].split("#")[0];
+          
+          if (uuid && uuid.length === 36) {
+            try {
+              const slRes = await fetch(`https://world.secondlife.com/parcel/${uuid}`);
+              if (slRes.ok) {
+                const html = await slRes.text();
+                // Busca a tag title via expressão regular
+                const titleMatch = html.match(/<title>(.*?)<\/title>/i);
+                
+                if (titleMatch && titleMatch[1]) {
+                  let title = titleMatch[1];
+                  
+                  // Corta o sulfixo padrão " - Second Life"
+                  let idx = title.indexOf(" - Second Life");
+                  if (idx !== -1) {
+                    title = title.substring(0, idx).trim();
+                  }
+
+                  // Regra antiga de formatação (mantida para compatibilidade)
+                  if (title.toLowerCase() === "royie" || title.toLowerCase() === "royier") {
+                    title = "Royier";
+                  }
+
+                  // Apenas atualiza se o nome for diferente
+                  if (namesList[i] !== title) {
+                    namesList[i] = title;
+                    updatedCount++;
+                  }
+                }
+              }
+            } catch (fetchErr) {
+              console.error(`[SYNC] Erro ao buscar UUID ${uuid}: ${fetchErr.message}`);
+            }
+            
+            // Pausa obrigatória de 500ms entre as requisições para evitar rate limit ou bloqueio de IP pela LL
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        }
+
+        if (updatedCount > 0) {
+          await saveServerChunks(srv, mainList, namesList);
+          console.log(`[SYNC] Continente ${srv} atualizado! ${updatedCount} regiões foram renomeadas ou consertadas.`);
+        } else {
+          console.log(`[SYNC] Continente ${srv} checado. Nenhuma alteração necessária.`);
+        }
+      }
+      console.log("[SYNC] Sincronização automática finalizada com sucesso!");
+    } catch (err) {
+      console.error("[SYNC] Erro grave durante a varredura em background:", err);
+    }
+  })();
+});
+// ========================================================
+
 
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime } = req.body;
@@ -631,12 +705,10 @@ app.post("/action", requireToken, async (req, res) => {
         await addPlayerMessage(user, `You don't have enough F₵. Required: ${price}, You have: ${buyer.M}`);
         responsePayload.status = "denied";
       } else {
-        // Correção: Se o dono compra dele mesmo, a transação vira custo zero
         if (ownerUuid === user) {
           await addPlayerMessage(user, `You bought your own product (${plan}). Your balance remains ${buyer.M} F₵.`);
           responsePayload.status = "success";
         } 
-        // Compras reais de outros jogadores
         else {
           buyer.M -= price;
           await savePlayerData(user, buyer);
