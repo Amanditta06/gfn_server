@@ -162,7 +162,6 @@ async function dbSet(id, value) {
   }
 }
 
-// Helper para salvar os chunks de nomes e coordenadas de forma sincronizada
 async function saveServerChunks(srvName, mainList, namesList) {
   const newMainStr = mainList.join("ç");
   const chunks = ["", "", "", "", ""];
@@ -405,7 +404,7 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
 });
 
 // ========================================================
-// --- AUTO-SINCER DAS PARCELAS (WEBSCRAPING NO BACKEND) ---
+// --- AUTO-SINCER DAS PARCELAS CORRIGIDO PARA PEGAR APENAS A REGIÃO ---
 // ========================================================
 app.post('/admin/sync-regions', requireToken, async (req, res) => {
   // Libera o Second Life IMEDIATAMENTE (Senão o LSL trava esperando o script terminar)
@@ -468,10 +467,19 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
                   // Limpa quebras de linhas, tabulações e espaços duplos
                   title = title.replace(/\n/g, ' ').replace(/\r/g, '').replace(/\s+/g, ' ').trim();
                   
-                  // Extrai o nome limpando a parte "- Second Life"
-                  let idx = title.indexOf(" - Second Life");
-                  if (idx !== -1) {
-                    title = title.substring(0, idx).trim();
+                  // O formato é "Nome da Parcela - Nome da Região - Second Life"
+                  // 1) Retira o " - Second Life"
+                  let slIdx = title.indexOf(" - Second Life");
+                  if (slIdx !== -1) {
+                    let textSemSL = title.substring(0, slIdx).trim(); // "Nome da Parcela - Nome da Região"
+                    
+                    // 2) Retira o "Nome da Parcela - " pegando tudo após o ÚLTIMO hífen
+                    let lastDashIdx = textSemSL.lastIndexOf(" - ");
+                    if (lastDashIdx !== -1) {
+                        title = textSemSL.substring(lastDashIdx + 3).trim(); // Pega apenas a região
+                    } else {
+                        title = textSemSL; // Fallback se não tiver hífen extra
+                    }
                   }
 
                   // Substituição manual (herdada)
