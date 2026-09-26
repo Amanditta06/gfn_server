@@ -33,6 +33,7 @@ let MAX_TRANSACTION = 1000000;
 const globalDebounce = new Set();
 const mutexes = {};
 
+// Agora o Lock é por usuário, impedindo que requisições do mesmo avatar atropelem umas as outras
 async function withLock(key, fn) {
   if (!mutexes[key]) mutexes[key] = Promise.resolve();
   let release;
@@ -285,136 +286,6 @@ async function savePlayerData(uuid, data) {
 }
 
 // ========================================================
-// --- GERENCIADOR DE PARCELAS INTELIGENTE ---
-// ========================================================
-app.post('/admin/parcel', requireToken, async (req, res) => {
-  const { action, serverId, uuid, pos, regionName, num, newPos } = req.body;
-  if (!serverId) return res.status(400).json({ error: "serverId obrigatório" });
-
-  try {
-    let targetServer = serverId;
-    const formatRegion = (name) => {
-      if (!name) return "NULL";
-      let clean = name.trim();
-      if (clean.toLowerCase() === "royie" || clean.toLowerCase() === "royier") return "Royier";
-      return clean;
-    };
-
-    if (serverId === "AUTO") {
-      let serversData = await dbGet("SERVERS");
-      let servers = serversData ? serversData.split("ç") : [];
-      let found = false;
-      for (let srv of servers) {
-        let mData = await dbGet(srv) || "";
-        let mList = mData ? mData.split("ç") : [];
-        let idx = mList.findIndex(item => item.startsWith(uuid + "#"));
-        if (idx !== -1) {
-          targetServer = srv;
-          found = true;
-          break; 
-        }
-      }
-      if (!found && action !== "SET_PARCEL") return res.status(404).json({ error: "Parcela não encontrada em nenhum continente ativo." });
-      if (!found) targetServer = servers[0] || "Satori";
-    }
-
-    let serversData = await dbGet("SERVERS");
-    let servers = serversData ? serversData.split("ç") : [];
-
-    if (action === "SET_PARCEL") {
-      const newItem = `${uuid}#${pos}`;
-      const cleanRegion = formatRegion(regionName);
-
-      for (let srv of servers) {
-        let mData = await dbGet(srv) || "";
-        let mList = mData ? mData.split("ç") : [];
-        
-        let n1 = await dbGet(`${srv}_NAMES_1`) || "";
-        let n2 = await dbGet(`${srv}_NAMES_2`) || "";
-        let n3 = await dbGet(`${srv}_NAMES_3`) || "";
-        let n4 = await dbGet(`${srv}_NAMES_4`) || "";
-        let n5 = await dbGet(`${srv}_NAMES_5`) || "";
-        let joined = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
-        let nList = joined ? joined.split("ç") : [];
-        while (nList.length < mList.length) nList.push("NULL");
-
-        let idx = mList.findIndex(item => item.startsWith(uuid + "#"));
-        if (idx !== -1) {
-          mList.splice(idx, 1);
-          nList.splice(idx, 1);
-          await saveServerChunks(srv, mList, nList);
-        }
-      }
-
-      let targetMainData = await dbGet(targetServer) || ""; 
-      let targetMainList = targetMainData ? targetMainData.split("ç") : [];
-      
-      let tN1 = await dbGet(`${targetServer}_NAMES_1`) || "";
-      let tN2 = await dbGet(`${targetServer}_NAMES_2`) || "";
-      let tN3 = await dbGet(`${targetServer}_NAMES_3`) || "";
-      let tN4 = await dbGet(`${targetServer}_NAMES_4`) || "";
-      let tN5 = await dbGet(`${targetServer}_NAMES_5`) || "";
-      let tJoined = [tN1, tN2, tN3, tN4, tN5].filter(Boolean).join("ç");
-      let targetNamesList = tJoined ? tJoined.split("ç") : [];
-      while (targetNamesList.length < targetMainList.length) targetNamesList.push("NULL");
-
-      targetMainList.push(newItem);
-      targetNamesList.push(cleanRegion);
-      await saveServerChunks(targetServer, targetMainList, targetNamesList);
-    } 
-    else {
-      let mainData = await dbGet(targetServer) || ""; 
-      let mainList = mainData ? mainData.split("ç") : [];
-
-      let n1 = await dbGet(`${targetServer}_NAMES_1`) || "";
-      let n2 = await dbGet(`${targetServer}_NAMES_2`) || "";
-      let n3 = await dbGet(`${targetServer}_NAMES_3`) || "";
-      let n4 = await dbGet(`${targetServer}_NAMES_4`) || "";
-      let n5 = await dbGet(`${targetServer}_NAMES_5`) || "";
-      let joined = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
-      let namesList = joined ? joined.split("ç") : [];
-      while (namesList.length < mainList.length) namesList.push("NULL");
-
-      if (action === "DEL_PARCEL") {
-        const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
-        if (idx !== -1) {
-          mainList.splice(idx, 1);
-          namesList.splice(idx, 1);
-        }
-      } 
-      else if (action === "DEL_NUM") {
-        if (num >= 0 && num < mainList.length) {
-          mainList.splice(num, 1);
-          namesList.splice(num, 1);
-        }
-      } 
-      else if (action === "REORDER") {
-        const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
-        if (idx !== -1) {
-          let targetPos = newPos < 0 ? 0 : (newPos > mainList.length ? mainList.length : newPos);
-          const item = mainList.splice(idx, 1)[0];
-          const name = namesList.splice(idx, 1)[0];
-          mainList.splice(targetPos, 0, item);
-          namesList.splice(targetPos, 0, name);
-        }
-      }
-      else if (action === "UPDATE_REGION") {
-        const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
-        if (idx !== -1) {
-          namesList[idx] = formatRegion(regionName);
-        }
-        namesList = namesList.map(name => formatRegion(name));
-      }
-      await saveServerChunks(targetServer, mainList, namesList);
-    }
-    res.status(200).json({ success: true, message: `Ação ${action} processada no servidor: ${targetServer}.` });
-  } catch (error) {
-    console.error("Erro no processamento de parcelas:", error);
-    res.status(500).json({ error: "Erro interno no servidor de parcelas" });
-  }
-});
-
-// ========================================================
 // --- AUTO-SINCER (WEBSCRAPING PELA URL DO TELEPORTE) ---
 // ========================================================
 app.post('/admin/sync-regions', requireToken, async (req, res) => {
@@ -506,12 +377,12 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
 // ========================================================
 // --- NOVO SISTEMA DE DEMANDA DE HUB (SUPPLY & DEMAND) ---
 // ========================================================
-async function processDemand(hubUuid) {
+async function processDemand(hubKey) {
   let demandDataStr = await dbGet("GLOBAL_DEMAND") || "{}";
   let demandData = {};
   try { demandData = JSON.parse(demandDataStr); } catch(e) {}
 
-  let loc = demandData[hubUuid] || { mult: 1.0, history: [], last_delivery: 0 };
+  let loc = demandData[hubKey] || { mult: 1.0, history: [], last_delivery: 0 };
   let now = getUnixTime();
 
   // Limpa o histórico de entregas (Apaga tudo mais velho que 3 Horas = 10800s)
@@ -535,7 +406,7 @@ async function processDemand(hubUuid) {
   
   loc.history.push(now);
   loc.last_delivery = now;
-  demandData[hubUuid] = loc;
+  demandData[hubKey] = loc;
   await dbSet("GLOBAL_DEMAND", JSON.stringify(demandData));
 
   return { mult: loc.mult };
@@ -545,11 +416,12 @@ async function processDemand(hubUuid) {
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime } = req.body;
   let targetUuid = target || plan; 
+  let safeTopic = (topic || "").toLowerCase().trim();
   
   // ========================================================
   // 1. DEBOUNCE ANTI-GLITCH (BLOQUEIA DUPLAS COLISÕES DO SL)
   // ========================================================
-  const txHash = `${user}_${topic}_${targetUuid}_${content}`;
+  const txHash = `${user}_${safeTopic}_${targetUuid}_${content}`;
   if (globalDebounce.has(txHash)) {
       return res.json({ status: "ignored" });
   }
@@ -560,17 +432,29 @@ app.post("/action", requireToken, async (req, res) => {
   let responsePayload = { status: "success" };
 
   // ========================================================
-  // 2. LOCK DE BANCO DE DADOS (IMPEDE CORRIDA DE PROCESSOS)
+  // 2. INVERSOR DE CORRIDA (Micro-Delay para o cargo sell)
+  // Se for o cargo sell, congela ele por 800ms para garantir 
+  // que a requisição de "delivered" foi processada no banco primeiro!
   // ========================================================
-  await withLock("GLOBAL_TX", async () => {
+  if (safeTopic === "cargo sell") {
+      await new Promise(resolve => setTimeout(resolve, 800));
+  }
+
+  // ========================================================
+  // 3. LOCK POR USUÁRIO (Blindagem de Banco de Dados)
+  // ========================================================
+  await withLock(user, async () => {
     try {
       
       // ========================================================
       // DETECTA O AVISO DE "DELIVERED" (LOCALIZAÇÃO DA CARGA)
       // ========================================================
-      if (topic === "delivered" || topic === "delivery") {
-          if (targetUuid && targetUuid.length >= 32 && targetUuid.includes("-")) {
-              let demandResult = await processDemand(targetUuid);
+      if (safeTopic === "delivered" || safeTopic === "delivery" || safeTopic === "cargo delivered") {
+          // Extrai o nome do Hub (Aceita "GFN MAIN HUB", "Royier", etc. Nao exige mais UUID de 36 caracteres)
+          let hubKey = target || content || plan; 
+          
+          if (hubKey && hubKey !== "FREE" && hubKey !== "PREMIUM" && hubKey !== "TEST_CARGO" && hubKey.length > 2) {
+              let demandResult = await processDemand(hubKey);
               
               let player = await getPlayerData(user);
               player.LAST_DEMAND_MULT = demandResult.mult; // Guarda na memória do Player
@@ -583,7 +467,7 @@ app.post("/action", requireToken, async (req, res) => {
       // ========================================================
       // DETECTA O PEDIDO DE PAGAMENTO DA CARGA (CARGO SELL)
       // ========================================================
-      else if (topic === "cargo sell") {
+      else if (safeTopic === "cargo sell") {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
 
@@ -591,8 +475,8 @@ app.post("/action", requireToken, async (req, res) => {
         let demandMult = 1.0;
         let now = getUnixTime();
 
-        // Checa se o aviso de "delivered" aconteceu nos últimos 60 segundos
-        if (player.LAST_DEMAND_MULT && player.LAST_DEMAND_TIME && (now - player.LAST_DEMAND_TIME) < 60) {
+        // Checa se o aviso de "delivered" aconteceu nos últimos 120 segundos
+        if (player.LAST_DEMAND_MULT && player.LAST_DEMAND_TIME && (now - player.LAST_DEMAND_TIME) < 120) {
             demandMult = player.LAST_DEMAND_MULT;
         }
 
@@ -603,7 +487,7 @@ app.post("/action", requireToken, async (req, res) => {
             await addPlayerMessage(user, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +20% every hour without deliveries.`);
         }
         
-        // Limpa a memória para que a próxima entrega em outro lugar não sofra a mesma penalidade
+        // Limpa a memória de demanda após processar o pagamento
         player.LAST_DEMAND_MULT = 1.0;
         player.LAST_DEMAND_TIME = 0;
 
@@ -727,7 +611,7 @@ app.post("/action", requireToken, async (req, res) => {
         await savePlayerData(user, player);
         responsePayload.recebido = recebido;
       } 
-      else if (topic === "addBoost") {
+      else if (safeTopic === "addboost") {
         let add_mult = parseFloat(content) || 1.0;
         let add_time = parseInt(targetUuid) || 0;
         let player = await getPlayerData(user);
@@ -739,30 +623,30 @@ app.post("/action", requireToken, async (req, res) => {
         player.B_T = current_time;
         await savePlayerData(user, player);
       } 
-      else if (topic === "check") {
+      else if (safeTopic === "check") {
         let player = await getPlayerData(user);
         await addPlayerMessage(user, `You have ${player.M} F₵.`);
         await addPlayerMessage(user, `You have ${player.P} GFN points this week.`);
       }
-      else if (topic === "godCheck") {
+      else if (safeTopic === "godcheck") {
         let tPlayer = await getPlayerData(targetUuid);
         await addPlayerMessage(user, `Target (${targetUuid}) Balance: ${tPlayer.M} F₵ | Points: ${tPlayer.P}`);
       }
-      else if (topic === "M_RESET") {
+      else if (safeTopic === "m_reset") {
         let tPlayer = await getPlayerData(targetUuid);
         tPlayer.M = parseInt(content) || 0;
         await savePlayerData(targetUuid, tPlayer);
         await addPlayerMessage(user, `Money reset for ${targetUuid}. New balance: ${tPlayer.M} F₵`);
         await addPlayerMessage(targetUuid, `Your money balance was reset by an administrator.`);
       }
-      else if (topic === "P_RESET") {
+      else if (safeTopic === "p_reset") {
         let tPlayer = await getPlayerData(targetUuid);
         tPlayer.P = parseInt(content) || 0;
         await savePlayerData(targetUuid, tPlayer);
         await addPlayerMessage(user, `Points reset for ${targetUuid}. New points: ${tPlayer.P}`);
         await addPlayerMessage(targetUuid, `Your GFN points were reset by an administrator.`);
       }
-      else if (topic === "pay") {
+      else if (safeTopic === "pay") {
         let amountVal = parseInt(content) || 0;
         if (amountVal <= 0) {
           await addPlayerMessage(user, "Transaction failed. Invalid amount.");
@@ -793,7 +677,7 @@ app.post("/action", requireToken, async (req, res) => {
         await addPlayerMessage(user, `You successfully paid ${amountVal} F₵ to ${targetProfile}. Your new balance: ${sender.M} F₵`);
         await addPlayerMessage(targetUuid, `You received ${amountVal} F₵ from ${senderProfile}. Your new balance: ${tPlayer.M} F₵`);
       }
-      else if (topic === "MASS_MONEY_RESET_CUSTOM") {
+      else if (safeTopic === "mass_money_reset_custom") {
         const maxValue = parseInt(content) || 0;
         const alertMessage = plan;
         const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
@@ -815,7 +699,7 @@ app.post("/action", requireToken, async (req, res) => {
         await addPlayerMessage(user, `VARREDURA CONCLUÍDA! ${affected} contas foram limitadas a ${maxValue} F₵ e notificadas.`);
         responsePayload.status = "success";
       }
-      else if (topic === "buy") {
+      else if (safeTopic === "buy") {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) {
           responsePayload.status = "denied";
@@ -846,7 +730,7 @@ app.post("/action", requireToken, async (req, res) => {
           }
         }
       }
-      else if (topic === "refillPay") {
+      else if (safeTopic === "refillpay") {
         let cost = parseInt(content) || 0;
         if (cost > MAX_TRANSACTION) {
           responsePayload.status = "denied";
