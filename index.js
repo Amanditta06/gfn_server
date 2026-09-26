@@ -906,8 +906,6 @@ app.get("/get-rank", async (req, res) => {
 app.get("/get", async (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: "missing id" });
-  date; // no-op
-  if (!id) return res.status(400).json({ error: "missing id" });
   try {
     const q = await db.query("SELECT value FROM kvstore WHERE id=$1", [id]);
     const value = q.rowCount === 0 ? null : q.rows[0].value;
