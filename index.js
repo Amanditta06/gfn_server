@@ -33,7 +33,6 @@ let MAX_TRANSACTION = 1000000;
 const globalDebounce = new Set();
 const mutexes = {};
 
-// Agora o Lock é por usuário, impedindo que requisições do mesmo avatar atropelem umas as outras
 async function withLock(key, fn) {
   if (!mutexes[key]) mutexes[key] = Promise.resolve();
   let release;
@@ -285,6 +284,135 @@ async function savePlayerData(uuid, data) {
   );
 }
 
+
+// ========================================================
+// --- GERENCIADOR DE PARCELAS INTELIGENTE ---
+// ========================================================
+app.post('/admin/parcel', requireToken, async (req, res) => {
+  const { action, serverId, uuid, pos, regionName, num, newPos } = req.body;
+  if (!serverId) return res.status(400).json({ error: "serverId obrigatório" });
+
+  try {
+    let targetServer = serverId;
+    const formatRegion = (name) => {
+      if (!name) return "NULL";
+      let clean = name.trim();
+      if (clean.toLowerCase() === "royie" || clean.toLowerCase() === "royier") return "Royier";
+      return clean;
+    };
+
+    if (serverId === "AUTO") {
+      let serversData = await dbGet("SERVERS");
+      let servers = serversData ? serversData.split("ç") : [];
+      let found = false;
+      for (let srv of servers) {
+        let mData = await dbGet(srv) || "";
+        let mList = mData ? mData.split("ç") : [];
+        let idx = mList.findIndex(item => item.startsWith(uuid + "#"));
+        if (idx !== -1) {
+          targetServer = srv;
+          found = true;
+          break; 
+        }
+      }
+      if (!found && action !== "SET_PARCEL") return res.status(404).json({ error: "Parcela não encontrada em nenhum continente ativo." });
+      if (!found) targetServer = servers[0] || "Satori";
+    }
+
+    let serversData = await dbGet("SERVERS");
+    let servers = serversData ? serversData.split("ç") : [];
+
+    if (action === "SET_PARCEL") {
+      const newItem = `${uuid}#${pos}`;
+      const cleanRegion = formatRegion(regionName);
+
+      for (let srv of servers) {
+        let mData = await dbGet(srv) || "";
+        let mList = mData ? mData.split("ç") : [];
+        let n1 = await dbGet(`${srv}_NAMES_1`) || "";
+        let n2 = await dbGet(`${srv}_NAMES_2`) || "";
+        let n3 = await dbGet(`${srv}_NAMES_3`) || "";
+        let n4 = await dbGet(`${srv}_NAMES_4`) || "";
+        let n5 = await dbGet(`${srv}_NAMES_5`) || "";
+        let joined = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
+        let nList = joined ? joined.split("ç") : [];
+        while (nList.length < mList.length) nList.push("NULL");
+
+        let idx = mList.findIndex(item => item.startsWith(uuid + "#"));
+        if (idx !== -1) {
+          mList.splice(idx, 1);
+          nList.splice(idx, 1);
+          await saveServerChunks(srv, mList, nList);
+        }
+      }
+
+      let targetMainData = await dbGet(targetServer) || ""; 
+      let targetMainList = targetMainData ? targetMainData.split("ç") : [];
+      let tN1 = await dbGet(`${targetServer}_NAMES_1`) || "";
+      let tN2 = await dbGet(`${targetServer}_NAMES_2`) || "";
+      let tN3 = await dbGet(`${targetServer}_NAMES_3`) || "";
+      let tN4 = await dbGet(`${targetServer}_NAMES_4`) || "";
+      let tN5 = await dbGet(`${targetServer}_NAMES_5`) || "";
+      let tJoined = [tN1, tN2, tN3, tN4, tN5].filter(Boolean).join("ç");
+      let targetNamesList = tJoined ? tJoined.split("ç") : [];
+      while (targetNamesList.length < targetMainList.length) targetNamesList.push("NULL");
+
+      targetMainList.push(newItem);
+      targetNamesList.push(cleanRegion);
+      await saveServerChunks(targetServer, targetMainList, targetNamesList);
+    } 
+    else {
+      let mainData = await dbGet(targetServer) || ""; 
+      let mainList = mainData ? mainData.split("ç") : [];
+      let n1 = await dbGet(`${targetServer}_NAMES_1`) || "";
+      let n2 = await dbGet(`${targetServer}_NAMES_2`) || "";
+      let n3 = await dbGet(`${targetServer}_NAMES_3`) || "";
+      let n4 = await dbGet(`${targetServer}_NAMES_4`) || "";
+      let n5 = await dbGet(`${targetServer}_NAMES_5`) || "";
+      let joined = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
+      let namesList = joined ? joined.split("ç") : [];
+      while (namesList.length < mainList.length) namesList.push("NULL");
+
+      if (action === "DEL_PARCEL") {
+        const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
+        if (idx !== -1) {
+          mainList.splice(idx, 1);
+          namesList.splice(idx, 1);
+        }
+      } 
+      else if (action === "DEL_NUM") {
+        if (num >= 0 && num < mainList.length) {
+          mainList.splice(num, 1);
+          namesList.splice(num, 1);
+        }
+      } 
+      else if (action === "REORDER") {
+        const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
+        if (idx !== -1) {
+          let targetPos = newPos < 0 ? 0 : (newPos > mainList.length ? mainList.length : newPos);
+          const item = mainList.splice(idx, 1)[0];
+          const name = namesList.splice(idx, 1)[0];
+          mainList.splice(targetPos, 0, item);
+          namesList.splice(targetPos, 0, name);
+        }
+      }
+      else if (action === "UPDATE_REGION") {
+        const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
+        if (idx !== -1) {
+          namesList[idx] = formatRegion(regionName);
+        }
+        namesList = namesList.map(name => formatRegion(name));
+      }
+      await saveServerChunks(targetServer, mainList, namesList);
+    }
+    res.status(200).json({ success: true, message: `Ação ${action} processada no servidor: ${targetServer}.` });
+  } catch (error) {
+    console.error("Erro no processamento de parcelas:", error);
+    res.status(500).json({ error: "Erro interno no servidor de parcelas" });
+  }
+});
+
+
 // ========================================================
 // --- AUTO-SINCER (WEBSCRAPING PELA URL DO TELEPORTE) ---
 // ========================================================
@@ -375,53 +503,68 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
 });
 
 // ========================================================
-// --- NOVO SISTEMA DE DEMANDA DE HUB (SUPPLY & DEMAND) ---
+// --- SISTEMA DE DEMANDA DE HUB BLINDADO (SUPPLY & DEMAND) ---
 // ========================================================
 async function processDemand(hubKey) {
-  let demandDataStr = await dbGet("GLOBAL_DEMAND") || "{}";
-  let demandData = {};
-  try { demandData = JSON.parse(demandDataStr); } catch(e) {}
+  // Lock exclusivo para o BD de Demanda (Evita que multiplos players corrompam a mesma chave)
+  return await withLock("GLOBAL_DEMAND_LOCK", async () => {
+      let demandDataStr = await dbGet("GLOBAL_DEMAND") || "{}";
+      let demandData = {};
+      try { demandData = JSON.parse(demandDataStr); } catch(e) {}
 
-  let loc = demandData[hubKey] || { mult: 1.0, history: [], last_delivery: 0 };
-  let now = getUnixTime();
+      let loc = demandData[hubKey] || { mult: 1.0, history: [], last_delivery: 0 };
+      let now = getUnixTime();
 
-  // Limpa o histórico de entregas (Apaga tudo mais velho que 3 Horas = 10800s)
-  loc.history = loc.history.filter(ts => (now - ts) <= 10800);
+      // Limpa o histórico de entregas (Apaga tudo mais velho que 3 Horas = 10800s)
+      loc.history = loc.history.filter(ts => (now - ts) <= 10800);
 
-  // Recuperação de Demanda (Ganha +0.2 por cada Hora = 3600s sem entregas)
-  if (loc.last_delivery > 0 && loc.mult < 1.0) {
-     let timeOffline = now - loc.last_delivery;
-     if (timeOffline >= 3600) {
-        let hoursRecovered = Math.floor(timeOffline / 3600);
-        loc.mult = Math.min(1.0, loc.mult + (hoursRecovered * 0.2));
-     }
-  }
+      // Recuperação de Demanda (Ganha +0.2 por cada Hora = 3600s sem entregas)
+      if (loc.last_delivery > 0 && loc.mult < 1.0) {
+         let timeOffline = now - loc.last_delivery;
+         if (timeOffline >= 3600) {
+            let hoursRecovered = Math.floor(timeOffline / 3600);
+            loc.mult = Math.min(1.0, loc.mult + (hoursRecovered * 0.2));
+         }
+      }
 
-  // Aplica Queda se Hub estiver Saturado (>= 3 entregas nas últimas 3h)
-  if (loc.history.length >= 3) {
-     loc.mult = Math.max(0.1, loc.mult - 0.1); 
-  }
-  
-  loc.mult = Math.round(loc.mult * 10) / 10;
-  
-  loc.history.push(now);
-  loc.last_delivery = now;
-  demandData[hubKey] = loc;
-  await dbSet("GLOBAL_DEMAND", JSON.stringify(demandData));
+      // Aplica Queda se Hub estiver Saturado (>= 3 entregas nas últimas 3h)
+      if (loc.history.length >= 3) {
+         loc.mult = Math.max(0.1, loc.mult - 0.1); 
+      }
+      
+      loc.mult = Math.round(loc.mult * 10) / 10;
+      
+      loc.history.push(now);
+      loc.last_delivery = now;
+      demandData[hubKey] = loc;
+      await dbSet("GLOBAL_DEMAND", JSON.stringify(demandData));
 
-  return { mult: loc.mult };
+      return { mult: loc.mult };
+  });
 }
 // ========================================================
 
 app.post("/action", requireToken, async (req, res) => {
-  const { topic, user, target, content, plan, productName, reqTime } = req.body;
+  const { topic, user, target, content, plan, productName, reqTime, action } = req.body;
   let targetUuid = target || plan; 
-  let safeTopic = (topic || "").toLowerCase().trim();
+  
+  // Extração Cirúrgica de Topic/Action e UUID 
+  let safeTopic = (topic || action || "").toLowerCase().trim();
+  
+  let rawData = `${target || ""} ${content || ""} ${plan || ""} ${productName || ""} ${action || ""}`;
+  let hubUuid = null;
+  // Caçador de UUID na String (Extrai f202f068-b919-3342-1f9a-ee7bdb07ad17 do SLURL)
+  let uuidMatch = rawData.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+  if (uuidMatch) {
+      hubUuid = uuidMatch[1];
+  } else {
+      hubUuid = targetUuid; // Fallback
+  }
   
   // ========================================================
   // 1. DEBOUNCE ANTI-GLITCH (BLOQUEIA DUPLAS COLISÕES DO SL)
   // ========================================================
-  const txHash = `${user}_${safeTopic}_${targetUuid}_${content}`;
+  const txHash = `${user}_${safeTopic}_${hubUuid}_${content}`;
   if (globalDebounce.has(txHash)) {
       return res.json({ status: "ignored" });
   }
@@ -432,12 +575,11 @@ app.post("/action", requireToken, async (req, res) => {
   let responsePayload = { status: "success" };
 
   // ========================================================
-  // 2. INVERSOR DE CORRIDA (Micro-Delay para o cargo sell)
-  // Se for o cargo sell, congela ele por 800ms para garantir 
-  // que a requisição de "delivered" foi processada no banco primeiro!
+  // 2. INVERSOR DE CORRIDA (Micro-Delay expandido para 1200ms)
+  // Garante tempo sobrando pro 'delivered' processar o DB de demanda.
   // ========================================================
   if (safeTopic === "cargo sell") {
-      await new Promise(resolve => setTimeout(resolve, 800));
+      await new Promise(resolve => setTimeout(resolve, 1200));
   }
 
   // ========================================================
@@ -447,14 +589,12 @@ app.post("/action", requireToken, async (req, res) => {
     try {
       
       // ========================================================
-      // DETECTA O AVISO DE "DELIVERED" (LOCALIZAÇÃO DA CARGA)
+      // DETECTA O AVISO DE "DELIVERED"
       // ========================================================
-      if (safeTopic === "delivered" || safeTopic === "delivery" || safeTopic === "cargo delivered") {
-          // Extrai o nome do Hub (Aceita "GFN MAIN HUB", "Royier", etc. Nao exige mais UUID de 36 caracteres)
-          let hubKey = target || content || plan; 
-          
-          if (hubKey && hubKey !== "FREE" && hubKey !== "PREMIUM" && hubKey !== "TEST_CARGO" && hubKey.length > 2) {
-              let demandResult = await processDemand(hubKey);
+      if (safeTopic.includes("deliver")) {
+          // O hubUuid já foi purificado lá em cima.
+          if (hubUuid && hubUuid !== "FREE" && hubUuid !== "PREMIUM" && hubUuid !== "TEST_CARGO" && hubUuid.length > 2) {
+              let demandResult = await processDemand(hubUuid);
               
               let player = await getPlayerData(user);
               player.LAST_DEMAND_MULT = demandResult.mult; // Guarda na memória do Player
@@ -475,7 +615,7 @@ app.post("/action", requireToken, async (req, res) => {
         let demandMult = 1.0;
         let now = getUnixTime();
 
-        // Checa se o aviso de "delivered" aconteceu nos últimos 120 segundos
+        // Checa se a memória da demanda aconteceu nos últimos 120 segundos
         if (player.LAST_DEMAND_MULT && player.LAST_DEMAND_TIME && (now - player.LAST_DEMAND_TIME) < 120) {
             demandMult = player.LAST_DEMAND_MULT;
         }
