@@ -284,7 +284,6 @@ async function savePlayerData(uuid, data) {
   );
 }
 
-
 // ========================================================
 // --- GERENCIADOR DE PARCELAS INTELIGENTE ---
 // ========================================================
@@ -412,7 +411,6 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
   }
 });
 
-
 // ========================================================
 // --- AUTO-SINCER (WEBSCRAPING PELA URL DO TELEPORTE) ---
 // ========================================================
@@ -505,39 +503,48 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
 // ========================================================
 // --- SISTEMA DE DEMANDA DE HUB BLINDADO (SUPPLY & DEMAND) ---
 // ========================================================
-async function processDemand(hubKey) {
-  // Lock exclusivo para o BD de Demanda (Evita que multiplos players corrompam a mesma chave)
+async function processDemand(hubKey, user) {
   return await withLock("GLOBAL_DEMAND_LOCK", async () => {
       let demandDataStr = await dbGet("GLOBAL_DEMAND") || "{}";
       let demandData = {};
       try { demandData = JSON.parse(demandDataStr); } catch(e) {}
 
-      let loc = demandData[hubKey] || { mult: 1.0, history: [], last_delivery: 0 };
+      let loc = demandData[hubKey] || { mult: 1.0, history: [], last_delivery: 0, user_history: {} };
+      if (!loc.user_history) loc.user_history = {}; 
+
       let now = getUnixTime();
 
       // Limpa o histórico de entregas (Apaga tudo mais velho que 3 Horas = 10800s)
       loc.history = loc.history.filter(ts => (now - ts) <= 10800);
 
-      // Recuperação de Demanda (Ganha +0.2 por cada Hora = 3600s sem entregas)
-      if (loc.last_delivery > 0 && loc.mult < 1.0) {
-         let timeOffline = now - loc.last_delivery;
-         if (timeOffline >= 3600) {
-            let hoursRecovered = Math.floor(timeOffline / 3600);
-            loc.mult = Math.min(1.0, loc.mult + (hoursRecovered * 0.2));
-         }
-      }
+      // ANTI-DOUBLE-COUNT: Se esse jogador já baixou a demanda aqui nos últimos 2 MINUTOS, ignora!
+      let lastUserTime = loc.user_history[user] || 0;
+      let alreadyCountedRecently = (now - lastUserTime) < 120;
 
-      // Aplica Queda se Hub estiver Saturado (>= 3 entregas nas últimas 3h)
-      if (loc.history.length >= 3) {
-         loc.mult = Math.max(0.1, loc.mult - 0.1); 
+      if (!alreadyCountedRecently) {
+         // Recuperação de Demanda (+0.2 por cada Hora sem entregas)
+         if (loc.last_delivery > 0 && loc.mult < 1.0) {
+            let timeOffline = now - loc.last_delivery;
+            if (timeOffline >= 3600) {
+               let hoursRecovered = Math.floor(timeOffline / 3600);
+               loc.mult = Math.min(1.0, loc.mult + (hoursRecovered * 0.2));
+            }
+         }
+
+         // Aplica Queda se Hub estiver Saturado (>= 3 entregas nas últimas 3h)
+         if (loc.history.length >= 3) {
+            loc.mult = Math.max(0.1, loc.mult - 0.1); 
+         }
+         
+         loc.mult = Math.round(loc.mult * 10) / 10;
+         
+         loc.history.push(now);
+         loc.last_delivery = now;
+         loc.user_history[user] = now;
+         
+         demandData[hubKey] = loc;
+         await dbSet("GLOBAL_DEMAND", JSON.stringify(demandData));
       }
-      
-      loc.mult = Math.round(loc.mult * 10) / 10;
-      
-      loc.history.push(now);
-      loc.last_delivery = now;
-      demandData[hubKey] = loc;
-      await dbSet("GLOBAL_DEMAND", JSON.stringify(demandData));
 
       return { mult: loc.mult };
   });
@@ -548,12 +555,11 @@ app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime, action } = req.body;
   let targetUuid = target || plan; 
   
-  // Extração Cirúrgica de Topic/Action e UUID 
   let safeTopic = (topic || action || "").toLowerCase().trim();
   
+  // CAÇADOR DE UUID: Procura um código "00000000-..." em QUALQUER PARTE da mensagem
   let rawData = `${target || ""} ${content || ""} ${plan || ""} ${productName || ""} ${action || ""}`;
   let hubUuid = null;
-  // Caçador de UUID na String (Extrai f202f068-b919-3342-1f9a-ee7bdb07ad17 do SLURL)
   let uuidMatch = rawData.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
   if (uuidMatch) {
       hubUuid = uuidMatch[1];
@@ -575,8 +581,7 @@ app.post("/action", requireToken, async (req, res) => {
   let responsePayload = { status: "success" };
 
   // ========================================================
-  // 2. INVERSOR DE CORRIDA (Micro-Delay expandido para 1200ms)
-  // Garante tempo sobrando pro 'delivered' processar o DB de demanda.
+  // 2. INVERSOR DE CORRIDA (Micro-Delay de 1.2s para prioridade de db)
   // ========================================================
   if (safeTopic === "cargo sell") {
       await new Promise(resolve => setTimeout(resolve, 1200));
@@ -592,13 +597,12 @@ app.post("/action", requireToken, async (req, res) => {
       // DETECTA O AVISO DE "DELIVERED"
       // ========================================================
       if (safeTopic.includes("deliver")) {
-          // O hubUuid já foi purificado lá em cima.
           if (hubUuid && hubUuid !== "FREE" && hubUuid !== "PREMIUM" && hubUuid !== "TEST_CARGO" && hubUuid.length > 2) {
-              let demandResult = await processDemand(hubUuid);
+              let demandResult = await processDemand(hubUuid, user);
               
               let player = await getPlayerData(user);
-              player.LAST_DEMAND_MULT = demandResult.mult; // Guarda na memória do Player
-              player.LAST_DEMAND_TIME = getUnixTime();     // Marca a hora da entrega
+              player.LAST_DEMAND_MULT = demandResult.mult; 
+              player.LAST_DEMAND_TIME = getUnixTime();     
               await savePlayerData(user, player);
           }
           return res.json({ status: "success" });
@@ -615,21 +619,25 @@ app.post("/action", requireToken, async (req, res) => {
         let demandMult = 1.0;
         let now = getUnixTime();
 
-        // Checa se a memória da demanda aconteceu nos últimos 120 segundos
-        if (player.LAST_DEMAND_MULT && player.LAST_DEMAND_TIME && (now - player.LAST_DEMAND_TIME) < 120) {
+        // Extração de Demanda em Tempo Real (Pesca a UUID de dentro da requisição do Cargo Sell se ela existir)
+        if (hubUuid && hubUuid.length === 36) {
+            let demandResult = await processDemand(hubUuid, user);
+            demandMult = demandResult.mult;
+        } 
+        // Fallback: Usa a memória caso a carga mande a localização numa requisição e o pagamento em outra
+        else if (player.LAST_DEMAND_MULT && player.LAST_DEMAND_TIME && (now - player.LAST_DEMAND_TIME) < 120) {
             demandMult = player.LAST_DEMAND_MULT;
         }
 
-        // Aplica o corte de demanda antes de injetar o dinheiro (Exceto planos Free/Test)
+        player.LAST_DEMAND_MULT = 1.0;
+        player.LAST_DEMAND_TIME = 0;
+
+        // APLICA O CORTE E ENVIA ALERTA AO PLAYER IMEDIATAMENTE (Ignorando planos grátis ou eventos)
         if (demandMult < 1.0 && plan !== "FREE" && plan !== "TEST_CARGO" && plan !== "EVENT") {
             price = Math.round(price * demandMult);
             let lostPercent = Math.round((1.0 - demandMult) * 100);
             await addPlayerMessage(user, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +20% every hour without deliveries.`);
         }
-        
-        // Limpa a memória de demanda após processar o pagamento
-        player.LAST_DEMAND_MULT = 1.0;
-        player.LAST_DEMAND_TIME = 0;
 
         let recebido = 0;
         let boost_m = 1.0;
