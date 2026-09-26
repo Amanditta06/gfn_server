@@ -253,7 +253,7 @@ app.post("/ack-msg", async (req, res) => {
 async function getPlayerData(uuid) {
   if (!uuid) return null;
   const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [`player_${uuid}`]);
-  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0 };
+  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0, ACTIVE_HUB: "", HUB_TIMESTAMP: 0, LAST_DEMAND_MULT: 1.0, LAST_DEMAND_TIME: 0 };
   
   if (res.rowCount > 0) {
     try { 
@@ -270,6 +270,9 @@ async function getPlayerData(uuid) {
       data.RE = parseInt(data.RE, 10) || 0;
       data.B_M = parseFloat(data.B_M) || 1.0;
       data.B_T = parseInt(data.B_T, 10) || 0;
+      data.HUB_TIMESTAMP = parseInt(data.HUB_TIMESTAMP, 10) || 0;
+      data.LAST_DEMAND_MULT = parseFloat(data.LAST_DEMAND_MULT) || 1.0;
+      data.LAST_DEMAND_TIME = parseInt(data.LAST_DEMAND_TIME, 10) || 0;
     } catch(e) {
       console.error(`Error parsing player data for ${uuid}:`, e);
     }
@@ -503,40 +506,49 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
 // ========================================================
 // --- SISTEMA DE DEMANDA BLINDADO (ISOLADO POR PARCELA) ---
 // ========================================================
-async function processDemand(hubKey) {
+async function processDemand(hubKey, user) {
   try {
       let demandDataStr = await dbGet("GLOBAL_DEMAND") || "{}";
       let demandData = {};
       try { demandData = JSON.parse(demandDataStr); } catch(e) {}
 
-      let loc = demandData[hubKey] || { mult: 1.0, history: [], last_delivery: 0 };
+      let loc = demandData[hubKey] || { mult: 1.0, history: [], last_delivery: 0, user_history: {} };
+      if (!loc.user_history) loc.user_history = {}; 
+
       let now = getUnixTime();
 
       // Limpa o histórico de entregas (Apaga tudo mais velho que 3 Horas = 10800s)
       loc.history = loc.history.filter(ts => (now - ts) <= 10800);
 
-      // Recuperação de Demanda (+0.2 por cada Hora sem entregas)
-      if (loc.last_delivery > 0 && loc.mult < 1.0) {
-         let timeOffline = now - loc.last_delivery;
-         if (timeOffline >= 3600) {
-            let hoursRecovered = Math.floor(timeOffline / 3600);
-            loc.mult = Math.min(1.0, loc.mult + (hoursRecovered * 0.2));
+      // Proteção anti-duplo clique (15 segundos para o mesmo usuário no mesmo hub)
+      let lastUserTime = loc.user_history[user] || 0;
+      let alreadyCountedRecently = (now - lastUserTime) < 15;
+
+      if (!alreadyCountedRecently) {
+         // Recuperação de Demanda (+0.2 por cada Hora sem entregas)
+         if (loc.last_delivery > 0 && loc.mult < 1.0) {
+            let timeOffline = now - loc.last_delivery;
+            if (timeOffline >= 3600) {
+               let hoursRecovered = Math.floor(timeOffline / 3600);
+               loc.mult = Math.min(1.0, loc.mult + (hoursRecovered * 0.2));
+            }
          }
-      }
 
-      // Adiciona a entrega atual ao histórico deste Hub específico
-      loc.history.push(now);
-      loc.last_delivery = now;
+         // Adiciona a entrega ao histórico deste Hub específico
+         loc.history.push(now);
+         loc.last_delivery = now;
+         loc.user_history[user] = now;
 
-      // Aplica Queda se Hub estiver Saturado (>= 3 entregas nas últimas 3h)
-      if (loc.history.length >= 3) {
-         loc.mult = Math.max(0.1, loc.mult - 0.1); 
+         // Aplica Queda se Hub estiver Saturado (>= 3 entregas nas últimas 3h)
+         if (loc.history.length >= 3) {
+            loc.mult = Math.max(0.1, loc.mult - 0.1); 
+         }
+         
+         loc.mult = Math.round(loc.mult * 10) / 10;
+         
+         demandData[hubKey] = loc;
+         await dbSet("GLOBAL_DEMAND", JSON.stringify(demandData));
       }
-      
-      loc.mult = Math.round(loc.mult * 10) / 10;
-      
-      demandData[hubKey] = loc;
-      await dbSet("GLOBAL_DEMAND", JSON.stringify(demandData));
 
       return { mult: loc.mult, count: loc.history.length };
   } catch (err) {
@@ -550,11 +562,9 @@ app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime, action } = req.body;
   let safeTopic = (topic || action || "").toLowerCase().trim();
   
-  // ========================================================
-  // EXTRATOR BLINDADO DE DESTINO (NUNCA USA PLANO COMO HUB)
-  // ========================================================
+  // Extração Cirúrgica de Hub/Parcela (UUID ou Nome válido)
   let rawData = `${target || ""} ${content || ""} ${plan || ""} ${productName || ""} ${action || ""}`;
-  let hubKey = "DEFAULT_HUB";
+  let hubKey = null;
 
   let uuidMatch = rawData.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
   if (uuidMatch) {
@@ -564,21 +574,13 @@ app.post("/action", requireToken, async (req, res) => {
       const invalidValues = ["free", "premium", "test_cargo", "event", "test", "0", ""];
       if (cleanTarget && !invalidValues.includes(cleanTarget.toLowerCase())) {
           hubKey = cleanTarget;
-      } else {
-          let cleanProduct = (productName || "").trim();
-          if (cleanProduct && !invalidValues.includes(cleanProduct.toLowerCase())) {
-              hubKey = cleanProduct;
-          } else {
-              hubKey = "GFN_MAIN_HUB";
-          }
       }
   }
-  // ========================================================
 
   // ========================================================
   // 1. DEBOUNCE ANTI-GLITCH
   // ========================================================
-  const txHash = `${user}_${safeTopic}_${hubKey}_${content}`;
+  const txHash = `${user}_${safeTopic}_${hubKey || 'general'}_${content}`;
   if (globalDebounce.has(txHash)) {
       return res.json({ status: "ignored" });
   }
@@ -594,20 +596,44 @@ app.post("/action", requireToken, async (req, res) => {
   await withLock(user, async () => {
     try {
       
-      if (safeTopic === "cargo sell" || safeTopic === "delivered" || safeTopic === "delivery") {
+      let player = await getPlayerData(user);
+      let now = getUnixTime();
+
+      // Se a mensagem for de entrega/chegada (delivered/delivery), processa o registro no Hub e salva na memória do player
+      if (safeTopic.includes("deliver") || safeTopic === "delivery") {
+        if (hubKey && hubKey.length > 2) {
+            player.ACTIVE_HUB = hubKey;
+            player.HUB_TIMESTAMP = now;
+
+            let demandResult = await processDemand(hubKey, user);
+            player.LAST_DEMAND_MULT = demandResult.mult;
+            player.LAST_DEMAND_TIME = now;
+
+            await savePlayerData(user, player);
+        }
+        return res.json({ status: "success" });
+      }
+
+      // Se a mensagem for de venda de carga (cargo sell)
+      else if (safeTopic === "cargo sell") {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
 
-        let player = await getPlayerData(user);
         let demandMult = 1.0;
-        let now = getUnixTime();
 
-        let demandResult = await processDemand(hubKey);
-        demandMult = demandResult.mult;
+        // Se a UUID veio direto no cargo sell ou está guardada na memória recente do player (< 120s)
+        let activeHub = hubKey || ((player.ACTIVE_HUB && (now - player.HUB_TIMESTAMP) < 120) ? player.ACTIVE_HUB : null);
 
-        if (safeTopic !== "cargo sell") {
-            return res.json({ status: "success" });
+        if (activeHub) {
+            let demandResult = await processDemand(activeHub, user);
+            demandMult = demandResult.mult;
+        } else if (player.LAST_DEMAND_MULT && (now - player.LAST_DEMAND_TIME) < 120) {
+            demandMult = player.LAST_DEMAND_MULT;
         }
+
+        // Limpa a memória de demanda temporária
+        player.LAST_DEMAND_MULT = 1.0;
+        player.LAST_DEMAND_TIME = 0;
 
         // APLICA DEMANDA EM TUDO, EXCETO NO PLANO "EVENT"
         if (demandMult < 1.0 && plan !== "EVENT") {
