@@ -61,7 +61,7 @@ async function clearAllMessageQueues() {
   if (!DATABASE_URL) return;
   try {
     await db.query("DELETE FROM kvstore WHERE id LIKE '%_MSG'");
-    await db.query("DELETE FROM kvstore WHERE id LIKE '%_ALERTS'"); // Limpa fila de alertas no boot
+    await db.query("DELETE FROM kvstore WHERE id LIKE '%_ALERTS'"); // Limpa lixo de testes anteriores
   } catch (e) {}
 }
 
@@ -181,39 +181,6 @@ app.post("/ack-msg", async (req, res) => {
   if (!uuid) return res.status(400).json({ error: "missing uuid" });
   try {
     await db.query("DELETE FROM kvstore WHERE id=$1", [`${uuid}_MSG`]);
-    res.json({ status: "cleared" });
-  } catch (e) { res.status(500).json({ error: "db error" }); }
-});
-
-// ========================================================
-// ALERTAS ISOLADOS (APENAS WARNINGS)
-// ========================================================
-async function addPlayerAlert(uuid, msg) {
-  const keyId = `${uuid}_ALERTS`;
-  try {
-    const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [keyId]);
-    let alerts = [];
-    if (res.rowCount > 0 && res.rows[0].value) { try { alerts = JSON.parse(res.rows[0].value); } catch(e) {} }
-    alerts.push(msg);
-    if (alerts.length > 5) alerts = alerts.slice(-5);
-    await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, [keyId, JSON.stringify(alerts)]);
-  } catch (e) {}
-}
-
-app.get("/get-alerts", async (req, res) => {
-  const uuid = req.query.uuid;
-  if (!uuid) return res.status(400).json({ error: "missing uuid" });
-  try {
-    const q = await db.query("SELECT value FROM kvstore WHERE id=$1", [`${uuid}_ALERTS`]);
-    res.json({ alerts: (q.rowCount > 0 && q.rows[0].value) ? JSON.parse(q.rows[0].value) : [] });
-  } catch (e) { res.status(500).json({ error: "db error" }); }
-});
-
-app.post("/ack-alerts", async (req, res) => {
-  const { uuid } = req.body;
-  if (!uuid) return res.status(400).json({ error: "missing uuid" });
-  try {
-    await db.query("DELETE FROM kvstore WHERE id=$1", [`${uuid}_ALERTS`]);
     res.json({ status: "cleared" });
   } catch (e) { res.status(500).json({ error: "db error" }); }
 });
@@ -709,43 +676,57 @@ app.get("/get", async (req, res) => {
 });
 
 app.post("/set", requireToken, async (req, res) => {
-  const { id, value } = req.body;
+  let { id, value } = req.body; // <-- Mudado para 'let' para podermos injetar o aviso!
   if (!id) return res.status(400).json({ error: "missing id" });
+  
   try {
-    await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, [id, value]);
-    if (id === "GLOBAL_SETTINGS") await loadGlobalSettings();
-
     // ========================================================
-    // INTERCEPTAÇÃO SEGURA: ALERTA VAI PARA addPlayerAlert()
+    // INTERCEPTADOR: LÊ O LOG E INJETA O AVISO DIRETAMENTE NA GAVETA ADMIN
     // ========================================================
     if (id === "gfn_admin_logs" && value) {
-        let agentMatch = value.match(/\/app\/agent\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-        let parcelMatch = value.match(/\/app\/parcel\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+        let logs = value.split("|#|").filter(Boolean);
+        let lastLog = logs[logs.length - 1] || "";
+        
+        let agentMatch = lastLog.match(/\/app\/agent\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+        let parcelMatch = lastLog.match(/\/app\/parcel\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
         
         if (agentMatch && parcelMatch) {
             let playerUuid = agentMatch[1];
             let parcelUuid = parcelMatch[1];
             
-            if (value.includes("Action: Cargo Delivered")) {
+            if (lastLog.includes("Action: Cargo Delivered")) {
                 let pData = await getPlayerData(playerUuid);
                 pData.ACTIVE_PARCEL = parcelUuid;
                 pData.PARCEL_TIME = getUnixTime();
                 await savePlayerData(playerUuid, pData);
             } 
-            else if (value.toLowerCase().includes("cargo loaded") || value.includes("Action: Cargo Loaded")) {
+            else if (lastLog.toLowerCase().includes("cargo loaded") || lastLog.includes("Action: Cargo Loaded")) {
                 let currentDemand = await getParcelDemandOnly(parcelUuid);
                 if (currentDemand < 1.0) {
                     let lostPercent = Math.round((1.0 - currentDemand) * 100);
-                    // AQUI ESTÁ A MÁGICA: Manda SÓ para a fila de alertas (não vai para a HUD)
-                    await addPlayerAlert(playerUuid, `⚠️ [WARNING] The destination parcel has a low demand! Current demand multiplier is ${currentDemand}x (-${lostPercent}% payout).`);
+                    // INJETA O AVISO EXATAMENTE AQUI:
+                    let warningLog = `[${getUnixTime()}] secondlife:///app/agent/${playerUuid}/inspect | ⚠️ [DEMAND WARNING] Destination has low demand: ${currentDemand}x (-${lostPercent}% payout).`;
+                    value = value + "|#|" + warningLog; 
                 }
             }
         }
     }
     // ========================================================
 
+    // Salva o value no banco (agora carregando a injeção do log, se ocorreu)
+    await db.query(
+      `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, 
+      [id, value]
+    );
+
+    if (id === "GLOBAL_SETTINGS") {
+        await loadGlobalSettings();
+    }
+
     res.json({ status: "ok", id, value });
-  } catch (e) { res.status(500).json({ error: "db error" }); }
+  } catch (e) { 
+    res.status(500).json({ error: "db error" }); 
+  }
 });
 
 app.get("/", (req, res) => res.json({ status: "ok" }));
