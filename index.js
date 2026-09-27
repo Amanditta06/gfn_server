@@ -603,20 +603,20 @@ app.post("/action", requireToken, async (req, res) => {
       }
       else if (safeTopic === "godcheck") {
         let tPlayer = await getPlayerData(target);
-        await addPlayerMessage(user, `Target (${target}) Balance: ${tPlayer.M} F₵ | Points: ${tPlayer.P}`);
+        await addPlayerMessage(user, `[ADMIN CHECK] Target secondlife:///app/agent/${target}/inspect Balance: ${tPlayer.M} F₵ | Points: ${tPlayer.P}`);
       }
       else if (safeTopic === "m_reset") {
         let tPlayer = await getPlayerData(target);
         tPlayer.M = parseInt(content) || 0;
         await savePlayerData(target, tPlayer);
-        await addPlayerMessage(user, `Money reset for ${target}. New balance: ${tPlayer.M} F₵`);
+        await addPlayerMessage(user, `Money reset for secondlife:///app/agent/${target}/inspect. New balance: ${tPlayer.M} F₵`);
         await addPlayerMessage(target, `Your money balance was reset by an administrator.`);
       }
       else if (safeTopic === "p_reset") {
         let tPlayer = await getPlayerData(target);
         tPlayer.P = parseInt(content) || 0;
         await savePlayerData(target, tPlayer);
-        await addPlayerMessage(user, `Points reset for ${target}. New points: ${tPlayer.P}`);
+        await addPlayerMessage(user, `Points reset for secondlife:///app/agent/${target}/inspect. New points: ${tPlayer.P}`);
         await addPlayerMessage(target, `Your GFN points were reset by an administrator.`);
       }
       else if (safeTopic === "pay") {
@@ -629,9 +629,16 @@ app.post("/action", requireToken, async (req, res) => {
 
         let tPlayer = await getPlayerData(target);
         sender.M -= amountVal; tPlayer.M += amountVal;
-        await savePlayerData(user, sender); await savePlayerData(target, tPlayer);
-        await addPlayerMessage(user, `You successfully paid ${amountVal} F₵ to secondlife:///app/agent/${target}/about. Your new balance: ${sender.M} F₵`);
-        await addPlayerMessage(target, `You received ${amountVal} F₵ from secondlife:///app/agent/${user}/about. Your new balance: ${tPlayer.M} F₵`);
+        await savePlayerData(user, sender); 
+        await savePlayerData(target, tPlayer);
+        
+        if (plan === "GOD") {
+            await addPlayerMessage(user, `[ADMIN PAY] You paid ${amountVal} F₵ to secondlife:///app/agent/${target}/inspect.`);
+            await addPlayerMessage(target, `⚠️ An ADMIN has paid you ${amountVal} F₵. Your balance is now ${tPlayer.M} F₵.`);
+        } else {
+            await addPlayerMessage(user, `You successfully paid ${amountVal} F₵ to secondlife:///app/agent/${target}/about. Your new balance: ${sender.M} F₵`);
+            await addPlayerMessage(target, `You received ${amountVal} F₵ from secondlife:///app/agent/${user}/about. Your new balance: ${tPlayer.M} F₵`);
+        }
       }
       else if (safeTopic === "mass_money_reset_custom") {
         const maxValue = parseInt(content) || 0;
