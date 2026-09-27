@@ -402,6 +402,9 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
   })();
 });
 
+// ========================================================
+// LÓGICA DE DEMANDA (CORRIGIDA PARA RECUPERAÇÃO CONTÍNUA)
+// ========================================================
 async function processParcelDemand(parcelUuid, user) {
   if (!parcelUuid || parcelUuid.length !== 36) return 1.0;
   const key = `PARCEL_${parcelUuid}`;
@@ -418,17 +421,19 @@ async function processParcelDemand(parcelUuid, user) {
       if (!alreadyCountedRecently) {
          if (parcel.last_delivery > 0 && parcel.mult < 1.0) {
             let timeOffline = now - parcel.last_delivery;
-            if (timeOffline >= 3600) {
-               let hoursRecovered = Math.floor(timeOffline / 3600);
-               parcel.mult = Math.min(1.0, parcel.mult + (hoursRecovered * 0.2));
-            }
+            // RECUPERAÇÃO PROPORCIONAL: 0.2 por hora, aplicado a cada segundo.
+            let recovered = (timeOffline / 3600.0) * 0.2;
+            parcel.mult = Math.min(1.0, parcel.mult + recovered);
          }
+         
          parcel.history.push(now);
          parcel.last_delivery = now;
          parcel.user_history[user] = now;
          
-         if (parcel.history.length >= 1) { parcel.mult = Math.max(0.1, parcel.mult - 0.1); }
+         // Aplica a penalidade da entrega atual (-0.1)
+         parcel.mult = Math.max(0.1, parcel.mult - 0.1);
          
+         // Arredonda para 1 casa decimal pra ficar bonito (ex: 0.9, 0.8)
          parcel.mult = Math.round(parcel.mult * 10) / 10;
          await dbSet(key, JSON.stringify(parcel));
       }
@@ -445,16 +450,18 @@ async function getParcelDemandOnly(parcelUuid) {
       let parcel = JSON.parse(dataStr);
       let now = getUnixTime();
       let mult = parcel.mult;
+      
       if (parcel.last_delivery > 0 && mult < 1.0) {
          let timeOffline = now - parcel.last_delivery;
-         if (timeOffline >= 3600) {
-            let hoursRecovered = Math.floor(timeOffline / 3600);
-            mult = Math.min(1.0, mult + (hoursRecovered * 0.2));
-         }
+         // RECUPERAÇÃO PROPORCIONAL (Calcula o valor real no exato momento da visualização)
+         let recovered = (timeOffline / 3600.0) * 0.2;
+         mult = Math.min(1.0, mult + recovered);
       }
+      
       return Math.round(mult * 10) / 10;
   } catch (err) { return 1.0; }
 }
+// ========================================================
 
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime, action } = req.body;
@@ -630,19 +637,13 @@ app.post("/action", requireToken, async (req, res) => {
         if (amountVal > MAX_TRANSACTION) amountVal = MAX_TRANSACTION;
 
         if (plan === "GOD") {
-            // ==========================================
-            // MODO ADMIN: O dinheiro "surge do nada", não desconta da sua conta, e você pode se pagar.
-            // ==========================================
             let tPlayer = await getPlayerData(target);
-            tPlayer.M += amountVal; // Apenas adiciona o dinheiro ao alvo
+            tPlayer.M += amountVal; 
             await savePlayerData(target, tPlayer);
             
             await addPlayerMessage(user, `[ADMIN PAY] You paid ${amountVal} F₵ to secondlife:///app/agent/${target}/inspect.`);
             await addPlayerMessage(target, `⚠️ An ADMIN has paid you ${amountVal} F₵. Your balance is now ${tPlayer.M} F₵.`);
         } else {
-            // ==========================================
-            // MODO JOGADOR NORMAL: Desconta da conta, precisa ter saldo, não pode se pagar.
-            // ==========================================
             let sender = await getPlayerData(user);
             if (sender.M < amountVal) {
                 await addPlayerMessage(user, `⚠️ Negado: Você não tem saldo suficiente. Seu saldo é ${sender.M} F₵.`);
@@ -662,6 +663,22 @@ app.post("/action", requireToken, async (req, res) => {
             await addPlayerMessage(user, `You successfully paid ${amountVal} F₵ to secondlife:///app/agent/${target}/about. Your new balance: ${sender.M} F₵`);
             await addPlayerMessage(target, `You received ${amountVal} F₵ from secondlife:///app/agent/${user}/about. Your new balance: ${tPlayer.M} F₵`);
         }
+      }
+      else if (safeTopic === "mass_money_reset_custom") {
+        const maxValue = parseInt(content) || 0;
+        const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
+        for (let row of q.rows) {
+          try {
+            let pData = JSON.parse(row.value);
+            if (pData.M > maxValue) {
+                pData.M = maxValue;
+                await db.query("UPDATE kvstore SET value = $1 WHERE id = $2", [JSON.stringify(pData), row.id]);
+                await addPlayerMessage(row.id.replace("player_", ""), plan);
+            }
+          } catch(e) {}
+        }
+        await addPlayerMessage(user, `VARREDURA CONCLUÍDA! Contas limitadas a ${maxValue} F₵.`);
+        responsePayload.status = "success";
       }
       else if (safeTopic === "buy") {
         let price = parseInt(content) || 0;
