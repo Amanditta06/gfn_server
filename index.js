@@ -621,40 +621,47 @@ app.post("/action", requireToken, async (req, res) => {
       }
       else if (safeTopic === "pay") {
         let amountVal = parseInt(content) || 0;
-        if (amountVal <= 0) return res.json({ status: "denied" });
-        if (amountVal > MAX_TRANSACTION) amountVal = MAX_TRANSACTION;
-        let sender = await getPlayerData(user);
-        if (sender.M < amountVal) return res.json({ status: "denied" });
-        if (user === target) return res.json({ status: "denied" });
-
-        let tPlayer = await getPlayerData(target);
-        sender.M -= amountVal; tPlayer.M += amountVal;
-        await savePlayerData(user, sender); 
-        await savePlayerData(target, tPlayer);
         
+        if (amountVal <= 0) {
+            await addPlayerMessage(user, "⚠️ Negado: Você não pode transferir valores zerados ou negativos.");
+            return res.json({ status: "denied" });
+        }
+        
+        if (amountVal > MAX_TRANSACTION) amountVal = MAX_TRANSACTION;
+
         if (plan === "GOD") {
+            // ==========================================
+            // MODO ADMIN: O dinheiro "surge do nada", não desconta da sua conta, e você pode se pagar.
+            // ==========================================
+            let tPlayer = await getPlayerData(target);
+            tPlayer.M += amountVal; // Apenas adiciona o dinheiro ao alvo
+            await savePlayerData(target, tPlayer);
+            
             await addPlayerMessage(user, `[ADMIN PAY] You paid ${amountVal} F₵ to secondlife:///app/agent/${target}/inspect.`);
             await addPlayerMessage(target, `⚠️ An ADMIN has paid you ${amountVal} F₵. Your balance is now ${tPlayer.M} F₵.`);
         } else {
+            // ==========================================
+            // MODO JOGADOR NORMAL: Desconta da conta, precisa ter saldo, não pode se pagar.
+            // ==========================================
+            let sender = await getPlayerData(user);
+            if (sender.M < amountVal) {
+                await addPlayerMessage(user, `⚠️ Negado: Você não tem saldo suficiente. Seu saldo é ${sender.M} F₵.`);
+                return res.json({ status: "denied" });
+            }
+            if (user === target) {
+                await addPlayerMessage(user, "⚠️ Negado: Você não pode transferir F₵ para si mesmo.");
+                return res.json({ status: "denied" });
+            }
+
+            let tPlayer = await getPlayerData(target);
+            sender.M -= amountVal; 
+            tPlayer.M += amountVal;
+            await savePlayerData(user, sender); 
+            await savePlayerData(target, tPlayer);
+            
             await addPlayerMessage(user, `You successfully paid ${amountVal} F₵ to secondlife:///app/agent/${target}/about. Your new balance: ${sender.M} F₵`);
             await addPlayerMessage(target, `You received ${amountVal} F₵ from secondlife:///app/agent/${user}/about. Your new balance: ${tPlayer.M} F₵`);
         }
-      }
-      else if (safeTopic === "mass_money_reset_custom") {
-        const maxValue = parseInt(content) || 0;
-        const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
-        for (let row of q.rows) {
-          try {
-            let pData = JSON.parse(row.value);
-            if (pData.M > maxValue) {
-                pData.M = maxValue;
-                await db.query("UPDATE kvstore SET value = $1 WHERE id = $2", [JSON.stringify(pData), row.id]);
-                await addPlayerMessage(row.id.replace("player_", ""), plan);
-            }
-          } catch(e) {}
-        }
-        await addPlayerMessage(user, `VARREDURA CONCLUÍDA! Contas limitadas a ${maxValue} F₵.`);
-        responsePayload.status = "success";
       }
       else if (safeTopic === "buy") {
         let price = parseInt(content) || 0;
