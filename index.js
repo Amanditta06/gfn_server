@@ -395,7 +395,10 @@ async function processParcelDemand(parcelUuid, user) {
          parcel.history.push(now);
          parcel.last_delivery = now;
          parcel.user_history[user] = now;
-         if (parcel.history.length >= 3) { parcel.mult = Math.max(0.1, parcel.mult - 0.1); }
+         
+         // DEMANDA CAI APÓS A PRIMEIRA ENTREGA AO INVÉS DE 3
+         if (parcel.history.length >= 1) { parcel.mult = Math.max(0.1, parcel.mult - 0.1); }
+         
          parcel.mult = Math.round(parcel.mult * 10) / 10;
          await dbSet(key, JSON.stringify(parcel));
       }
