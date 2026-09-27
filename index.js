@@ -65,12 +65,60 @@ async function clearAllMessageQueues() {
   } catch (e) {}
 }
 
+// ========================================================
+// FUNÇÃO CENTRAL DO HALL DA FAMA
+// ========================================================
+async function processHallOfFame(rankString) {
+  if (!rankString || rankString.length <= 5 || rankString.includes("Waiting")) return;
+  try {
+    let hofRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["HALL_OF_FAME"]);
+    let hofList = [];
+    if (hofRes.rowCount > 0 && hofRes.rows[0].value) { 
+      try { hofList = JSON.parse(hofRes.rows[0].value); } catch(e){} 
+    }
+    
+    // Suporta tanto quebra de linha real quanto o texto literal "\n"
+    const lines = rankString.split(/\\n|\n/);
+    
+    lines.forEach(line => {
+       let match = line.match(/(?:[\d]+[°\.]\s*:?\s*)?(.+?)\s*(?:\(([\d,\.]+)\)|-\s*([\d,\.]+))/);
+       if (match) {
+         let playerName = match[1].trim();
+         let scoreStr = match[2] || match[3];
+         let weeklyScore = parseInt(scoreStr.replace(/\D/g, ''));
+         if (!isNaN(weeklyScore)) {
+           let existing = hofList.find(p => p.name === playerName);
+           // Atualiza apenas se for MAIOR que o recorde anterior (ou adiciona novo)
+           if (existing) { 
+             if (weeklyScore > existing.score) existing.score = weeklyScore; 
+           } else { 
+             hofList.push({ name: playerName, score: weeklyScore }); 
+           }
+         }
+       }
+    });
+    
+    hofList.sort((a, b) => b.score - a.score);
+    hofList = hofList.slice(0, 3); // Mantém estritamente o top 3
+    await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, ["HALL_OF_FAME", JSON.stringify(hofList)]);
+  } catch(e) {
+    console.error("Erro ao processar Hall of Fame:", e);
+  }
+}
+// ========================================================
+
 async function ensureTable() {
   if (!DATABASE_URL) return;
   try {
     await db.query(`CREATE TABLE IF NOT EXISTS kvstore (id TEXT PRIMARY KEY, value TEXT);`);
     await loadGlobalSettings(); 
     await clearAllMessageQueues();
+    
+    // TODA VEZ QUE O SERVIDOR DER REBOOT: Ele puxa a semana anterior e checa o Hall da Fama
+    const lastRankRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["lastWeekTopFive"]);
+    if (lastRankRes.rowCount > 0 && lastRankRes.rows[0].value) {
+       await processHallOfFame(lastRankRes.rows[0].value);
+    }
   } catch (e) {}
 }
 ensureTable();
@@ -88,26 +136,9 @@ setInterval(async () => {
 
       if (oldRank && oldRank.length > 5 && !oldRank.includes("Waiting")) {
         await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, ["lastWeekTopFive", oldRank]);
-        let hofRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["HALL_OF_FAME"]);
-        let hofList = [];
-        if (hofRes.rowCount > 0 && hofRes.rows[0].value) { try { hofList = JSON.parse(hofRes.rows[0].value); } catch(e){} }
-        const lines = oldRank.split('\n');
-        lines.forEach(line => {
-           let match = line.match(/(?:[\d]+[°\.]\s*:?\s*)?(.+?)\s*(?:\(([\d,\.]+)\)|-\s*([\d,\.]+))/);
-           if (match) {
-             let playerName = match[1].trim();
-             let scoreStr = match[2] || match[3];
-             let weeklyScore = parseInt(scoreStr.replace(/\D/g, ''));
-             if (!isNaN(weeklyScore)) {
-               let existing = hofList.find(p => p.name === playerName);
-               if (existing) { if (weeklyScore > existing.score) existing.score = weeklyScore; } 
-               else { hofList.push({ name: playerName, score: weeklyScore }); }
-             }
-           }
-        });
-        hofList.sort((a, b) => b.score - a.score);
-        hofList = hofList.slice(0, 3);
-        await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, ["HALL_OF_FAME", JSON.stringify(hofList)]);
+        
+        // Processa o Hall da Fama na virada da semana
+        await processHallOfFame(oldRank);
       }
       await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, ["weeklyTopFive", "Waiting for new deliveries..."]);
       activeServerWeek = currentNowWeek;
@@ -396,7 +427,6 @@ async function processParcelDemand(parcelUuid, user) {
          parcel.last_delivery = now;
          parcel.user_history[user] = now;
          
-         // DEMANDA CAI APÓS A PRIMEIRA ENTREGA AO INVÉS DE 3
          if (parcel.history.length >= 1) { parcel.mult = Math.max(0.1, parcel.mult - 0.1); }
          
          parcel.mult = Math.round(parcel.mult * 10) / 10;
@@ -679,7 +709,7 @@ app.get("/get", async (req, res) => {
 });
 
 app.post("/set", requireToken, async (req, res) => {
-  let { id, value } = req.body; // <-- Mudado para 'let' para podermos injetar o aviso!
+  let { id, value } = req.body; 
   if (!id) return res.status(400).json({ error: "missing id" });
   
   try {
@@ -707,7 +737,6 @@ app.post("/set", requireToken, async (req, res) => {
                 let currentDemand = await getParcelDemandOnly(parcelUuid);
                 if (currentDemand < 1.0) {
                     let lostPercent = Math.round((1.0 - currentDemand) * 100);
-                    // INJETA O AVISO EXATAMENTE AQUI:
                     let warningLog = `[${getUnixTime()}] secondlife:///app/agent/${playerUuid}/inspect | ⚠️ [DEMAND WARNING] Destination has low demand: ${currentDemand}x (-${lostPercent}% payout).`;
                     value = value + "|#|" + warningLog; 
                 }
@@ -716,7 +745,6 @@ app.post("/set", requireToken, async (req, res) => {
     }
     // ========================================================
 
-    // Salva o value no banco (agora carregando a injeção do log, se ocorreu)
     await db.query(
       `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, 
       [id, value]
