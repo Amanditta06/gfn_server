@@ -27,9 +27,6 @@ let MAX_EV = 5000;
 let MAX_F = 2000;
 let MAX_TRANSACTION = 1000000;
 
-// ========================================================
-// --- SISTEMA DE SEGURANÇA BANCÁRIA (MUTEX & DEBOUNCE) ---
-// ========================================================
 const globalDebounce = new Set();
 const mutexes = {};
 
@@ -47,7 +44,6 @@ async function withLock(key, fn) {
     if (mutexes[key] === nextPromise) delete mutexes[key];
   }
 }
-// ========================================================
 
 async function loadGlobalSettings() {
   try {
@@ -58,64 +54,43 @@ async function loadGlobalSettings() {
       if (parts[7] !== undefined && !isNaN(parseInt(parts[7]))) MAX_EV = parseInt(parts[7]);
       if (parts[8] !== undefined && !isNaN(parseInt(parts[8]))) MAX_F = parseInt(parts[8]);
     }
-  } catch (e) {
-    console.error("Error loading settings:", e);
-  }
+  } catch (e) {}
 }
 
 async function clearAllMessageQueues() {
   if (!DATABASE_URL) return;
   try {
-    const res = await db.query("DELETE FROM kvstore WHERE id LIKE '%_MSG'");
-    console.log(`🧹 Limpeza de Boot: ${res.rowCount} filas de mensagens antigas foram apagadas com sucesso!`);
-  } catch (e) {
-    console.error("Error clearing message queues on reboot:", e);
-  }
+    await db.query("DELETE FROM kvstore WHERE id LIKE '%_MSG'");
+    await db.query("DELETE FROM kvstore WHERE id LIKE '%_ALERTS'"); // Limpa fila de alertas no boot
+  } catch (e) {}
 }
 
 async function ensureTable() {
   if (!DATABASE_URL) return;
   try {
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS kvstore (
-        id TEXT PRIMARY KEY,
-        value TEXT
-      );
-    `);
-    console.log("kvstore table ready");
+    await db.query(`CREATE TABLE IF NOT EXISTS kvstore (id TEXT PRIMARY KEY, value TEXT);`);
     await loadGlobalSettings(); 
     await clearAllMessageQueues();
-  } catch (e) {
-    console.error("Error ensuring kvstore table:", e);
-  }
+  } catch (e) {}
 }
 ensureTable();
 
 const getUnixTime = () => Math.floor(Date.now() / 1000);
 const getCurrentWeek = () => Math.floor((getUnixTime() + 345600) / 604800);
-
 let activeServerWeek = getCurrentWeek();
 
 setInterval(async () => {
   let currentNowWeek = getCurrentWeek();
   if (currentNowWeek !== activeServerWeek) {
     try {
-      console.log("Week Rollover Detected! Archiving Last Week and processing Global Hall of Fame...");
       const oldRankRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["weeklyTopFive"]);
       let oldRank = oldRankRes.rowCount > 0 ? oldRankRes.rows[0].value : "";
 
       if (oldRank && oldRank.length > 5 && !oldRank.includes("Waiting")) {
-        await db.query(
-          `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, 
-          ["lastWeekTopFive", oldRank]
-        );
-
+        await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, ["lastWeekTopFive", oldRank]);
         let hofRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["HALL_OF_FAME"]);
         let hofList = [];
-        if (hofRes.rowCount > 0 && hofRes.rows[0].value) {
-           try { hofList = JSON.parse(hofRes.rows[0].value); } catch(e){}
-        }
-
+        if (hofRes.rowCount > 0 && hofRes.rows[0].value) { try { hofList = JSON.parse(hofRes.rows[0].value); } catch(e){} }
         const lines = oldRank.split('\n');
         lines.forEach(line => {
            let match = line.match(/(?:[\d]+[°\.]\s*:?\s*)?(.+?)\s*(?:\(([\d,\.]+)\)|-\s*([\d,\.]+))/);
@@ -125,41 +100,24 @@ setInterval(async () => {
              let weeklyScore = parseInt(scoreStr.replace(/\D/g, ''));
              if (!isNaN(weeklyScore)) {
                let existing = hofList.find(p => p.name === playerName);
-               if (existing) {
-                 if (weeklyScore > existing.score) existing.score = weeklyScore;
-               } else {
-                 hofList.push({ name: playerName, score: weeklyScore });
-               }
+               if (existing) { if (weeklyScore > existing.score) existing.score = weeklyScore; } 
+               else { hofList.push({ name: playerName, score: weeklyScore }); }
              }
            }
         });
-
         hofList.sort((a, b) => b.score - a.score);
         hofList = hofList.slice(0, 3);
-        await db.query(
-          `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, 
-          ["HALL_OF_FAME", JSON.stringify(hofList)]
-        );
+        await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, ["HALL_OF_FAME", JSON.stringify(hofList)]);
       }
-
-      await db.query(
-        `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, 
-        ["weeklyTopFive", "Waiting for new deliveries..."]
-      );
-
+      await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, ["weeklyTopFive", "Waiting for new deliveries..."]);
       activeServerWeek = currentNowWeek;
-      console.log("Rollover complete!");
-    } catch (e) {
-      console.error("Error during week rollover:", e);
-    }
+    } catch (e) {}
   }
 }, 60000);
 
 function requireToken(req, res, next) {
   const token = req.header("x-api-token");
-  if (!token || token !== API_TOKEN) {
-    return res.status(401).json({ error: "invalid token" });
-  }
+  if (!token || token !== API_TOKEN) return res.status(401).json({ error: "invalid token" });
   next();
 }
 
@@ -167,21 +125,13 @@ async function dbGet(id) {
   try {
     const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [id]);
     return res.rowCount > 0 ? res.rows[0].value : null;
-  } catch (e) {
-    console.error("dbGet error:", e);
-    return null;
-  }
+  } catch (e) { return null; }
 }
 
 async function dbSet(id, value) {
   try {
-    await db.query(
-      `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`,
-      [id, value]
-    );
-  } catch (e) {
-    console.error("dbSet error:", e);
-  }
+    await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, [id, value]);
+  } catch (e) {}
 }
 
 async function saveServerChunks(srvName, mainList, namesList) {
@@ -202,64 +152,81 @@ async function saveServerChunks(srvName, mainList, namesList) {
   await dbSet(`${srvName}_NAMES_5`, chunks[4]);
 }
 
+// ========================================================
+// MENSAGENS NORMAIS (HUD / PAGAMENTOS)
+// ========================================================
 async function addPlayerMessage(uuid, msg) {
   const keyId = `${uuid}_MSG`;
   try {
     const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [keyId]);
     let messages = [];
-    if (res.rowCount > 0 && res.rows[0].value) {
-      try { messages = JSON.parse(res.rows[0].value); } catch(e) {}
-    }
+    if (res.rowCount > 0 && res.rows[0].value) { try { messages = JSON.parse(res.rows[0].value); } catch(e) {} }
     messages.push(msg);
-    if (messages.length > 20) {
-        messages = messages.slice(-20);
-    }
-    await db.query(
-      `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`,
-      [keyId, JSON.stringify(messages)]
-    );
-  } catch (e) {
-    console.error("Error adding message:", e);
-  }
+    if (messages.length > 20) messages = messages.slice(-20);
+    await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, [keyId, JSON.stringify(messages)]);
+  } catch (e) {}
 }
 
 app.get("/get-msg", async (req, res) => {
   const uuid = req.query.uuid;
   if (!uuid) return res.status(400).json({ error: "missing uuid" });
-  const keyId = `${uuid}_MSG`;
   try {
-    const q = await db.query("SELECT value FROM kvstore WHERE id=$1", [keyId]);
-    const messages = (q.rowCount > 0 && q.rows[0].value) ? JSON.parse(q.rows[0].value) : [];
-    res.json({ messages });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "db error" });
-  }
+    const q = await db.query("SELECT value FROM kvstore WHERE id=$1", [`${uuid}_MSG`]);
+    res.json({ messages: (q.rowCount > 0 && q.rows[0].value) ? JSON.parse(q.rows[0].value) : [] });
+  } catch (e) { res.status(500).json({ error: "db error" }); }
 });
 
 app.post("/ack-msg", async (req, res) => {
   const { uuid } = req.body;
   if (!uuid) return res.status(400).json({ error: "missing uuid" });
-  const keyId = `${uuid}_MSG`;
   try {
-    await db.query("DELETE FROM kvstore WHERE id=$1", [keyId]);
+    await db.query("DELETE FROM kvstore WHERE id=$1", [`${uuid}_MSG`]);
     res.json({ status: "cleared" });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "db error" });
-  }
+  } catch (e) { res.status(500).json({ error: "db error" }); }
 });
+
+// ========================================================
+// ALERTAS ISOLADOS (APENAS WARNINGS)
+// ========================================================
+async function addPlayerAlert(uuid, msg) {
+  const keyId = `${uuid}_ALERTS`;
+  try {
+    const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [keyId]);
+    let alerts = [];
+    if (res.rowCount > 0 && res.rows[0].value) { try { alerts = JSON.parse(res.rows[0].value); } catch(e) {} }
+    alerts.push(msg);
+    if (alerts.length > 5) alerts = alerts.slice(-5);
+    await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, [keyId, JSON.stringify(alerts)]);
+  } catch (e) {}
+}
+
+app.get("/get-alerts", async (req, res) => {
+  const uuid = req.query.uuid;
+  if (!uuid) return res.status(400).json({ error: "missing uuid" });
+  try {
+    const q = await db.query("SELECT value FROM kvstore WHERE id=$1", [`${uuid}_ALERTS`]);
+    res.json({ alerts: (q.rowCount > 0 && q.rows[0].value) ? JSON.parse(q.rows[0].value) : [] });
+  } catch (e) { res.status(500).json({ error: "db error" }); }
+});
+
+app.post("/ack-alerts", async (req, res) => {
+  const { uuid } = req.body;
+  if (!uuid) return res.status(400).json({ error: "missing uuid" });
+  try {
+    await db.query("DELETE FROM kvstore WHERE id=$1", [`${uuid}_ALERTS`]);
+    res.json({ status: "cleared" });
+  } catch (e) { res.status(500).json({ error: "db error" }); }
+});
+// ========================================================
 
 async function getPlayerData(uuid) {
   if (!uuid) return null;
   const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [`player_${uuid}`]);
   let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0 };
-  
   if (res.rowCount > 0) {
     try { 
       let parsedData = JSON.parse(res.rows[0].value);
       data = { ...data, ...parsedData }; 
-      
       data.M = parseInt(data.M, 10) || 0;
       data.P = parseInt(data.P, 10) || 0;
       data.P_W = parseInt(data.P_W, 10) || 0;
@@ -271,23 +238,15 @@ async function getPlayerData(uuid) {
       data.B_M = parseFloat(data.B_M) || 1.0;
       data.B_T = parseInt(data.B_T, 10) || 0;
       data.PARCEL_TIME = parseInt(data.PARCEL_TIME, 10) || 0;
-    } catch(e) {
-      console.error(`Error parsing player data for ${uuid}:`, e);
-    }
+    } catch(e) {}
   }
   return data;
 }
 
 async function savePlayerData(uuid, data) {
-  await db.query(
-    `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`,
-    [`player_${uuid}`, JSON.stringify(data)]
-  );
+  await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, [`player_${uuid}`, JSON.stringify(data)]);
 }
 
-// ========================================================
-// --- GERENCIADOR DE PARCELAS INTELIGENTE ---
-// ========================================================
 app.post('/admin/parcel', requireToken, async (req, res) => {
   const { action, serverId, uuid, pos, regionName, num, newPos } = req.body;
   if (!serverId) return res.status(400).json({ error: "serverId obrigatório" });
@@ -308,8 +267,7 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       for (let srv of servers) {
         let mData = await dbGet(srv) || "";
         let mList = mData ? mData.split("ç") : [];
-        let idx = mList.findIndex(item => item.startsWith(uuid + "#"));
-        if (idx !== -1) {
+        if (mList.findIndex(item => item.startsWith(uuid + "#")) !== -1) {
           targetServer = srv;
           found = true;
           break; 
@@ -329,12 +287,7 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       for (let srv of servers) {
         let mData = await dbGet(srv) || "";
         let mList = mData ? mData.split("ç") : [];
-        let n1 = await dbGet(`${srv}_NAMES_1`) || "";
-        let n2 = await dbGet(`${srv}_NAMES_2`) || "";
-        let n3 = await dbGet(`${srv}_NAMES_3`) || "";
-        let n4 = await dbGet(`${srv}_NAMES_4`) || "";
-        let n5 = await dbGet(`${srv}_NAMES_5`) || "";
-        let joined = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
+        let joined = [await dbGet(`${srv}_NAMES_1`), await dbGet(`${srv}_NAMES_2`), await dbGet(`${srv}_NAMES_3`), await dbGet(`${srv}_NAMES_4`), await dbGet(`${srv}_NAMES_5`)].filter(Boolean).join("ç");
         let nList = joined ? joined.split("ç") : [];
         while (nList.length < mList.length) nList.push("NULL");
 
@@ -348,12 +301,7 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
 
       let targetMainData = await dbGet(targetServer) || ""; 
       let targetMainList = targetMainData ? targetMainData.split("ç") : [];
-      let tN1 = await dbGet(`${targetServer}_NAMES_1`) || "";
-      let tN2 = await dbGet(`${targetServer}_NAMES_2`) || "";
-      let tN3 = await dbGet(`${targetServer}_NAMES_3`) || "";
-      let tN4 = await dbGet(`${targetServer}_NAMES_4`) || "";
-      let tN5 = await dbGet(`${targetServer}_NAMES_5`) || "";
-      let tJoined = [tN1, tN2, tN3, tN4, tN5].filter(Boolean).join("ç");
+      let tJoined = [await dbGet(`${targetServer}_NAMES_1`), await dbGet(`${targetServer}_NAMES_2`), await dbGet(`${targetServer}_NAMES_3`), await dbGet(`${targetServer}_NAMES_4`), await dbGet(`${targetServer}_NAMES_5`)].filter(Boolean).join("ç");
       let targetNamesList = tJoined ? tJoined.split("ç") : [];
       while (targetNamesList.length < targetMainList.length) targetNamesList.push("NULL");
 
@@ -364,27 +312,16 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
     else {
       let mainData = await dbGet(targetServer) || ""; 
       let mainList = mainData ? mainData.split("ç") : [];
-      let n1 = await dbGet(`${targetServer}_NAMES_1`) || "";
-      let n2 = await dbGet(`${targetServer}_NAMES_2`) || "";
-      let n3 = await dbGet(`${targetServer}_NAMES_3`) || "";
-      let n4 = await dbGet(`${targetServer}_NAMES_4`) || "";
-      let n5 = await dbGet(`${targetServer}_NAMES_5`) || "";
-      let joined = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
+      let joined = [await dbGet(`${targetServer}_NAMES_1`), await dbGet(`${targetServer}_NAMES_2`), await dbGet(`${targetServer}_NAMES_3`), await dbGet(`${targetServer}_NAMES_4`), await dbGet(`${targetServer}_NAMES_5`)].filter(Boolean).join("ç");
       let namesList = joined ? joined.split("ç") : [];
       while (namesList.length < mainList.length) namesList.push("NULL");
 
       if (action === "DEL_PARCEL") {
         const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
-        if (idx !== -1) {
-          mainList.splice(idx, 1);
-          namesList.splice(idx, 1);
-        }
+        if (idx !== -1) { mainList.splice(idx, 1); namesList.splice(idx, 1); }
       } 
       else if (action === "DEL_NUM") {
-        if (num >= 0 && num < mainList.length) {
-          mainList.splice(num, 1);
-          namesList.splice(num, 1);
-        }
+        if (num >= 0 && num < mainList.length) { mainList.splice(num, 1); namesList.splice(num, 1); }
       } 
       else if (action === "REORDER") {
         const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
@@ -398,58 +335,36 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       }
       else if (action === "UPDATE_REGION") {
         const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
-        if (idx !== -1) {
-          namesList[idx] = formatRegion(regionName);
-        }
+        if (idx !== -1) namesList[idx] = formatRegion(regionName);
         namesList = namesList.map(name => formatRegion(name));
       }
       await saveServerChunks(targetServer, mainList, namesList);
     }
-    res.status(200).json({ success: true, message: `Ação ${action} processada no servidor: ${targetServer}.` });
-  } catch (error) {
-    console.error("Erro no processamento de parcelas:", error);
-    res.status(500).json({ error: "Erro interno no servidor de parcelas" });
-  }
+    res.status(200).json({ success: true, message: `Ação ${action} processada.` });
+  } catch (error) { res.status(500).json({ error: "Erro interno no servidor" }); }
 });
 
-// ========================================================
-// --- AUTO-SINCER (WEBSCRAPING PELA URL DO TELEPORTE) ---
-// ========================================================
 app.post('/admin/sync-regions', requireToken, async (req, res) => {
-  res.json({ status: "success", message: "Sincronização iniciada em segundo plano. Isso pode levar alguns minutos." });
+  res.json({ status: "success", message: "Sincronização iniciada." });
   (async () => {
     try {
-      console.log("[SYNC] Iniciando varredura automatizada das parcelas via Second Life Web...");
       let serversData = await dbGet("SERVERS");
       let servers = serversData ? serversData.split("ç").filter(Boolean) : [];
-
       for (let srv of servers) {
         let mainData = await dbGet(srv) || "";
         let mainList = mainData ? mainData.split("ç").filter(Boolean) : [];
         if (mainList.length === 0) continue;
 
-        let n1 = await dbGet(`${srv}_NAMES_1`) || "";
-        let n2 = await dbGet(`${srv}_NAMES_2`) || "";
-        let n3 = await dbGet(`${srv}_NAMES_3`) || "";
-        let n4 = await dbGet(`${srv}_NAMES_4`) || "";
-        let n5 = await dbGet(`${srv}_NAMES_5`) || "";
-        
-        let originalNames = [n1, n2, n3, n4, n5].filter(Boolean).join("ç");
+        let originalNames = [await dbGet(`${srv}_NAMES_1`), await dbGet(`${srv}_NAMES_2`), await dbGet(`${srv}_NAMES_3`), await dbGet(`${srv}_NAMES_4`), await dbGet(`${srv}_NAMES_5`)].filter(Boolean).join("ç");
         let namesList = originalNames ? originalNames.split("ç") : [];
         while (namesList.length < mainList.length) namesList.push("NULL");
 
         let updatedCount = 0;
-
         for (let i = 0; i < mainList.length; i++) {
           let uuid = mainList[i].split("#")[0];
           if (uuid && uuid.length === 36) {
             try {
-              const fetchOptions = {
-                headers: {
-                  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                  "Accept": "text/html,application/xhtml+xml,application/xml"
-                }
-              };
+              const fetchOptions = { headers: { "User-Agent": "Mozilla/5.0", "Accept": "text/html,application/xml" } };
               let slRes = await fetch(`https://world.secondlife.com/parcel/${uuid}`, fetchOptions);
               if (!slRes.ok) slRes = await fetch(`https://world.secondlife.com/place/${uuid}`, fetchOptions);
 
@@ -457,10 +372,8 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
                 const html = await slRes.text();
                 let extractedRegion = "";
                 const mapMatch = html.match(/maps\.secondlife\.com\/secondlife\/([^\/"]+)/i);
-                
-                if (mapMatch && mapMatch[1]) {
-                  extractedRegion = decodeURIComponent(mapMatch[1]).replace(/\+/g, ' ').trim();
-                } else {
+                if (mapMatch && mapMatch[1]) { extractedRegion = decodeURIComponent(mapMatch[1]).replace(/\+/g, ' ').trim(); } 
+                else {
                   const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
                   if (titleMatch && titleMatch[1]) {
                     let title = titleMatch[1].replace(/\n/g, ' ').replace(/\r/g, '').replace(/\s+/g, ' ').trim();
@@ -471,39 +384,26 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
                     extractedRegion = title;
                   }
                 }
-
                 if (extractedRegion) {
                   if (extractedRegion.toLowerCase() === "royie" || extractedRegion.toLowerCase() === "royier") extractedRegion = "Royier";
                   extractedRegion = extractedRegion.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
-                  if (namesList[i] !== extractedRegion && extractedRegion.length > 0 && extractedRegion !== "Second Life") {
-                    console.log(`[SYNC] Corrigindo banco: de "${namesList[i]}" para -> "${extractedRegion}"`);
+                  if (namesList[i] !== extractedRegion && extractedRegion !== "Second Life") {
                     namesList[i] = extractedRegion;
                     updatedCount++;
                   }
                 }
               }
-            } catch (fetchErr) {
-              console.error(`[SYNC] Erro HTTP ao processar UUID ${uuid}: ${fetchErr.message}`);
-            }
+            } catch (err) {}
             await new Promise(resolve => setTimeout(resolve, 800));
           }
         }
         let newNames = namesList.join("ç");
-        if (newNames !== originalNames) {
-          await saveServerChunks(srv, mainList, namesList);
-          console.log(`[SYNC] Continente ${srv} atualizado no BD! (Registros corrigidos: ${updatedCount})`);
-        }
+        if (newNames !== originalNames) await saveServerChunks(srv, mainList, namesList);
       }
-      console.log("[SYNC] Varredura GLOBAL finalizada com sucesso!");
-    } catch (err) {
-      console.error("[SYNC] Erro fatal durante a varredura:", err);
-    }
+    } catch (err) {}
   })();
 });
 
-// ========================================================
-// --- DEMANDA ISOLADA POR PARCELA (TABELA INDIVIDUAL) ---
-// ========================================================
 async function processParcelDemand(parcelUuid, user) {
   if (!parcelUuid || parcelUuid.length !== 36) return 1.0;
   const key = `PARCEL_${parcelUuid}`;
@@ -511,18 +411,13 @@ async function processParcelDemand(parcelUuid, user) {
       let dataStr = await dbGet(key);
       let parcel = dataStr ? JSON.parse(dataStr) : { mult: 1.0, history: [], last_delivery: 0, user_history: {} };
       if (!parcel.user_history) parcel.user_history = {};
-
       let now = getUnixTime();
 
-      // Limpa histórico de entregas mais velho que 3 horas (10800s)
       parcel.history = parcel.history.filter(ts => (now - ts) <= 10800);
-
-      // Proteção anti-duplo clique (15 segundos para o mesmo usuário na mesma parcela)
       let lastUserTime = parcel.user_history[user] || 0;
       let alreadyCountedRecently = (now - lastUserTime) < 15;
 
       if (!alreadyCountedRecently) {
-         // Recuperação de Demanda (+0.2 por cada hora sem entregas)
          if (parcel.last_delivery > 0 && parcel.mult < 1.0) {
             let timeOffline = now - parcel.last_delivery;
             if (timeOffline >= 3600) {
@@ -530,29 +425,17 @@ async function processParcelDemand(parcelUuid, user) {
                parcel.mult = Math.min(1.0, parcel.mult + (hoursRecovered * 0.2));
             }
          }
-
          parcel.history.push(now);
          parcel.last_delivery = now;
          parcel.user_history[user] = now;
-
-         // Queda se houver 3 ou mais entregas nas últimas 3 horas
-         if (parcel.history.length >= 3) {
-            parcel.mult = Math.max(0.1, parcel.mult - 0.1);
-         }
-
+         if (parcel.history.length >= 3) { parcel.mult = Math.max(0.1, parcel.mult - 0.1); }
          parcel.mult = Math.round(parcel.mult * 10) / 10;
-
          await dbSet(key, JSON.stringify(parcel));
       }
-
       return parcel.mult;
-  } catch (err) {
-      console.error("Erro no processParcelDemand:", err);
-      return 1.0;
-  }
+  } catch (err) { return 1.0; }
 }
 
-// NOVA FUNÇÃO: Apenas LÊ a demanda sem registrar ou alterar a memória de entregas.
 async function getParcelDemandOnly(parcelUuid) {
   if (!parcelUuid || parcelUuid.length !== 36) return 1.0;
   const key = `PARCEL_${parcelUuid}`;
@@ -560,11 +443,8 @@ async function getParcelDemandOnly(parcelUuid) {
       let dataStr = await dbGet(key);
       if (!dataStr) return 1.0;
       let parcel = JSON.parse(dataStr);
-      
       let now = getUnixTime();
       let mult = parcel.mult;
-
-      // Se a parcela estiver em recuperação de demanda (+0.2 por hora offline)
       if (parcel.last_delivery > 0 && mult < 1.0) {
          let timeOffline = now - parcel.last_delivery;
          if (timeOffline >= 3600) {
@@ -573,33 +453,20 @@ async function getParcelDemandOnly(parcelUuid) {
          }
       }
       return Math.round(mult * 10) / 10;
-  } catch (err) {
-      console.error("Erro no getParcelDemandOnly:", err);
-      return 1.0;
-  }
+  } catch (err) { return 1.0; }
 }
-// ========================================================
 
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime, action } = req.body;
   let safeTopic = (topic || action || "").toLowerCase().trim();
 
-  // ========================================================
-  // 1. DEBOUNCE ANTI-GLITCH
-  // ========================================================
   const txHash = `${user}_${safeTopic}_${content}`;
-  if (globalDebounce.has(txHash)) {
-      return res.json({ status: "ignored" });
-  }
+  if (globalDebounce.has(txHash)) return res.json({ status: "ignored" });
   globalDebounce.add(txHash);
   setTimeout(() => globalDebounce.delete(txHash), 2500);
-  // ========================================================
 
   let responsePayload = { status: "success" };
 
-  // ========================================================
-  // 2. LOCK POR USUÁRIO
-  // ========================================================
   await withLock(user, async () => {
     try {
       let player = await getPlayerData(user);
@@ -610,22 +477,15 @@ app.post("/action", requireToken, async (req, res) => {
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
 
         let demandMult = 1.0;
-
-        // Pega a UUID da parcela associada a ESTE EXATO jogador pelo log recente (< 120 segundos)
         let targetParcel = null;
-        if (player.ACTIVE_PARCEL && (now - player.PARCEL_TIME) < 120) {
-            targetParcel = player.ACTIVE_PARCEL;
-        }
-
+        if (player.ACTIVE_PARCEL && (now - player.PARCEL_TIME) < 120) { targetParcel = player.ACTIVE_PARCEL; }
         if (targetParcel && targetParcel.length === 36 && targetParcel !== "00000000-0000-0000-0000-000000000000") {
             demandMult = await processParcelDemand(targetParcel, user);
         }
 
-        // Limpa a memória temporária do player após o uso
         player.ACTIVE_PARCEL = "";
         player.PARCEL_TIME = 0;
 
-        // APLICA O DESCONTO DE DEMANDA EM TUDO, EXCETO NO PLANO "EVENT"
         if (demandMult < 1.0 && plan !== "EVENT") {
             price = Math.round(price * demandMult);
             let lostPercent = Math.round((1.0 - demandMult) * 100);
@@ -636,45 +496,29 @@ app.post("/action", requireToken, async (req, res) => {
         let boost_m = 1.0;
         let currentWeek = getCurrentWeek();
 
-        if (player.P_W !== currentWeek) {
-          player.P = 0;
-          player.P_W = currentWeek;
-        }
+        if (player.P_W !== currentWeek) { player.P = 0; player.P_W = currentWeek; }
 
         if (player.B_T > now) {
           boost_m = parseFloat(player.B_M) || 1.0;
           if (boost_m > 1.0) price = Math.round(price * boost_m);
-        } else if (player.B_T > 0) {
-          player.B_M = 1.0;
-          player.B_T = 0;
-        }
+        } else if (player.B_T > 0) { player.B_M = 1.0; player.B_T = 0; }
 
         if (plan !== "FREE" && plan !== "EVENT" && plan !== "TEST_CARGO") {
           if (boost_m > 1.0) await addPlayerMessage(user, `Cargo value boosted by ${boost_m}X!`);
           await addPlayerMessage(user, `You won ${price} F₵.`);
 
           player.P += Math.round(price * 0.1);
-          if (player.AT !== "A") {
-            player.AT = "A";
-            responsePayload.newBuyer = true;
-          }
+          if (player.AT !== "A") { player.AT = "A"; responsePayload.newBuyer = true; }
 
           try {
             const buyersRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["GFN_BUYERS"]);
             let buyersList = [];
-            if (buyersRes.rowCount > 0 && buyersRes.rows[0].value) {
-              buyersList = buyersRes.rows[0].value.split(",").filter(Boolean);
-            }
+            if (buyersRes.rowCount > 0 && buyersRes.rows[0].value) buyersList = buyersRes.rows[0].value.split(",").filter(Boolean);
             if (!buyersList.includes(user)) {
               buyersList.push(user);
-              await db.query(
-                `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`,
-                ["GFN_BUYERS", buyersList.join(",")]
-              );
+              await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, ["GFN_BUYERS", buyersList.join(",")]);
             }
-          } catch (e) {
-            console.error("Error updating GFN_BUYERS:", e);
-          }
+          } catch (e) {}
 
           let premiumBonus = 0;
           if (plan === "PREMIUM") {
@@ -682,7 +526,6 @@ app.post("/action", requireToken, async (req, res) => {
             premiumBonus = Math.floor(price * 0.2); 
             await addPlayerMessage(user, "You won 20% more for being premium.");
           }
-
           player.M += (price + premiumBonus);
           recebido = price + premiumBonus;
           await addPlayerMessage(user, `You have now ${player.M} F₵.`);
@@ -695,13 +538,10 @@ app.post("/action", requireToken, async (req, res) => {
             if (player.TC_V + price >= MAX_TC) {
               let resto = MAX_TC - player.TC_V;
               player.TC_V = MAX_TC;
-              player.M += resto;
-              recebido = resto;
+              player.M += resto; recebido = resto;
               await addPlayerMessage(user, `You won ${resto} F₵.`);
             } else {
-              player.TC_V += price;
-              player.M += price;
-              recebido = price;
+              player.TC_V += price; player.M += price; recebido = price;
               await addPlayerMessage(user, `You won ${price} F₵.`);
             }
           }
@@ -716,13 +556,10 @@ app.post("/action", requireToken, async (req, res) => {
             if (player.EV_V + price >= MAX_EV) {
               let resto = MAX_EV - player.EV_V;
               player.EV_V = MAX_EV;
-              player.M += resto;
-              recebido = resto;
+              player.M += resto; recebido = resto;
               await addPlayerMessage(user, `You won ${resto} F₵.`);
             } else {
-              player.EV_V += price;
-              player.M += price;
-              recebido = price;
+              player.EV_V += price; player.M += price; recebido = price;
               await addPlayerMessage(user, `You won ${price} F₵.`);
             }
           }
@@ -736,19 +573,15 @@ app.post("/action", requireToken, async (req, res) => {
             if (player.RE + price >= MAX_F) {
               let resto = MAX_F - player.RE;
               player.RE = MAX_F;
-              player.M += resto;
-              recebido = resto;
+              player.M += resto; recebido = resto;
               await addPlayerMessage(user, `You won ${resto} F₵.`);
             } else {
-              player.RE += price;
-              player.M += price;
-              recebido = price;
+              player.RE += price; player.M += price; recebido = price;
               await addPlayerMessage(user, `You won ${price} F₵.`);
             }
           }
           await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         }
-
         await savePlayerData(user, player);
         responsePayload.recebido = recebido;
       } 
@@ -760,8 +593,7 @@ app.post("/action", requireToken, async (req, res) => {
         let current_time = player.B_T;
         if (current_time < now) current_time = now;
         current_time += add_time;
-        player.B_M = add_mult;
-        player.B_T = current_time;
+        player.B_M = add_mult; player.B_T = current_time;
         await savePlayerData(user, player);
       } 
       else if (safeTopic === "check") {
@@ -789,83 +621,48 @@ app.post("/action", requireToken, async (req, res) => {
       }
       else if (safeTopic === "pay") {
         let amountVal = parseInt(content) || 0;
-        if (amountVal <= 0) {
-          await addPlayerMessage(user, "Transaction failed. Invalid amount.");
-          return res.json({ status: "denied" });
-        }
+        if (amountVal <= 0) return res.json({ status: "denied" });
         if (amountVal > MAX_TRANSACTION) amountVal = MAX_TRANSACTION;
-        
         let sender = await getPlayerData(user);
-        if (sender.M < amountVal) {
-          await addPlayerMessage(user, `Transaction failed. You don't have enough F₵. Current balance: ${sender.M} F₵`);
-          return res.json({ status: "denied" });
-        }
-        if (user === target) {
-          await addPlayerMessage(user, "Transaction failed. You cannot pay yourself.");
-          return res.json({ status: "denied" });
-        }
+        if (sender.M < amountVal) return res.json({ status: "denied" });
+        if (user === target) return res.json({ status: "denied" });
 
         let tPlayer = await getPlayerData(target);
-        sender.M -= amountVal;
-        tPlayer.M += amountVal;
-        
-        await savePlayerData(user, sender);
-        await savePlayerData(target, tPlayer);
-
-        let senderProfile = `secondlife:///app/agent/${user}/about`;
-        let targetProfile = `secondlife:///app/agent/${target}/about`;
-
-        await addPlayerMessage(user, `You successfully paid ${amountVal} F₵ to ${targetProfile}. Your new balance: ${sender.M} F₵`);
-        await addPlayerMessage(target, `You received ${amountVal} F₵ from ${senderProfile}. Your new balance: ${tPlayer.M} F₵`);
+        sender.M -= amountVal; tPlayer.M += amountVal;
+        await savePlayerData(user, sender); await savePlayerData(target, tPlayer);
+        await addPlayerMessage(user, `You successfully paid ${amountVal} F₵ to secondlife:///app/agent/${target}/about. Your new balance: ${sender.M} F₵`);
+        await addPlayerMessage(target, `You received ${amountVal} F₵ from secondlife:///app/agent/${user}/about. Your new balance: ${tPlayer.M} F₵`);
       }
       else if (safeTopic === "mass_money_reset_custom") {
         const maxValue = parseInt(content) || 0;
-        const alertMessage = plan;
         const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
-        let affected = 0;
         for (let row of q.rows) {
           try {
             let pData = JSON.parse(row.value);
             if (pData.M > maxValue) {
                 pData.M = maxValue;
                 await db.query("UPDATE kvstore SET value = $1 WHERE id = $2", [JSON.stringify(pData), row.id]);
-                let playerUuid = row.id.replace("player_", "");
-                await addPlayerMessage(playerUuid, alertMessage);
-                affected++;
+                await addPlayerMessage(row.id.replace("player_", ""), plan);
             }
-          } catch(e) {
-            console.error("Erro ao analisar dados do jogador no RESET:", e);
-          }
+          } catch(e) {}
         }
-        await addPlayerMessage(user, `VARREDURA CONCLUÍDA! ${affected} contas foram limitadas a ${maxValue} F₵ e notificadas.`);
+        await addPlayerMessage(user, `VARREDURA CONCLUÍDA! Contas limitadas a ${maxValue} F₵.`);
         responsePayload.status = "success";
       }
       else if (safeTopic === "buy") {
         let price = parseInt(content) || 0;
-        if (price > MAX_TRANSACTION) {
-          responsePayload.status = "denied";
-          await addPlayerMessage(user, `Purchase blocked! You cannot spend more than ${MAX_TRANSACTION} F₵ in a single transaction.`);
-          return res.json(responsePayload);
-        }
+        if (price > MAX_TRANSACTION) { responsePayload.status = "denied"; return res.json(responsePayload); }
         let buyer = await getPlayerData(user);
-        let ownerUuid = target;
-        if (buyer.M < price) {
-          await addPlayerMessage(user, `You don't have enough F₵. Required: ${price}, You have: ${buyer.M}`);
-          responsePayload.status = "denied";
-        } else {
-          if (ownerUuid === user) {
-            await addPlayerMessage(user, `You bought your own product (${plan}). Your balance remains ${buyer.M} F₵.`);
-            responsePayload.status = "success";
-          } 
+        if (buyer.M < price) { responsePayload.status = "denied"; } 
+        else {
+          if (target === user) { responsePayload.status = "success"; } 
           else {
-            buyer.M -= price;
-            await savePlayerData(user, buyer);
+            buyer.M -= price; await savePlayerData(user, buyer);
             await addPlayerMessage(user, `You successfully bought ${plan} for ${price} F₵. Balance: ${buyer.M} F₵`);
-            if (ownerUuid) {
-              let ownerData = await getPlayerData(ownerUuid);
-              ownerData.M += price;
-              await savePlayerData(ownerUuid, ownerData);
-              await addPlayerMessage(ownerUuid, `Your vending machine sold ${plan} for ${price} F₵. Balance: ${ownerData.M} F₵`);
+            if (target) {
+              let ownerData = await getPlayerData(target);
+              ownerData.M += price; await savePlayerData(target, ownerData);
+              await addPlayerMessage(target, `Your vending machine sold ${plan} for ${price} F₵. Balance: ${ownerData.M} F₵`);
             }
             responsePayload.status = "success";
           }
@@ -873,54 +670,33 @@ app.post("/action", requireToken, async (req, res) => {
       }
       else if (safeTopic === "refillpay") {
         let cost = parseInt(content) || 0;
-        if (cost > MAX_TRANSACTION) {
-          responsePayload.status = "denied";
-          await addPlayerMessage(user, `Refill blocked! Cost exceeds the single transaction limit of ${MAX_TRANSACTION} F₵.`);
-          return res.json(responsePayload);
-        }
+        if (cost > MAX_TRANSACTION) { responsePayload.status = "denied"; return res.json(responsePayload); }
         let owner = await getPlayerData(user);
-        if (owner.M < cost) {
-          await addPlayerMessage(user, `You don't have enough F₵ to refill. Required: ${cost}, You have: ${owner.M}`);
-          responsePayload.status = "denied";
-        } else {
-          owner.M -= cost;
-          await savePlayerData(user, owner);
+        if (owner.M < cost) { responsePayload.status = "denied"; } 
+        else {
+          owner.M -= cost; await savePlayerData(user, owner);
           await addPlayerMessage(user, `Refill paid: ${cost} F₵. Balance: ${owner.M} F₵`);
           responsePayload.status = "ok";
         }
       }
-
       res.json(responsePayload);
-
-    } catch (err) {
-      console.error(err);
-      res.status(500).json({ error: "Internal calculation error" });
-    }
+    } catch (err) { res.status(500).json({ error: "Internal calculation error" }); }
   });
-  // FIM DO BLOCO DE LOCK
 });
 
 app.get("/get-rank", async (req, res) => {
   try {
     const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
-    let players = [];
-    let currentWeek = getCurrentWeek();
+    let players = []; let currentWeek = getCurrentWeek();
     for (let row of q.rows) {
       try {
         let data = JSON.parse(row.value);
-        if (data.P_W === currentWeek && data.P && data.P > 0) {
-          let uuid = row.id.replace("player_", "");
-          players.push({ uuid, points: data.P });
-        }
+        if (data.P_W === currentWeek && data.P && data.P > 0) players.push({ uuid: row.id.replace("player_", ""), points: data.P });
       } catch(e) {}
     }
     players.sort((a, b) => b.points - a.points);
-    let top5 = players.slice(0, 5);
-    res.json({ status: "success", top: top5 });
-  } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "db error" });
-  }
+    res.json({ status: "success", top: players.slice(0, 5) });
+  } catch (e) { res.status(500).json({ error: "db error" }); }
 });
 
 app.get("/get", async (req, res) => {
@@ -928,30 +704,21 @@ app.get("/get", async (req, res) => {
   if (!id) return res.status(400).json({ error: "missing id" });
   try {
     const q = await db.query("SELECT value FROM kvstore WHERE id=$1", [id]);
-    const value = q.rowCount === 0 ? null : q.rows[0].value;
-    res.json({ id, value });
-  } catch (e) {
-    res.status(500).json({ error: "db error" });
-  }
+    res.json({ id, value: q.rowCount === 0 ? null : q.rows[0].value });
+  } catch (e) { res.status(500).json({ error: "db error" }); }
 });
 
 app.post("/set", requireToken, async (req, res) => {
   const { id, value } = req.body;
   if (!id) return res.status(400).json({ error: "missing id" });
   try {
-    await db.query(
-      `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`,
-      [id, value]
-    );
-    if (id === "GLOBAL_SETTINGS") {
-        await loadGlobalSettings();
-    }
+    await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, [id, value]);
+    if (id === "GLOBAL_SETTINGS") await loadGlobalSettings();
 
     // ========================================================
-    // --- INTERCEPTAÇÃO SEGURA VINCULADA AO AGENT (PLAYER) ---
+    // INTERCEPTAÇÃO SEGURA: ALERTA VAI PARA addPlayerAlert()
     // ========================================================
     if (id === "gfn_admin_logs" && value) {
-        // Extrai a UUID do Agente e da Parcela, independentemente se for carregamento ou entrega.
         let agentMatch = value.match(/\/app\/agent\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
         let parcelMatch = value.match(/\/app\/parcel\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
         
@@ -959,20 +726,18 @@ app.post("/set", requireToken, async (req, res) => {
             let playerUuid = agentMatch[1];
             let parcelUuid = parcelMatch[1];
             
-            // 1. CARGA ENTREGUE
             if (value.includes("Action: Cargo Delivered")) {
                 let pData = await getPlayerData(playerUuid);
                 pData.ACTIVE_PARCEL = parcelUuid;
                 pData.PARCEL_TIME = getUnixTime();
                 await savePlayerData(playerUuid, pData);
             } 
-            // 2. CARGA INICIADA (Apenas aviso na HUD)
             else if (value.toLowerCase().includes("cargo loaded") || value.includes("Action: Cargo Loaded")) {
                 let currentDemand = await getParcelDemandOnly(parcelUuid);
                 if (currentDemand < 1.0) {
                     let lostPercent = Math.round((1.0 - currentDemand) * 100);
-                    // Dispara a mensagem de aviso diretamente para a HUD do jogador
-                    await addPlayerMessage(playerUuid, `⚠️ [WARNING] The destination parcel has a low demand! Current demand multiplier is ${currentDemand}x (-${lostPercent}% payout).`);
+                    // AQUI ESTÁ A MÁGICA: Manda SÓ para a fila de alertas (não vai para a HUD)
+                    await addPlayerAlert(playerUuid, `⚠️ [WARNING] The destination parcel has a low demand! Current demand multiplier is ${currentDemand}x (-${lostPercent}% payout).`);
                 }
             }
         }
@@ -980,13 +745,8 @@ app.post("/set", requireToken, async (req, res) => {
     // ========================================================
 
     res.json({ status: "ok", id, value });
-  } catch (e) {
-    res.status(500).json({ error: "db error" });
-  }
+  } catch (e) { res.status(500).json({ error: "db error" }); }
 });
 
 app.get("/", (req, res) => res.json({ status: "ok" }));
-
-app.listen(PORT, () => {
-  console.log("API running on port", PORT);
-});
+app.listen(PORT, () => console.log("API running on port", PORT));
