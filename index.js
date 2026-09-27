@@ -551,6 +551,33 @@ async function processParcelDemand(parcelUuid, user) {
       return 1.0;
   }
 }
+
+// NOVA FUNÇÃO: Apenas LÊ a demanda sem registrar ou alterar a memória de entregas.
+async function getParcelDemandOnly(parcelUuid) {
+  if (!parcelUuid || parcelUuid.length !== 36) return 1.0;
+  const key = `PARCEL_${parcelUuid}`;
+  try {
+      let dataStr = await dbGet(key);
+      if (!dataStr) return 1.0;
+      let parcel = JSON.parse(dataStr);
+      
+      let now = getUnixTime();
+      let mult = parcel.mult;
+
+      // Se a parcela estiver em recuperação de demanda (+0.2 por hora offline)
+      if (parcel.last_delivery > 0 && mult < 1.0) {
+         let timeOffline = now - parcel.last_delivery;
+         if (timeOffline >= 3600) {
+            let hoursRecovered = Math.floor(timeOffline / 3600);
+            mult = Math.min(1.0, mult + (hoursRecovered * 0.2));
+         }
+      }
+      return Math.round(mult * 10) / 10;
+  } catch (err) {
+      console.error("Erro no getParcelDemandOnly:", err);
+      return 1.0;
+  }
+}
 // ========================================================
 
 app.post("/action", requireToken, async (req, res) => {
@@ -923,16 +950,31 @@ app.post("/set", requireToken, async (req, res) => {
     // ========================================================
     // --- INTERCEPTAÇÃO SEGURA VINCULADA AO AGENT (PLAYER) ---
     // ========================================================
-    if (id === "gfn_admin_logs" && value && value.includes("Action: Cargo Delivered")) {
+    if (id === "gfn_admin_logs" && value) {
+        // Extrai a UUID do Agente e da Parcela, independentemente se for carregamento ou entrega.
         let agentMatch = value.match(/\/app\/agent\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
         let parcelMatch = value.match(/\/app\/parcel\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+        
         if (agentMatch && parcelMatch) {
             let playerUuid = agentMatch[1];
             let parcelUuid = parcelMatch[1];
-            let pData = await getPlayerData(playerUuid);
-            pData.ACTIVE_PARCEL = parcelUuid;
-            pData.PARCEL_TIME = getUnixTime();
-            await savePlayerData(playerUuid, pData);
+            
+            // 1. CARGA ENTREGUE
+            if (value.includes("Action: Cargo Delivered")) {
+                let pData = await getPlayerData(playerUuid);
+                pData.ACTIVE_PARCEL = parcelUuid;
+                pData.PARCEL_TIME = getUnixTime();
+                await savePlayerData(playerUuid, pData);
+            } 
+            // 2. CARGA INICIADA (Apenas aviso na HUD)
+            else if (value.toLowerCase().includes("cargo loaded") || value.includes("Action: Cargo Loaded")) {
+                let currentDemand = await getParcelDemandOnly(parcelUuid);
+                if (currentDemand < 1.0) {
+                    let lostPercent = Math.round((1.0 - currentDemand) * 100);
+                    // Dispara a mensagem de aviso diretamente para a HUD do jogador
+                    await addPlayerMessage(playerUuid, `⚠️ [WARNING] The destination parcel has a low demand! Current demand multiplier is ${currentDemand}x (-${lostPercent}% payout).`);
+                }
+            }
         }
     }
     // ========================================================
