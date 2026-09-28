@@ -504,6 +504,7 @@ async function isHubImmune(parcelUuid) {
   return false; 
 }
 
+// RESTAURADO PARA O CÁLCULO CONTÍNUO ORIGINAL (REMOVIDO OS TICKS)
 async function processParcelDemand(parcelUuid, user) {
   if (!parcelUuid || parcelUuid.length < 36) return 1.0;
   
@@ -539,17 +540,18 @@ async function processParcelDemand(parcelUuid, user) {
          }
          
          parcel.history.push(now);
-         parcel.last_delivery = now;
+         parcel.last_delivery = now; 
          parcel.user_history[user] = now;
          
          parcel.mult = Math.max(0.1, parcel.mult - 0.1);
-         parcel.mult = Math.round(parcel.mult * 10) / 10;
+         parcel.mult = Math.round(parcel.mult * 10) / 10; 
          await dbSet(key, JSON.stringify(parcel));
       }
       return parcel.mult;
   } catch (err) { return 1.0; }
 }
 
+// RESTAURADO PARA O CÁLCULO CONTÍNUO ORIGINAL (REMOVIDO OS TICKS)
 async function getParcelDemandOnly(parcelUuid) {
   if (!parcelUuid || parcelUuid.length < 36) return { mult: 1.0, last_delivery: 0 };
   
@@ -602,7 +604,23 @@ app.post("/action", requireToken, async (req, res) => {
 
         let demandMult = 1.0;
         let targetParcel = null;
-        if (player.ACTIVE_PARCEL && (now - player.PARCEL_TIME) < 120) { targetParcel = player.ACTIVE_PARCEL; }
+
+        // ========================================================
+        // RETRY LOOP: Protege vendas extremamente rápidas (Mentira Race Condition)
+        // Como o botão no HUD pode ser clicado antes do log do LSL chegar ao servidor,
+        // aguardamos e tentamos até 3 vezes (3 segundos) antes de desistir.
+        // ========================================================
+        for (let i = 0; i < 4; i++) {
+            if (player.ACTIVE_PARCEL && (now - player.PARCEL_TIME) < 1800) { 
+                targetParcel = player.ACTIVE_PARCEL.toLowerCase(); 
+                break;
+            }
+            if (i < 3) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                player = await getPlayerData(user); // Busca o player no DB denovo
+            }
+        }
+
         if (targetParcel && targetParcel.length >= 36) {
             demandMult = await processParcelDemand(targetParcel, user);
         }
@@ -926,8 +944,8 @@ app.post("/set", requireToken, async (req, res) => {
         let parcelMatch = lastLog.match(/\/app\/parcel\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
         
         if (agentMatch && parcelMatch) {
-            let playerUuid = agentMatch[1];
-            let parcelUuid = parcelMatch[1];
+            let playerUuid = agentMatch[1].toLowerCase();
+            let parcelUuid = parcelMatch[1].toLowerCase(); 
             
             if (lastLog.includes("Action: Cargo Delivered")) {
                 let pData = await getPlayerData(playerUuid);
@@ -948,9 +966,9 @@ app.post("/set", requireToken, async (req, res) => {
             } 
             else if (lastLog.toLowerCase().includes("cargo loaded") || lastLog.includes("Action: Cargo Loaded")) {
                 let currentDemand = await getParcelDemandOnly(parcelUuid);
-                if (currentDemand < 1.0) {
-                    let lostPercent = Math.round((1.0 - currentDemand) * 100);
-                    let warningLog = `[${getUnixTime()}] secondlife:///app/agent/${playerUuid}/inspect | ⚠️ [DEMAND WARNING] Destination has low demand: ${currentDemand}x (-${lostPercent}% payout).`;
+                if (currentDemand.mult < 1.0) {
+                    let lostPercent = Math.round((1.0 - currentDemand.mult) * 100);
+                    let warningLog = `[${getUnixTime()}] secondlife:///app/agent/${playerUuid}/inspect | ⚠️ [DEMAND WARNING] Destination has low demand: ${currentDemand.mult}x (-${lostPercent}% payout).`;
                     value = value + "|#|" + warningLog; 
                 }
             }
