@@ -517,17 +517,17 @@ async function processParcelDemand(parcelUuid, user) {
 }
 
 async function getParcelDemandOnly(parcelUuid) {
-  if (!parcelUuid || parcelUuid.length < 36) return 1.0;
+  if (!parcelUuid || parcelUuid.length < 36) return { mult: 1.0, last_delivery: 0 };
   
   let cleanUuid = parcelUuid.toLowerCase().replace(/[^0-9a-f\-]/g, "");
-  if (cleanUuid.length !== 36) return 1.0;
+  if (cleanUuid.length !== 36) return { mult: 1.0, last_delivery: 0 };
   
-  if (await isHubImmune(cleanUuid)) return 1.0;
+  if (await isHubImmune(cleanUuid)) return { mult: 1.0, last_delivery: 0 };
   
   const key = `PARCEL_${cleanUuid}`;
   try {
       let dataStr = await dbGet(key);
-      if (!dataStr) return 1.0;
+      if (!dataStr) return { mult: 1.0, last_delivery: 0 };
       let parcel = JSON.parse(dataStr);
       let now = getUnixTime();
       let mult = parcel.mult;
@@ -538,8 +538,11 @@ async function getParcelDemandOnly(parcelUuid) {
          mult = Math.min(1.0, mult + recovered);
       }
       
-      return Math.round(mult * 10) / 10;
-  } catch (err) { return 1.0; }
+      return { 
+          mult: Math.round(mult * 10) / 10, 
+          last_delivery: parcel.last_delivery || 0 
+      };
+  } catch (err) { return { mult: 1.0, last_delivery: 0 }; }
 }
 // ========================================================
 
