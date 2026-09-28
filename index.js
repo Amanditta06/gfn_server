@@ -216,7 +216,7 @@ app.post("/ack-msg", async (req, res) => {
 async function getPlayerData(uuid) {
   if (!uuid) return null;
   const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [`player_${uuid}`]);
-  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0 };
+  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0, LAST_DIST: 0, AFFINITY: {} };
   if (res.rowCount > 0) {
     try { 
       let parsedData = JSON.parse(res.rows[0].value);
@@ -232,6 +232,8 @@ async function getPlayerData(uuid) {
       data.B_M = parseFloat(data.B_M) || 1.0;
       data.B_T = parseInt(data.B_T, 10) || 0;
       data.PARCEL_TIME = parseInt(data.PARCEL_TIME, 10) || 0;
+      data.LAST_DIST = parseFloat(data.LAST_DIST) || 0;
+      data.AFFINITY = parsedData.AFFINITY || {};
     } catch(e) {}
   }
   return data;
@@ -573,6 +575,8 @@ app.post("/action", requireToken, async (req, res) => {
             demandMult = await processParcelDemand(targetParcel, user);
         }
 
+        let savedParcelForAffinity = targetParcel; // Guarda para usar na afinidade antes de zerar
+
         player.ACTIVE_PARCEL = "";
         player.PARCEL_TIME = 0;
 
@@ -672,6 +676,42 @@ app.post("/action", requireToken, async (req, res) => {
           }
           await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         }
+
+        // ========================================================
+        // FEATURE: PROCESSAMENTO DE AFINIDADE COM O HUB
+        // ========================================================
+        if (savedParcelForAffinity && savedParcelForAffinity.length >= 36) {
+            if (!player.AFFINITY) player.AFFINITY = {};
+            let currentAffinity = parseFloat(player.AFFINITY[savedParcelForAffinity]) || 0.0;
+            let distance = player.LAST_DIST || 0;
+            let addedAffinity = 0;
+
+            // Só aumenta se a distância for maior que 1000m (1km)
+            if (distance > 1000) {
+                if (currentAffinity < 0.5) {
+                    addedAffinity = 0.01;
+                    currentAffinity = Math.min(0.5, currentAffinity + 0.01);
+                    currentAffinity = Math.round(currentAffinity * 100) / 100;
+                    player.AFFINITY[savedParcelForAffinity] = currentAffinity;
+
+                    await addPlayerMessage(user, `Sua afinidade com este HUB foi aumentada em +${addedAffinity}. Agora você tem ${currentAffinity} de afinidade total com este HUB.`);
+                }
+            }
+
+            // Pagamento extra por afinidade (valor da entrega * afinidade atual)
+            if (currentAffinity > 0 && price > 0) {
+                let affinityBonus = Math.round(price * currentAffinity);
+                if (affinityBonus > 0) {
+                    player.M += affinityBonus;
+                    recebido += affinityBonus;
+                    await addPlayerMessage(user, `Você recebeu um pagamento extra de ${affinityBonus} F₵ devido ao bônus de afinidade (${currentAffinity}x / ${(currentAffinity * 100).toFixed(0)}%) com este HUB.`);
+                    await addPlayerMessage(user, `You have now ${player.M} F₵.`);
+                }
+            }
+        }
+        player.LAST_DIST = 0; // Reseta a distância registrada
+        // ========================================================
+
         await savePlayerData(user, player);
         responsePayload.recebido = recebido;
       } 
@@ -845,6 +885,18 @@ app.post("/set", requireToken, async (req, res) => {
                 let pData = await getPlayerData(playerUuid);
                 pData.ACTIVE_PARCEL = parcelUuid;
                 pData.PARCEL_TIME = getUnixTime();
+                
+                // Extração da distância percorrida enviada no log de admin
+                let distMatch = lastLog.match(/(?:dist(?:ancia|ance)?[:\s]*)([\d,\.]+)\s*m?/i) || lastLog.match(/([\d,\.]+)\s*m\b/i);
+                let distance = 0;
+                if (distMatch) {
+                    distance = parseFloat(distMatch[1].replace(',', '.')) || 0;
+                } else {
+                    let numMatch = lastLog.match(/(\d+)\s*(?:m|metros)/i);
+                    if (numMatch) distance = parseFloat(numMatch[1]) || 0;
+                }
+                pData.LAST_DIST = distance;
+
                 await savePlayerData(playerUuid, pData);
             } 
             else if (lastLog.toLowerCase().includes("cargo loaded") || lastLog.includes("Action: Cargo Loaded")) {
