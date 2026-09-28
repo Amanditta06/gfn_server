@@ -103,7 +103,6 @@ async function processHallOfFame(rankString) {
     console.error("Erro ao processar Hall of Fame:", e);
   }
 }
-// ========================================================
 
 async function ensureTable() {
   if (!DATABASE_URL) return;
@@ -213,7 +212,6 @@ app.post("/ack-msg", async (req, res) => {
     res.json({ status: "cleared" });
   } catch (e) { res.status(500).json({ error: "db error" }); }
 });
-// ========================================================
 
 async function getPlayerData(uuid) {
   if (!uuid) return null;
@@ -400,60 +398,85 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
   })();
 });
 
+
 // ========================================================
-// LÓGICA DE DEMANDA E IMUNIDADE BLINDADA
+// IMUNIDADE BLINDADA (Força Bruta e Ignora Maiúsculas/Sujeiras)
 // ========================================================
 async function isHubImmune(parcelUuid) {
-  if (!parcelUuid || parcelUuid.length !== 36) return false;
-  
-  // TRANSFORMA O ALVO EM MINÚSCULO PARA NUNCA ERRAR O MATCH
-  let target = parcelUuid.toLowerCase(); 
-  
+  if (!parcelUuid) return false;
+  // Limpeza radical: destrói qualquer caractere invisível, acentos ou espaços
+  let target = parcelUuid.toLowerCase().replace(/[^0-9a-f\-]/g, ""); 
+  if (target.length !== 36) return false;
+
   try {
-    // 1. CHECA O MAINHUB (Buscando o nome exato do primeiro servidor dinamicamente)
-    let serversData = await dbGet("SERVERS");
-    if (serversData) {
-        let srvList = serversData.split("ç").filter(Boolean);
-        if (srvList.length > 0) {
-            let firstServerName = srvList[0];
-            let mainData = await dbGet(firstServerName);
-            if (mainData) {
-                let mainList = mainData.split("ç").filter(Boolean);
-                if (mainList.length > 0) {
-                    let mainUuid = mainList[0].split("#")[0].toLowerCase(); // Minúsculo
-                    if (target === mainUuid) return true;
-                }
-            }
-        }
-    }
-    
-    // 2. CHECA OS BOOSTED HUBS NAS PRINCIPAIS CHAVES DO SISTEMA
-    let keysToCheck = [
-        "BOOSTED_HUB", "BOOSTED_HUBS", "BOOSTED", 
-        "EVENT_HUB", "BONUS_HUB", "WEEKLY_HUB", 
-        "GLOBAL_SETTINGS", "HUB_BOOST"
-    ];
-    
-    for (let k of keysToCheck) {
-        let val = await dbGet(k);
-        // Confere se o valor existe, se é um texto, e procura o UUID convertido em minúsculo
-        if (val && typeof val === "string" && val.toLowerCase().includes(target)) return true;
-    }
-    
+      // 1. CHECA O MAINHUB (O primeiríssimo do Satori, ignorando maiúsculas na chave do DB)
+      const qSatori = await db.query("SELECT value FROM kvstore WHERE id ILIKE 'satori'");
+      for (let row of qSatori.rows) {
+          if (row.value) {
+              let list = row.value.split("ç").filter(Boolean);
+              if (list.length > 0) {
+                  let mainUuid = list[0].split("#")[0].toLowerCase().replace(/[^0-9a-f\-]/g, "");
+                  if (target === mainUuid) return true; // É O MAINHUB, IMUNIZADO!
+              }
+          }
+      }
+
+      // 2. DESCOBRE O NOME DA REGIÃO DESTE HUB (Para o caso de a HUD salvar o nome e não a UUID)
+      let targetRegionName = "";
+      const qContinents = await db.query("SELECT value FROM kvstore WHERE id IN ('Satori', 'Corsica', 'Nautilus', 'Heterocera', 'Jeogeot', 'Gaeta5', 'Zindra', 'Bellisseria', 'Blake_Sea', 'SATORI')");
+      for (let row of qContinents.rows) {
+          if (row.value) {
+              let list = row.value.split("ç").filter(Boolean);
+              for (let item of list) {
+                  let parts = item.split("#");
+                  if (parts[0].toLowerCase().replace(/[^0-9a-f\-]/g, "") === target) {
+                      if (parts.length > 1) {
+                          targetRegionName = parts[1].toLowerCase().trim();
+                          break;
+                      }
+                  }
+              }
+          }
+          if (targetRegionName) break;
+      }
+
+      // 3. VARREDURA NO BANCO DE DADOS EM BUSCA DO BOOSTED HUB
+      // Ignora letras maiúsculas/minúsculas e procura nas chaves suspeitas
+      const qBoosted = await db.query(`
+          SELECT id, value FROM kvstore 
+          WHERE id ILIKE '%boost%' 
+             OR id ILIKE '%event%' 
+             OR id ILIKE '%hub%'
+      `);
+      
+      for (let row of qBoosted.rows) {
+          if (row.value && typeof row.value === 'string') {
+              let valStr = row.value.toLowerCase();
+              // Se a chave salvar a UUID:
+              if (valStr.includes(target)) return true;
+              
+              // Se a chave salvar o NOME DA REGIÃO (ex: "Royier"):
+              if (targetRegionName && targetRegionName.length > 2 && valStr.includes(targetRegionName)) {
+                  return true; 
+              }
+          }
+      }
+
   } catch(e) {
-    console.error("Erro ao checar imunidade:", e);
+      console.error("Erro na blindagem de imunidade:", e);
   }
-  return false;
+  return false; // Se nada bater, não é imune.
 }
 
 async function processParcelDemand(parcelUuid, user) {
-  if (!parcelUuid || parcelUuid.length !== 36) return 1.0;
+  if (!parcelUuid || parcelUuid.length < 36) return 1.0;
   
-  // Força padronização minúscula
-  parcelUuid = parcelUuid.toLowerCase(); 
+  // Limpeza radical na UUID
+  let cleanUuid = parcelUuid.toLowerCase().replace(/[^0-9a-f\-]/g, "");
+  if (cleanUuid.length !== 36) return 1.0;
   
-  const key = `PARCEL_${parcelUuid}`;
-  let isImmune = await isHubImmune(parcelUuid);
+  const key = `PARCEL_${cleanUuid}`;
+  let isImmune = await isHubImmune(cleanUuid);
 
   try {
       let dataStr = await dbGet(key);
@@ -462,6 +485,7 @@ async function processParcelDemand(parcelUuid, user) {
       let now = getUnixTime();
 
       if (isImmune) {
+          // SE FOR IMUNE, TRAVA EM 1.0 E LIMPA HISTÓRICO
           parcel.mult = 1.0;
           parcel.history = [];
           parcel.last_delivery = now;
@@ -493,13 +517,14 @@ async function processParcelDemand(parcelUuid, user) {
 }
 
 async function getParcelDemandOnly(parcelUuid) {
-  if (!parcelUuid || parcelUuid.length !== 36) return 1.0;
+  if (!parcelUuid || parcelUuid.length < 36) return 1.0;
   
-  parcelUuid = parcelUuid.toLowerCase();
+  let cleanUuid = parcelUuid.toLowerCase().replace(/[^0-9a-f\-]/g, "");
+  if (cleanUuid.length !== 36) return 1.0;
   
-  if (await isHubImmune(parcelUuid)) return 1.0;
+  if (await isHubImmune(cleanUuid)) return 1.0;
   
-  const key = `PARCEL_${parcelUuid}`;
+  const key = `PARCEL_${cleanUuid}`;
   try {
       let dataStr = await dbGet(key);
       if (!dataStr) return 1.0;
@@ -541,7 +566,7 @@ app.post("/action", requireToken, async (req, res) => {
         let demandMult = 1.0;
         let targetParcel = null;
         if (player.ACTIVE_PARCEL && (now - player.PARCEL_TIME) < 120) { targetParcel = player.ACTIVE_PARCEL; }
-        if (targetParcel && targetParcel.length === 36 && targetParcel !== "00000000-0000-0000-0000-000000000000") {
+        if (targetParcel && targetParcel.length >= 36) {
             demandMult = await processParcelDemand(targetParcel, user);
         }
 
