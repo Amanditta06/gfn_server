@@ -114,6 +114,11 @@ async function ensureTable() {
     await loadGlobalSettings(); 
     await clearAllMessageQueues();
     
+    // ==============================================================
+    // ZERA A DEMANDA DE TODOS OS HUBS NO REBOOT
+    // ==============================================================
+    await db.query("DELETE FROM kvstore WHERE id LIKE 'PARCEL_%'");
+    
     // TODA VEZ QUE O SERVIDOR DER REBOOT: Ele puxa a semana anterior e checa o Hall da Fama
     const lastRankRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["lastWeekTopFive"]);
     if (lastRankRes.rowCount > 0 && lastRankRes.rows[0].value) {
@@ -403,16 +408,53 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
 });
 
 // ========================================================
-// LÓGICA DE DEMANDA (CORRIGIDA PARA RECUPERAÇÃO CONTÍNUA)
+// LÓGICA DE DEMANDA E IMUNIDADE
 // ========================================================
+async function isHubImmune(parcelUuid) {
+  if (!parcelUuid || parcelUuid.length !== 36) return false;
+  try {
+    // 1. Checa se é o Mainhub (Hub 0 de Satori)
+    let satoriData = await dbGet("Satori");
+    if (satoriData) {
+        let satoriList = satoriData.split("ç").filter(Boolean);
+        if (satoriList.length > 0) {
+            let mainUuid = satoriList[0].split("#")[0];
+            if (parcelUuid === mainUuid) return true;
+        }
+    }
+    
+    // 2. Checa se é um Boosted Hub salvo no banco de dados (Acesso Instantâneo)
+    let bHub1 = await dbGet("BOOSTED_HUB") || "";
+    let bHub2 = await dbGet("BOOSTED_HUBS") || "";
+    
+    if (bHub1.includes(parcelUuid)) return true;
+    if (bHub2.includes(parcelUuid)) return true;
+    
+  } catch(e) {
+    console.error("Erro ao checar imunidade", e);
+  }
+  return false;
+}
+
 async function processParcelDemand(parcelUuid, user) {
   if (!parcelUuid || parcelUuid.length !== 36) return 1.0;
+  
   const key = `PARCEL_${parcelUuid}`;
+  let isImmune = await isHubImmune(parcelUuid);
+
   try {
       let dataStr = await dbGet(key);
       let parcel = dataStr ? JSON.parse(dataStr) : { mult: 1.0, history: [], last_delivery: 0, user_history: {} };
       if (!parcel.user_history) parcel.user_history = {};
       let now = getUnixTime();
+
+      if (isImmune) {
+          parcel.mult = 1.0;
+          parcel.history = [];
+          parcel.last_delivery = now;
+          await dbSet(key, JSON.stringify(parcel));
+          return 1.0;
+      }
 
       parcel.history = parcel.history.filter(ts => (now - ts) <= 10800);
       let lastUserTime = parcel.user_history[user] || 0;
@@ -421,8 +463,7 @@ async function processParcelDemand(parcelUuid, user) {
       if (!alreadyCountedRecently) {
          if (parcel.last_delivery > 0 && parcel.mult < 1.0) {
             let timeOffline = now - parcel.last_delivery;
-            // RECUPERAÇÃO PROPORCIONAL: 0.2 por hora, aplicado a cada segundo.
-            let recovered = (timeOffline / 3600.0) * 0.2;
+            let recovered = (timeOffline / 600.0) * 0.15;
             parcel.mult = Math.min(1.0, parcel.mult + recovered);
          }
          
@@ -430,10 +471,7 @@ async function processParcelDemand(parcelUuid, user) {
          parcel.last_delivery = now;
          parcel.user_history[user] = now;
          
-         // Aplica a penalidade da entrega atual (-0.1)
          parcel.mult = Math.max(0.1, parcel.mult - 0.1);
-         
-         // Arredonda para 1 casa decimal pra ficar bonito (ex: 0.9, 0.8)
          parcel.mult = Math.round(parcel.mult * 10) / 10;
          await dbSet(key, JSON.stringify(parcel));
       }
@@ -443,6 +481,9 @@ async function processParcelDemand(parcelUuid, user) {
 
 async function getParcelDemandOnly(parcelUuid) {
   if (!parcelUuid || parcelUuid.length !== 36) return 1.0;
+  
+  if (await isHubImmune(parcelUuid)) return 1.0;
+  
   const key = `PARCEL_${parcelUuid}`;
   try {
       let dataStr = await dbGet(key);
@@ -453,8 +494,7 @@ async function getParcelDemandOnly(parcelUuid) {
       
       if (parcel.last_delivery > 0 && mult < 1.0) {
          let timeOffline = now - parcel.last_delivery;
-         // RECUPERAÇÃO PROPORCIONAL (Calcula o valor real no exato momento da visualização)
-         let recovered = (timeOffline / 3600.0) * 0.2;
+         let recovered = (timeOffline / 600.0) * 0.15;
          mult = Math.min(1.0, mult + recovered);
       }
       
@@ -496,7 +536,7 @@ app.post("/action", requireToken, async (req, res) => {
         if (demandMult < 1.0 && plan !== "EVENT") {
             price = Math.round(price * demandMult);
             let lostPercent = Math.round((1.0 - demandMult) * 100);
-            await addPlayerMessage(user, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +20% every hour without deliveries.`);
+            await addPlayerMessage(user, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +15% every 10 minutes without deliveries.`);
         }
 
         let recebido = 0;
