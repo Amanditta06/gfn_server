@@ -61,7 +61,7 @@ async function clearAllMessageQueues() {
   if (!DATABASE_URL) return;
   try {
     await db.query("DELETE FROM kvstore WHERE id LIKE '%_MSG'");
-    await db.query("DELETE FROM kvstore WHERE id LIKE '%_ALERTS'"); // Limpa lixo de testes anteriores
+    await db.query("DELETE FROM kvstore WHERE id LIKE '%_ALERTS'"); 
   } catch (e) {}
 }
 
@@ -77,7 +77,6 @@ async function processHallOfFame(rankString) {
       try { hofList = JSON.parse(hofRes.rows[0].value); } catch(e){} 
     }
     
-    // Suporta tanto quebra de linha real quanto o texto literal "\n"
     const lines = rankString.split(/\\n|\n/);
     
     lines.forEach(line => {
@@ -88,7 +87,6 @@ async function processHallOfFame(rankString) {
          let weeklyScore = parseInt(scoreStr.replace(/\D/g, ''));
          if (!isNaN(weeklyScore)) {
            let existing = hofList.find(p => p.name === playerName);
-           // Atualiza apenas se for MAIOR que o recorde anterior (ou adiciona novo)
            if (existing) { 
              if (weeklyScore > existing.score) existing.score = weeklyScore; 
            } else { 
@@ -99,7 +97,7 @@ async function processHallOfFame(rankString) {
     });
     
     hofList.sort((a, b) => b.score - a.score);
-    hofList = hofList.slice(0, 3); // Mantém estritamente o top 3
+    hofList = hofList.slice(0, 3);
     await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, ["HALL_OF_FAME", JSON.stringify(hofList)]);
   } catch(e) {
     console.error("Erro ao processar Hall of Fame:", e);
@@ -114,12 +112,9 @@ async function ensureTable() {
     await loadGlobalSettings(); 
     await clearAllMessageQueues();
     
-    // ==============================================================
     // ZERA A DEMANDA DE TODOS OS HUBS NO REBOOT
-    // ==============================================================
     await db.query("DELETE FROM kvstore WHERE id LIKE 'PARCEL_%'");
     
-    // TODA VEZ QUE O SERVIDOR DER REBOOT: Ele puxa a semana anterior e checa o Hall da Fama
     const lastRankRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["lastWeekTopFive"]);
     if (lastRankRes.rowCount > 0 && lastRankRes.rows[0].value) {
        await processHallOfFame(lastRankRes.rows[0].value);
@@ -141,8 +136,6 @@ setInterval(async () => {
 
       if (oldRank && oldRank.length > 5 && !oldRank.includes("Waiting")) {
         await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, ["lastWeekTopFive", oldRank]);
-        
-        // Processa o Hall da Fama na virada da semana
         await processHallOfFame(oldRank);
       }
       await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, ["weeklyTopFive", "Waiting for new deliveries..."]);
@@ -408,36 +401,56 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
 });
 
 // ========================================================
-// LÓGICA DE DEMANDA E IMUNIDADE
+// LÓGICA DE DEMANDA E IMUNIDADE BLINDADA
 // ========================================================
 async function isHubImmune(parcelUuid) {
   if (!parcelUuid || parcelUuid.length !== 36) return false;
+  
+  // TRANSFORMA O ALVO EM MINÚSCULO PARA NUNCA ERRAR O MATCH
+  let target = parcelUuid.toLowerCase(); 
+  
   try {
-    // 1. Checa se é o Mainhub (Hub 0 de Satori)
-    let satoriData = await dbGet("Satori");
-    if (satoriData) {
-        let satoriList = satoriData.split("ç").filter(Boolean);
-        if (satoriList.length > 0) {
-            let mainUuid = satoriList[0].split("#")[0];
-            if (parcelUuid === mainUuid) return true;
+    // 1. CHECA O MAINHUB (Buscando o nome exato do primeiro servidor dinamicamente)
+    let serversData = await dbGet("SERVERS");
+    if (serversData) {
+        let srvList = serversData.split("ç").filter(Boolean);
+        if (srvList.length > 0) {
+            let firstServerName = srvList[0];
+            let mainData = await dbGet(firstServerName);
+            if (mainData) {
+                let mainList = mainData.split("ç").filter(Boolean);
+                if (mainList.length > 0) {
+                    let mainUuid = mainList[0].split("#")[0].toLowerCase(); // Minúsculo
+                    if (target === mainUuid) return true;
+                }
+            }
         }
     }
     
-    // 2. Checa se é um Boosted Hub salvo no banco de dados (Acesso Instantâneo)
-    let bHub1 = await dbGet("BOOSTED_HUB") || "";
-    let bHub2 = await dbGet("BOOSTED_HUBS") || "";
+    // 2. CHECA OS BOOSTED HUBS NAS PRINCIPAIS CHAVES DO SISTEMA
+    let keysToCheck = [
+        "BOOSTED_HUB", "BOOSTED_HUBS", "BOOSTED", 
+        "EVENT_HUB", "BONUS_HUB", "WEEKLY_HUB", 
+        "GLOBAL_SETTINGS", "HUB_BOOST"
+    ];
     
-    if (bHub1.includes(parcelUuid)) return true;
-    if (bHub2.includes(parcelUuid)) return true;
+    for (let k of keysToCheck) {
+        let val = await dbGet(k);
+        // Confere se o valor existe, se é um texto, e procura o UUID convertido em minúsculo
+        if (val && typeof val === "string" && val.toLowerCase().includes(target)) return true;
+    }
     
   } catch(e) {
-    console.error("Erro ao checar imunidade", e);
+    console.error("Erro ao checar imunidade:", e);
   }
   return false;
 }
 
 async function processParcelDemand(parcelUuid, user) {
   if (!parcelUuid || parcelUuid.length !== 36) return 1.0;
+  
+  // Força padronização minúscula
+  parcelUuid = parcelUuid.toLowerCase(); 
   
   const key = `PARCEL_${parcelUuid}`;
   let isImmune = await isHubImmune(parcelUuid);
@@ -481,6 +494,8 @@ async function processParcelDemand(parcelUuid, user) {
 
 async function getParcelDemandOnly(parcelUuid) {
   if (!parcelUuid || parcelUuid.length !== 36) return 1.0;
+  
+  parcelUuid = parcelUuid.toLowerCase();
   
   if (await isHubImmune(parcelUuid)) return 1.0;
   
