@@ -504,7 +504,6 @@ async function isHubImmune(parcelUuid) {
   return false; 
 }
 
-// RESTAURADO PARA O CÁLCULO CONTÍNUO ORIGINAL (REMOVIDO OS TICKS)
 async function processParcelDemand(parcelUuid, user) {
   if (!parcelUuid || parcelUuid.length < 36) return 1.0;
   
@@ -544,14 +543,13 @@ async function processParcelDemand(parcelUuid, user) {
          parcel.user_history[user] = now;
          
          parcel.mult = Math.max(0.1, parcel.mult - 0.1);
-         parcel.mult = Math.round(parcel.mult * 10) / 10; 
+         parcel.mult = Math.round(parcel.mult * 10) / 10;
          await dbSet(key, JSON.stringify(parcel));
       }
       return parcel.mult;
   } catch (err) { return 1.0; }
 }
 
-// RESTAURADO PARA O CÁLCULO CONTÍNUO ORIGINAL (REMOVIDO OS TICKS)
 async function getParcelDemandOnly(parcelUuid) {
   if (!parcelUuid || parcelUuid.length < 36) return { mult: 1.0, last_delivery: 0 };
   
@@ -606,19 +604,17 @@ app.post("/action", requireToken, async (req, res) => {
         let targetParcel = null;
 
         // ========================================================
-        // RETRY LOOP: Protege vendas extremamente rápidas (Mentira Race Condition)
-        // Como o botão no HUD pode ser clicado antes do log do LSL chegar ao servidor,
-        // aguardamos e tentamos até 3 vezes (3 segundos) antes de desistir.
+        // ESPERA INTELIGENTE PELO LOG (gfn_admin_logs)
+        // O HUD envia a venda primeiro, mas precisamos aguardar 
+        // o log do LSL chegar ao DB para saber onde o player entregou.
         // ========================================================
-        for (let i = 0; i < 4; i++) {
+        for (let i = 0; i < 8; i++) {
             if (player.ACTIVE_PARCEL && (now - player.PARCEL_TIME) < 1800) { 
                 targetParcel = player.ACTIVE_PARCEL.toLowerCase(); 
                 break;
             }
-            if (i < 3) {
-                await new Promise(resolve => setTimeout(resolve, 1000));
-                player = await getPlayerData(user); // Busca o player no DB denovo
-            }
+            await new Promise(resolve => setTimeout(resolve, 500)); // Aguarda 500ms
+            player = await getPlayerData(user); // Re-lê os dados atualizados pelo log
         }
 
         if (targetParcel && targetParcel.length >= 36) {
@@ -733,7 +729,6 @@ app.post("/action", requireToken, async (req, res) => {
         if (!player.AFFINITY) player.AFFINITY = {};
         if (!player.AFFINITY_TIME) player.AFFINITY_TIME = {};
 
-        // Se o timestamp for 0 (inexistente), inicializa com o tempo atual para proteger a afinidade existente de ser apagada
         for (let hubUuid in player.AFFINITY) {
             let lastTime = player.AFFINITY_TIME[hubUuid] || 0;
             if (lastTime === 0) {
@@ -745,14 +740,12 @@ app.post("/action", requireToken, async (req, res) => {
         }
 
         if (savedParcelForAffinity && savedParcelForAffinity.length >= 36) {
-            // Atualiza o timestamp individual da última entrega deste player para este HUB específico
             player.AFFINITY_TIME[savedParcelForAffinity] = now;
 
             let currentAffinity = parseFloat(player.AFFINITY[savedParcelForAffinity]) || 0.0;
             let distance = player.LAST_DIST || 0;
             let addedAffinity = 0;
 
-            // Só aumenta se a distância for maior que 1000m (1km)
             if (distance > 1000) {
                 if (currentAffinity < 0.5) {
                     addedAffinity = 0.01;
@@ -764,7 +757,6 @@ app.post("/action", requireToken, async (req, res) => {
                 }
             }
 
-            // Pagamento extra por afinidade (valor da entrega * afinidade atual)
             if (currentAffinity > 0 && price > 0) {
                 let affinityBonus = Math.round(price * currentAffinity);
                 if (affinityBonus > 0) {
@@ -924,7 +916,26 @@ app.get("/get", async (req, res) => {
   if (!id) return res.status(400).json({ error: "missing id" });
   try {
     const q = await db.query("SELECT value FROM kvstore WHERE id=$1", [id]);
-    res.json({ id, value: q.rowCount === 0 ? null : q.rows[0].value });
+    let val = q.rowCount === 0 ? null : q.rows[0].value;
+    
+    // ========================================================
+    // CORREÇÃO DO RELÓGIO (Mantido conforme solicitado)
+    // ========================================================
+    if (val && id.startsWith("PARCEL_")) {
+        try {
+            let parcel = JSON.parse(val);
+            let now = getUnixTime();
+            if (parcel.last_delivery > 0 && parcel.mult < 1.0) {
+                let timeOffline = now - parcel.last_delivery;
+                let recovered = (timeOffline / 600.0) * 0.15;
+                parcel.mult = Math.min(1.0, parcel.mult + recovered);
+                parcel.mult = Math.round(parcel.mult * 10000) / 10000;
+                val = JSON.stringify(parcel);
+            }
+        } catch(e){}
+    }
+
+    res.json({ id, value: val });
   } catch (e) { res.status(500).json({ error: "db error" }); }
 });
 
@@ -934,7 +945,7 @@ app.post("/set", requireToken, async (req, res) => {
   
   try {
     // ========================================================
-    // INTERCEPTADOR: LÊ O LOG E INJETA O AVISO DIRETAMENTE NA GAVETA ADMIN
+    // INTERCEPTADOR: LÊ O LOG E ATUALIZA O PLAYER NO BANCO
     // ========================================================
     if (id === "gfn_admin_logs" && value) {
         let logs = value.split("|#|").filter(Boolean);
