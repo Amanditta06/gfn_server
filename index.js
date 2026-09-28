@@ -80,8 +80,10 @@ async function cleanupStaleAffinities() {
         if (pData.AFFINITY && pData.AFFINITY_TIME) {
           for (let hubUuid in pData.AFFINITY) {
             let lastTime = pData.AFFINITY_TIME[hubUuid] || 0;
-            // Verifica individualmente para cada HUB deste player específico se passou de 1 semana (604800s)
-            if (lastTime === 0 || (now - lastTime) > 604800) {
+            if (lastTime === 0) {
+              pData.AFFINITY_TIME[hubUuid] = now;
+              modified = true;
+            } else if ((now - lastTime) > 604800) {
               delete pData.AFFINITY[hubUuid];
               delete pData.AFFINITY_TIME[hubUuid];
               modified = true;
@@ -713,10 +715,12 @@ app.post("/action", requireToken, async (req, res) => {
         if (!player.AFFINITY) player.AFFINITY = {};
         if (!player.AFFINITY_TIME) player.AFFINITY_TIME = {};
 
-        // Remove individualmente as afinidades deste player que ficaram sem entrega há mais de 1 semana (604800s)
+        // Se o timestamp for 0 (inexistente), inicializa com o tempo atual para proteger a afinidade existente de ser apagada
         for (let hubUuid in player.AFFINITY) {
             let lastTime = player.AFFINITY_TIME[hubUuid] || 0;
-            if (lastTime === 0 || (now - lastTime) > 604800) {
+            if (lastTime === 0) {
+                player.AFFINITY_TIME[hubUuid] = now;
+            } else if ((now - lastTime) > 604800) {
                 delete player.AFFINITY[hubUuid];
                 delete player.AFFINITY_TIME[hubUuid];
             }
