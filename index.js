@@ -738,7 +738,7 @@ app.post("/action", requireToken, async (req, res) => {
                     currentAffinity = Math.round(currentAffinity * 100) / 100;
                     player.AFFINITY[savedParcelForAffinity] = currentAffinity;
 
-                    await addPlayerMessage(user, `Sua afinidade com este HUB foi aumentada em +${addedAffinity}. Agora você tem ${currentAffinity} de afinidade total com este HUB.`);
+                    await addPlayerMessage(user, `Your affinity with this HUB has increased by +${addedAffinity}. You now have ${currentAffinity} total affinity with this HUB.`);
                 }
             }
 
@@ -748,7 +748,7 @@ app.post("/action", requireToken, async (req, res) => {
                 if (affinityBonus > 0) {
                     player.M += affinityBonus;
                     recebido += affinityBonus;
-                    await addPlayerMessage(user, `Você recebeu um pagamento extra de ${affinityBonus} F₵ devido ao bônus de afinidade (${currentAffinity}x / ${(currentAffinity * 100).toFixed(0)}%) com este HUB.`);
+                    await addPlayerMessage(user, `You received an extra payout of ${affinityBonus} F₵ due to the affinity bonus (${currentAffinity}x / ${(currentAffinity * 100).toFixed(0)}%) with this HUB.`);
                     await addPlayerMessage(user, `You have now ${player.M} F₵.`);
                 }
             }
@@ -797,7 +797,7 @@ app.post("/action", requireToken, async (req, res) => {
         let amountVal = parseInt(content) || 0;
         
         if (amountVal <= 0) {
-            await addPlayerMessage(user, "⚠️ Negado: Você não pode transferir valores zerados ou negativos.");
+            await addPlayerMessage(user, "⚠️ Denied: You cannot transfer zero or negative amounts.");
             return res.json({ status: "denied" });
         }
         
@@ -813,11 +813,11 @@ app.post("/action", requireToken, async (req, res) => {
         } else {
             let sender = await getPlayerData(user);
             if (sender.M < amountVal) {
-                await addPlayerMessage(user, `⚠️ Negado: Você não tem saldo suficiente. Seu saldo é ${sender.M} F₵.`);
+                await addPlayerMessage(user, `⚠️ Denied: Insufficient balance. Your balance is ${sender.M} F₵.`);
                 return res.json({ status: "denied" });
             }
             if (user === target) {
-                await addPlayerMessage(user, "⚠️ Negado: Você não pode transferir F₵ para si mesmo.");
+                await addPlayerMessage(user, "⚠️ Denied: You cannot transfer F₵ to yourself.");
                 return res.json({ status: "denied" });
             }
 
@@ -844,7 +844,7 @@ app.post("/action", requireToken, async (req, res) => {
             }
           } catch(e) {}
         }
-        await addPlayerMessage(user, `VARREDURA CONCLUÍDA! Contas limitadas a ${maxValue} F₵.`);
+        await addPlayerMessage(user, `SWEEP COMPLETED! Accounts limited to ${maxValue} F₵.`);
         responsePayload.status = "success";
       }
       else if (safeTopic === "buy") {
