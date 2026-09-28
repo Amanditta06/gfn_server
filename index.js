@@ -66,6 +66,42 @@ async function clearAllMessageQueues() {
 }
 
 // ========================================================
+// LIMPEZA DIÁRIA INDIVIDUAL DE AFINIDADES EXPIRADAS (> 1 SEMANA)
+// ========================================================
+async function cleanupStaleAffinities() {
+  if (!DATABASE_URL) return;
+  try {
+    const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
+    let now = getUnixTime();
+    for (let row of q.rows) {
+      try {
+        let pData = JSON.parse(row.value);
+        let modified = false;
+        if (pData.AFFINITY && pData.AFFINITY_TIME) {
+          for (let hubUuid in pData.AFFINITY) {
+            let lastTime = pData.AFFINITY_TIME[hubUuid] || 0;
+            // Verifica individualmente para cada HUB deste player específico se passou de 1 semana (604800s)
+            if (lastTime === 0 || (now - lastTime) > 604800) {
+              delete pData.AFFINITY[hubUuid];
+              delete pData.AFFINITY_TIME[hubUuid];
+              modified = true;
+            }
+          }
+        }
+        if (modified) {
+          await db.query("UPDATE kvstore SET value = $1 WHERE id = $2", [JSON.stringify(pData), row.id]);
+        }
+      } catch (e) {}
+    }
+  } catch (e) {
+    console.error("Erro na limpeza de afinidades expiradas:", e);
+  }
+}
+
+// Executa a limpeza diariamente (a cada 24 horas)
+setInterval(cleanupStaleAffinities, 24 * 60 * 60 * 1000);
+
+// ========================================================
 // FUNÇÃO CENTRAL DO HALL DA FAMA
 // ========================================================
 async function processHallOfFame(rankString) {
@@ -113,6 +149,9 @@ async function ensureTable() {
     
     // ZERA A DEMANDA DE TODOS OS HUBS NO REBOOT
     await db.query("DELETE FROM kvstore WHERE id LIKE 'PARCEL_%'");
+    
+    // Executa a limpeza individual de afinidades no boot do servidor
+    await cleanupStaleAffinities();
     
     const lastRankRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["lastWeekTopFive"]);
     if (lastRankRes.rowCount > 0 && lastRankRes.rows[0].value) {
@@ -216,7 +255,7 @@ app.post("/ack-msg", async (req, res) => {
 async function getPlayerData(uuid) {
   if (!uuid) return null;
   const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [`player_${uuid}`]);
-  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0, LAST_DIST: 0, AFFINITY: {} };
+  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0, LAST_DIST: 0, AFFINITY: {}, AFFINITY_TIME: {} };
   if (res.rowCount > 0) {
     try { 
       let parsedData = JSON.parse(res.rows[0].value);
@@ -234,6 +273,7 @@ async function getPlayerData(uuid) {
       data.PARCEL_TIME = parseInt(data.PARCEL_TIME, 10) || 0;
       data.LAST_DIST = parseFloat(data.LAST_DIST) || 0;
       data.AFFINITY = parsedData.AFFINITY || {};
+      data.AFFINITY_TIME = parsedData.AFFINITY_TIME || {};
     } catch(e) {}
   }
   return data;
@@ -406,24 +446,21 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
 // ========================================================
 async function isHubImmune(parcelUuid) {
   if (!parcelUuid) return false;
-  // Limpeza radical: destrói qualquer caractere invisível, acentos ou espaços
   let target = parcelUuid.toLowerCase().replace(/[^0-9a-f\-]/g, ""); 
   if (target.length !== 36) return false;
 
   try {
-      // 1. CHECA O MAINHUB (O primeiríssimo do Satori, ignorando maiúsculas na chave do DB)
       const qSatori = await db.query("SELECT value FROM kvstore WHERE id ILIKE 'satori'");
       for (let row of qSatori.rows) {
           if (row.value) {
               let list = row.value.split("ç").filter(Boolean);
               if (list.length > 0) {
                   let mainUuid = list[0].split("#")[0].toLowerCase().replace(/[^0-9a-f\-]/g, "");
-                  if (target === mainUuid) return true; // É O MAINHUB, IMUNIZADO!
+                  if (target === mainUuid) return true; 
               }
           }
       }
 
-      // 2. DESCOBRE O NOME DA REGIÃO DESTE HUB (Para o caso de a HUD salvar o nome e não a UUID)
       let targetRegionName = "";
       const qContinents = await db.query("SELECT value FROM kvstore WHERE id IN ('Satori', 'Corsica', 'Nautilus', 'Heterocera', 'Jeogeot', 'Gaeta5', 'Zindra', 'Bellisseria', 'Blake_Sea', 'SATORI')");
       for (let row of qContinents.rows) {
@@ -442,8 +479,6 @@ async function isHubImmune(parcelUuid) {
           if (targetRegionName) break;
       }
 
-      // 3. VARREDURA NO BANCO DE DADOS EM BUSCA DO BOOSTED HUB
-      // Ignora letras maiúsculas/minúsculas e procura nas chaves suspeitas
       const qBoosted = await db.query(`
           SELECT id, value FROM kvstore 
           WHERE id ILIKE '%boost%' 
@@ -454,10 +489,7 @@ async function isHubImmune(parcelUuid) {
       for (let row of qBoosted.rows) {
           if (row.value && typeof row.value === 'string') {
               let valStr = row.value.toLowerCase();
-              // Se a chave salvar a UUID:
               if (valStr.includes(target)) return true;
-              
-              // Se a chave salvar o NOME DA REGIÃO (ex: "Royier"):
               if (targetRegionName && targetRegionName.length > 2 && valStr.includes(targetRegionName)) {
                   return true; 
               }
@@ -467,13 +499,12 @@ async function isHubImmune(parcelUuid) {
   } catch(e) {
       console.error("Erro na blindagem de imunidade:", e);
   }
-  return false; // Se nada bater, não é imune.
+  return false; 
 }
 
 async function processParcelDemand(parcelUuid, user) {
   if (!parcelUuid || parcelUuid.length < 36) return 1.0;
   
-  // Limpeza radical na UUID
   let cleanUuid = parcelUuid.toLowerCase().replace(/[^0-9a-f\-]/g, "");
   if (cleanUuid.length !== 36) return 1.0;
   
@@ -487,7 +518,6 @@ async function processParcelDemand(parcelUuid, user) {
       let now = getUnixTime();
 
       if (isImmune) {
-          // SE FOR IMUNE, TRAVA EM 1.0 E LIMPA HISTÓRICO
           parcel.mult = 1.0;
           parcel.history = [];
           parcel.last_delivery = now;
@@ -575,7 +605,7 @@ app.post("/action", requireToken, async (req, res) => {
             demandMult = await processParcelDemand(targetParcel, user);
         }
 
-        let savedParcelForAffinity = targetParcel; // Guarda para usar na afinidade antes de zerar
+        let savedParcelForAffinity = targetParcel; 
 
         player.ACTIVE_PARCEL = "";
         player.PARCEL_TIME = 0;
@@ -678,10 +708,24 @@ app.post("/action", requireToken, async (req, res) => {
         }
 
         // ========================================================
-        // FEATURE: PROCESSAMENTO DE AFINIDADE COM O HUB
+        // FEATURE: PROCESSAMENTO E EXPIRAÇÃO INDIVIDUAL DE AFINIDADE
         // ========================================================
+        if (!player.AFFINITY) player.AFFINITY = {};
+        if (!player.AFFINITY_TIME) player.AFFINITY_TIME = {};
+
+        // Remove individualmente as afinidades deste player que ficaram sem entrega há mais de 1 semana (604800s)
+        for (let hubUuid in player.AFFINITY) {
+            let lastTime = player.AFFINITY_TIME[hubUuid] || 0;
+            if (lastTime === 0 || (now - lastTime) > 604800) {
+                delete player.AFFINITY[hubUuid];
+                delete player.AFFINITY_TIME[hubUuid];
+            }
+        }
+
         if (savedParcelForAffinity && savedParcelForAffinity.length >= 36) {
-            if (!player.AFFINITY) player.AFFINITY = {};
+            // Atualiza o timestamp individual da última entrega deste player para este HUB específico
+            player.AFFINITY_TIME[savedParcelForAffinity] = now;
+
             let currentAffinity = parseFloat(player.AFFINITY[savedParcelForAffinity]) || 0.0;
             let distance = player.LAST_DIST || 0;
             let addedAffinity = 0;
@@ -709,7 +753,7 @@ app.post("/action", requireToken, async (req, res) => {
                 }
             }
         }
-        player.LAST_DIST = 0; // Reseta a distância registrada
+        player.LAST_DIST = 0; 
         // ========================================================
 
         await savePlayerData(user, player);
@@ -886,7 +930,6 @@ app.post("/set", requireToken, async (req, res) => {
                 pData.ACTIVE_PARCEL = parcelUuid;
                 pData.PARCEL_TIME = getUnixTime();
                 
-                // Extração da distância percorrida enviada no log de admin
                 let distMatch = lastLog.match(/(?:dist(?:ancia|ance)?[:\s]*)([\d,\.]+)\s*m?/i) || lastLog.match(/([\d,\.]+)\s*m\b/i);
                 let distance = 0;
                 if (distMatch) {
