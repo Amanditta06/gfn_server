@@ -276,6 +276,15 @@ async function getPlayerData(uuid) {
       data.LAST_DIST = parseFloat(data.LAST_DIST) || 0;
       data.AFFINITY = parsedData.AFFINITY || {};
       data.AFFINITY_TIME = parsedData.AFFINITY_TIME || {};
+
+      // PROTEÇÃO CONTRA BUG DE STRING, MAS PERMITINDO ACÚMULO REAL
+      let now = getUnixTime();
+      let maxAllowedFuture = now + (5 * 365 * 24 * 60 * 60); // Limite de 5 anos no futuro
+      
+      if (data.B_T > maxAllowedFuture) {
+          data.B_T = 0;
+          data.B_M = 1.0;
+      }
     } catch(e) {}
   }
   return data;
@@ -778,12 +787,27 @@ app.post("/action", requireToken, async (req, res) => {
         let add_time = parseInt(target) || 0;
         let player = await getPlayerData(user);
         let now = getUnixTime();
+
+        // Evita que um pacote corrompido do SL envie "infinito" de uma vez.
+        // Se a carga enviar mais de 1 ano em UM ÚNICO clique, força para 1 semana.
+        if (add_time > 31536000) {
+            add_time = 604800; 
+        }
+
         let current_time = player.B_T;
-        if (current_time < now) current_time = now;
-        current_time += add_time;
-        player.B_M = add_mult; player.B_T = current_time;
+        
+        // Se o boost já acabou, o tempo base começa do "agora"
+        if (current_time < now) {
+            current_time = now;
+        }
+        
+        // ACÚMULO SEM LIMITES! Cada convite vai somando semanas.
+        current_time += add_time; 
+
+        player.B_M = add_mult; 
+        player.B_T = current_time;
         await savePlayerData(user, player);
-      } 
+      }
       else if (safeTopic === "check") {
         let player = await getPlayerData(user);
         await addPlayerMessage(user, `You have ${player.M} F₵.`);
