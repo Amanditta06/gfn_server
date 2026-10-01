@@ -885,6 +885,26 @@ app.post("/action", requireToken, async (req, res) => {
         await addPlayerMessage(user, `SWEEP COMPLETED! Accounts limited to ${maxValue} F₵.`);
         responsePayload.status = "success";
       }
+      // ========================================================
+      // NOVO COMANDO: ZERAR BOOSTS DE TODOS OS PLAYERS
+      // ========================================================
+      else if (safeTopic === "mass_boost_reset") {
+        const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
+        for (let row of q.rows) {
+          try {
+            let pData = JSON.parse(row.value);
+            // Só atualiza quem realmente tem boost para economizar I/O no banco
+            if (pData.B_T > 0 || pData.B_M !== 1.0) {
+                pData.B_T = 0;
+                pData.B_M = 1.0;
+                await db.query("UPDATE kvstore SET value = $1 WHERE id = $2", [JSON.stringify(pData), row.id]);
+            }
+          } catch(e) {}
+        }
+        await addPlayerMessage(user, "SWEEP COMPLETED! All player boosts and weeks have been reset.");
+        responsePayload.status = "success";
+      }
+      // ========================================================
       else if (safeTopic === "buy") {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) { responsePayload.status = "denied"; return res.json(responsePayload); }
