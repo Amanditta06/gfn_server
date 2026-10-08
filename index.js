@@ -27,6 +27,12 @@ let MAX_EV = 5000;
 let MAX_F = 2000;
 let MAX_TRANSACTION = 1000000;
 
+// ========================================================
+// MIGUS GLOBAL CACHE
+// ========================================================
+let MIGU_CONFIG = { version: "1.0", duel_wager: 50, cookie_cost: 10, catch_chance: 0.55 };
+let MIGU_LIST = []; // Array of { name, mClass, subClass, image }
+
 const globalDebounce = new Set();
 const mutexes = {};
 
@@ -54,6 +60,18 @@ async function loadGlobalSettings() {
       if (parts[7] !== undefined && !isNaN(parseInt(parts[7]))) MAX_EV = parseInt(parts[7]);
       if (parts[8] !== undefined && !isNaN(parseInt(parts[8]))) MAX_F = parseInt(parts[8]);
     }
+
+    // Load Migu Configs
+    const mCfgRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["MIGU_CONFIG"]);
+    if (mCfgRes.rowCount > 0 && mCfgRes.rows[0].value) {
+        MIGU_CONFIG = { ...MIGU_CONFIG, ...JSON.parse(mCfgRes.rows[0].value) };
+    }
+
+    // Load Migu Database
+    const mListRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["MIGU_LIST"]);
+    if (mListRes.rowCount > 0 && mListRes.rows[0].value) {
+        MIGU_LIST = JSON.parse(mListRes.rows[0].value);
+    }
   } catch (e) {}
 }
 
@@ -65,9 +83,6 @@ async function clearAllMessageQueues() {
   } catch (e) {}
 }
 
-// ========================================================
-// LIMPEZA DIÁRIA INDIVIDUAL DE AFINIDADES EXPIRADAS (> 1 SEMANA)
-// ========================================================
 async function cleanupStaleAffinities() {
   if (!DATABASE_URL) return;
   try {
@@ -90,39 +105,25 @@ async function cleanupStaleAffinities() {
             }
           }
         }
-        if (modified) {
-          await db.query("UPDATE kvstore SET value = $1 WHERE id = $2", [JSON.stringify(pData), row.id]);
-        }
+        if (modified) await db.query("UPDATE kvstore SET value = $1 WHERE id = $2", [JSON.stringify(pData), row.id]);
       } catch (e) {}
     }
-  } catch (e) {
-    console.error("Erro na limpeza de afinidades expiradas:", e);
-  }
+  } catch (e) { console.error("Erro afinidades:", e); }
 }
 
-// Executa a limpeza diariamente (a cada 24 horas)
 setInterval(cleanupStaleAffinities, 24 * 60 * 60 * 1000);
 
-// ========================================================
-// FUNÇÃO CENTRAL DO HALL DA FAMA (CORRIGIDA ANTI-DUPLICAÇÃO)
-// ========================================================
 async function processHallOfFame(rankString) {
   if (!rankString || rankString.length <= 5 || rankString.includes("Waiting")) return;
   try {
     let hofRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["HALL_OF_FAME"]);
     let hofList = [];
-    if (hofRes.rowCount > 0 && hofRes.rows[0].value) { 
-      try { hofList = JSON.parse(hofRes.rows[0].value); } catch(e){} 
-    }
+    if (hofRes.rowCount > 0 && hofRes.rows[0].value) { try { hofList = JSON.parse(hofRes.rows[0].value); } catch(e){} }
     
-    // 1. Usamos um Map para garantir UNICIDADE ABSOLUTA por nome (ignorando maiúsculas e minúsculas)
     let playerRecords = new Map();
-    
-    // 2. Carrega os jogadores que já estão no HoF para o Map (isso já limpa duplicatas antigas do DB)
     hofList.forEach(p => {
       if (p && p.name) {
         let cleanName = p.name.trim().toLowerCase();
-        // Se o jogador não está no Map, ou a pontuação salva for maior, atualiza
         if (!playerRecords.has(cleanName) || playerRecords.get(cleanName).score < p.score) {
           playerRecords.set(cleanName, { name: p.name.trim(), score: p.score });
         }
@@ -130,42 +131,34 @@ async function processHallOfFame(rankString) {
     });
     
     const lines = rankString.split(/\\n|\n/);
-    
-    // 3. Processa a nova string de ranking da semana
     lines.forEach(line => {
        let match = line.match(/(?:[\d]+[°\.]\s*:?\s*)?(.+?)\s*(?:\(([\d,\.]+)\)|-\s*([\d,\.]+))/);
        if (match) {
          let playerName = match[1].trim();
-         let cleanName = playerName.toLowerCase(); // Chave limpa e padronizada
+         let cleanName = playerName.toLowerCase();
          let scoreStr = match[2] || match[3];
          let weeklyScore = parseInt(scoreStr.replace(/\D/g, ''));
          
          if (!isNaN(weeklyScore)) {
            if (playerRecords.has(cleanName)) {
              let existing = playerRecords.get(cleanName);
-             // Atualiza apenas se o recorde DESTA semana for MAIOR que o recorde HISTÓRICO
              if (weeklyScore > existing.score) {
                existing.score = weeklyScore;
-               existing.name = playerName; // Atualiza a formatação do nome pro mais recente
+               existing.name = playerName;
              }
            } else {
-             // Jogador novo entrando no Hall of Fame
              playerRecords.set(cleanName, { name: playerName, score: weeklyScore });
            }
          }
        }
     });
     
-    // 4. Converte o Map de volta para Array, ordena do maior pro menor e pega os top 3
     hofList = Array.from(playerRecords.values());
     hofList.sort((a, b) => b.score - a.score);
     hofList = hofList.slice(0, 3);
     
-    // 5. Salva no banco de dados
     await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, ["HALL_OF_FAME", JSON.stringify(hofList)]);
-  } catch(e) {
-    console.error("Erro ao processar Hall of Fame:", e);
-  }
+  } catch(e) {}
 }
 
 async function ensureTable() {
@@ -174,11 +167,7 @@ async function ensureTable() {
     await db.query(`CREATE TABLE IF NOT EXISTS kvstore (id TEXT PRIMARY KEY, value TEXT);`);
     await loadGlobalSettings(); 
     await clearAllMessageQueues();
-    
-    // ZERA A DEMANDA DE TODOS OS HUBS NO REBOOT
     await db.query("DELETE FROM kvstore WHERE id LIKE 'PARCEL_%'");
-    
-    // Executa a limpeza individual de afinidades no boot do servidor
     await cleanupStaleAffinities();
     
     const lastRankRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["lastWeekTopFive"]);
@@ -247,9 +236,6 @@ async function saveServerChunks(srvName, mainList, namesList) {
   await dbSet(`${srvName}_NAMES_5`, chunks[4]);
 }
 
-// ========================================================
-// MENSAGENS NORMAIS (HUD / PAGAMENTOS)
-// ========================================================
 async function addPlayerMessage(uuid, msg) {
   const keyId = `${uuid}_MSG`;
   try {
@@ -283,7 +269,7 @@ app.post("/ack-msg", async (req, res) => {
 async function getPlayerData(uuid) {
   if (!uuid) return null;
   const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [`player_${uuid}`]);
-  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0, LAST_DIST: 0, AFFINITY: {}, AFFINITY_TIME: {} };
+  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0, LAST_DIST: 0, AFFINITY: {}, AFFINITY_TIME: {}, MIGUS: [], ACTIVE_MIGU: "" };
   if (res.rowCount > 0) {
     try { 
       let parsedData = JSON.parse(res.rows[0].value);
@@ -302,15 +288,12 @@ async function getPlayerData(uuid) {
       data.LAST_DIST = parseFloat(data.LAST_DIST) || 0;
       data.AFFINITY = parsedData.AFFINITY || {};
       data.AFFINITY_TIME = parsedData.AFFINITY_TIME || {};
+      data.MIGUS = parsedData.MIGUS || [];
+      data.ACTIVE_MIGU = parsedData.ACTIVE_MIGU || "";
 
-      // PROTEÇÃO CONTRA BUG DE STRING, MAS PERMITINDO ACÚMULO REAL
       let now = getUnixTime();
-      let maxAllowedFuture = now + (5 * 365 * 24 * 60 * 60); // Limite de 5 anos no futuro
-      
-      if (data.B_T > maxAllowedFuture) {
-          data.B_T = 0;
-          data.B_M = 1.0;
-      }
+      let maxAllowedFuture = now + (5 * 365 * 24 * 60 * 60); 
+      if (data.B_T > maxAllowedFuture) { data.B_T = 0; data.B_M = 1.0; }
     } catch(e) {}
   }
   return data;
@@ -320,6 +303,177 @@ async function savePlayerData(uuid, data) {
   await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, [`player_${uuid}`, JSON.stringify(data)]);
 }
 
+// ========================================================
+// MIGUS ADMIN ROUTES
+// ========================================================
+
+app.post('/admin/migu/config', requireToken, async (req, res) => {
+    const { version, duel_wager, cookie_cost } = req.body;
+    if (version) MIGU_CONFIG.version = version;
+    if (duel_wager !== undefined) MIGU_CONFIG.duel_wager = parseInt(duel_wager);
+    if (cookie_cost !== undefined) MIGU_CONFIG.cookie_cost = parseInt(cookie_cost);
+    
+    await dbSet("MIGU_CONFIG", JSON.stringify(MIGU_CONFIG));
+    res.json({ success: true, message: "Global Migu Configuration Updated", config: MIGU_CONFIG });
+});
+
+app.post('/admin/migu/add', requireToken, async (req, res) => {
+    const { name, mClass, subClass, image } = req.body;
+    if (!name || !mClass || !subClass) return res.status(400).json({ error: "Missing Migu properties" });
+
+    // Check if exists, overwrite if true
+    let idx = MIGU_LIST.findIndex(m => m.name.toLowerCase() === name.toLowerCase());
+    if (idx !== -1) {
+        MIGU_LIST[idx] = { name, mClass, subClass, image };
+    } else {
+        MIGU_LIST.push({ name, mClass, subClass, image });
+    }
+    
+    await dbSet("MIGU_LIST", JSON.stringify(MIGU_LIST));
+    res.json({ success: true, message: `Migu [${name}] added to the Database.` });
+});
+
+app.post('/admin/migu/delete', requireToken, async (req, res) => {
+    const { name } = req.body;
+    if (!name) return res.status(400).json({ error: "Missing name" });
+
+    // 1. Remove from global list
+    MIGU_LIST = MIGU_LIST.filter(m => m.name.toLowerCase() !== name.toLowerCase());
+    await dbSet("MIGU_LIST", JSON.stringify(MIGU_LIST));
+
+    // 2. Iterate players and compensate
+    let affectedPlayers = 0;
+    try {
+        const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
+        for (let row of q.rows) {
+            try {
+                let pData = JSON.parse(row.value);
+                if (pData.MIGUS && pData.MIGUS.length > 0) {
+                    let count = 0;
+                    let newInventory = [];
+                    for (let m of pData.MIGUS) {
+                        if (m.toLowerCase() === name.toLowerCase()) count++;
+                        else newInventory.push(m);
+                    }
+                    if (count > 0) {
+                        pData.MIGUS = newInventory;
+                        if (pData.ACTIVE_MIGU && pData.ACTIVE_MIGU.toLowerCase() === name.toLowerCase()) {
+                            pData.ACTIVE_MIGU = "";
+                        }
+                        let compensation = count * 10000;
+                        pData.M += compensation;
+                        await db.query("UPDATE kvstore SET value = $1 WHERE id = $2", [JSON.stringify(pData), row.id]);
+                        
+                        let pUuid = row.id.replace("player_", "");
+                        await addPlayerMessage(pUuid, `⚠️ The Migu [${name}] was permanently deleted from the system. You received ${compensation} F₵ as compensation for losing ${count} Migus.`);
+                        affectedPlayers++;
+                    }
+                }
+            } catch(e) {}
+        }
+    } catch(err) {
+        return res.status(500).json({ error: "Database error during mass compensation." });
+    }
+
+    res.json({ success: true, message: `Migu [${name}] deleted. Compensated ${affectedPlayers} players.` });
+});
+
+// ========================================================
+// MIGUS GAMEPLAY ROUTES
+// ========================================================
+
+app.get('/migu/config', async (req, res) => {
+  const { version, uuid } = req.query;
+  if (version !== MIGU_CONFIG.version) return res.json({ status: "OUTDATED" });
+
+  let player = await getPlayerData(uuid);
+  let updated = false;
+  if (!player.MIGUS) { player.MIGUS = []; updated = true; }
+  if (!player.ACTIVE_MIGU) { player.ACTIVE_MIGU = ""; updated = true; }
+  if (updated) await savePlayerData(uuid, player);
+
+  return res.json({
+      status: "OK",
+      duel_wager: MIGU_CONFIG.duel_wager,
+      cookie_cost: MIGU_CONFIG.cookie_cost
+  });
+});
+
+app.get('/migu/catch', async (req, res) => {
+  const { uuid, z, water, ground } = req.query;
+
+  await withLock(uuid, async () => {
+      let player = await getPlayerData(uuid);
+      if (!player.MIGUS) player.MIGUS = [];
+
+      if (player.M < MIGU_CONFIG.cookie_cost) {
+          return res.send(`Failed: You need ${MIGU_CONFIG.cookie_cost} F₵ to throw a Cookie. Do some GFN deliveries!`);
+      }
+      
+      player.M -= MIGU_CONFIG.cookie_cost;
+
+      let envClass = "Walker";
+      if (parseFloat(z) > 100) envClass = "Flyer";
+      else if (parseFloat(water) > parseFloat(ground)) envClass = "Swimmer";
+
+      let availableMigus = MIGU_LIST.filter(m => m.subClass.toLowerCase() === envClass.toLowerCase());
+      
+      if (availableMigus.length === 0) {
+          await savePlayerData(uuid, player);
+          return res.send(`The Cookie broke! Sadly, no Migus of type [${envClass}] are registered in the ecosystem here. (-${MIGU_CONFIG.cookie_cost} F₵)`);
+      }
+
+      if (Math.random() <= MIGU_CONFIG.catch_chance) {
+          const selected = availableMigus[Math.floor(Math.random() * availableMigus.length)];
+          player.MIGUS.push(selected.name);
+          player.ACTIVE_MIGU = selected.name; 
+          await savePlayerData(uuid, player);
+          return res.send(`SUCCESS! You caught a [${selected.name}] (Class: ${selected.mClass})! (-${MIGU_CONFIG.cookie_cost} F₵) | Balance: ${player.M} F₵`);
+      } else {
+          await savePlayerData(uuid, player);
+          return res.send(`The Migu broke the Cookie and fled! (-${MIGU_CONFIG.cookie_cost} F₵) | Balance: ${player.M} F₵`);
+      }
+  });
+});
+
+app.get('/migu/duel', async (req, res) => {
+  const { p1, p2 } = req.query;
+  const duelLockStr = [p1, p2].sort().join("_");
+  
+  await withLock(duelLockStr, async () => {
+      let player1 = await getPlayerData(p1);
+      let player2 = await getPlayerData(p2);
+
+      if (player1.M < MIGU_CONFIG.duel_wager) return res.send(`Duel Cancelled: Challenger doesn't have ${MIGU_CONFIG.duel_wager} F₵.`);
+      if (player2.M < MIGU_CONFIG.duel_wager) return res.send(`Duel Cancelled: Opponent doesn't have ${MIGU_CONFIG.duel_wager} F₵.`);
+
+      if (!player1.ACTIVE_MIGU || player1.ACTIVE_MIGU === "") return res.send("Duel Cancelled: Challenger has no active Migu.");
+      if (!player2.ACTIVE_MIGU || player2.ACTIVE_MIGU === "") return res.send("Duel Cancelled: Opponent has no active Migu.");
+
+      const p1Rolo = Math.random();
+      const p2Rolo = Math.random();
+
+      if (p1Rolo > p2Rolo) {
+          player1.M += MIGU_CONFIG.duel_wager;
+          player2.M -= MIGU_CONFIG.duel_wager;
+          await savePlayerData(p1, player1);
+          await savePlayerData(p2, player2);
+          return res.send(`⚔️ CHALLENGER WINS! [${player1.ACTIVE_MIGU}] defeated [${player2.ACTIVE_MIGU}]. Won ${MIGU_CONFIG.duel_wager} F₵!`);
+      } else {
+          player2.M += MIGU_CONFIG.duel_wager;
+          player1.M -= MIGU_CONFIG.duel_wager;
+          await savePlayerData(p1, player1);
+          await savePlayerData(p2, player2);
+          return res.send(`⚔️ DEFENDER WINS! [${player2.ACTIVE_MIGU}] destroyed [${player1.ACTIVE_MIGU}]. Challenger lost ${MIGU_CONFIG.duel_wager} F₵!`);
+      }
+  });
+});
+// ========================================================
+// END MIGUS ROUTES
+// ========================================================
+
+
+// YOUR EXISTING ROUTES (UNCHANGED)
 app.post('/admin/parcel', requireToken, async (req, res) => {
   const { action, serverId, uuid, pos, regionName, num, newPos } = req.body;
   if (!serverId) return res.status(400).json({ error: "serverId obrigatório" });
@@ -360,8 +514,7 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       for (let srv of servers) {
         let mData = await dbGet(srv) || "";
         let mList = mData ? mData.split("ç") : [];
-        let joined = [await dbGet(`${srv}_NAMES_1`), await dbGet(`${srv}_NAMES_2`), await dbGet(`${srv}_NAMES_3`), await dbGet(`${srv}_NAMES_4`), await dbGet(`${srv}_NAMES_5`)]
-.filter(Boolean).join("ç");
+        let joined = [await dbGet(`${srv}_NAMES_1`), await dbGet(`${srv}_NAMES_2`), await dbGet(`${srv}_NAMES_3`), await dbGet(`${srv}_NAMES_4`), await dbGet(`${srv}_NAMES_5`)].filter(Boolean).join("ç");
         let nList = joined ? joined.split("ç") : [];
         while (nList.length < mList.length) nList.push("NULL");
 
@@ -375,8 +528,7 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
 
       let targetMainData = await dbGet(targetServer) || ""; 
       let targetMainList = targetMainData ? targetMainData.split("ç") : [];
-      let tJoined = [await dbGet(`${targetServer}_NAMES_1`), await dbGet(`${targetServer}_NAMES_2`), await dbGet(`${targetServer}_NAMES_3`), await dbGet(`${targetServer}_NAMES_4`), await dbGet(`${targetServer}_NAMES_5`)]
-.filter(Boolean).join("ç");
+      let tJoined = [await dbGet(`${targetServer}_NAMES_1`), await dbGet(`${targetServer}_NAMES_2`), await dbGet(`${targetServer}_NAMES_3`), await dbGet(`${targetServer}_NAMES_4`), await dbGet(`${targetServer}_NAMES_5`)].filter(Boolean).join("ç");
       let targetNamesList = tJoined ? tJoined.split("ç") : [];
       while (targetNamesList.length < targetMainList.length) targetNamesList.push("NULL");
 
@@ -387,8 +539,7 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
     else {
       let mainData = await dbGet(targetServer) || ""; 
       let mainList = mainData ? mainData.split("ç") : [];
-      let joined = [await dbGet(`${targetServer}_NAMES_1`), await dbGet(`${targetServer}_NAMES_2`), await dbGet(`${targetServer}_NAMES_3`), await dbGet(`${targetServer}_NAMES_4`), await dbGet(`${targetServer}_NAMES_5`)]
-.filter(Boolean).join("ç");
+      let joined = [await dbGet(`${targetServer}_NAMES_1`), await dbGet(`${targetServer}_NAMES_2`), await dbGet(`${targetServer}_NAMES_3`), await dbGet(`${targetServer}_NAMES_4`), await dbGet(`${targetServer}_NAMES_5`)].filter(Boolean).join("ç");
       let namesList = joined ? joined.split("ç") : [];
       while (namesList.length < mainList.length) namesList.push("NULL");
 
@@ -431,8 +582,7 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
         let mainList = mainData ? mainData.split("ç").filter(Boolean) : [];
         if (mainList.length === 0) continue;
 
-        let originalNames = [await dbGet(`${srv}_NAMES_1`), await dbGet(`${srv}_NAMES_2`), await dbGet(`${srv}_NAMES_3`), await dbGet(`${srv}_NAMES_4`), await dbGet(`${srv}_NAMES_5`)]
-.filter(Boolean).join("ç");
+        let originalNames = [await dbGet(`${srv}_NAMES_1`), await dbGet(`${srv}_NAMES_2`), await dbGet(`${srv}_NAMES_3`), await dbGet(`${srv}_NAMES_4`), await dbGet(`${srv}_NAMES_5`)].filter(Boolean).join("ç");
         let namesList = originalNames ? originalNames.split("ç") : [];
         while (namesList.length < mainList.length) namesList.push("NULL");
 
@@ -481,10 +631,6 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
   })();
 });
 
-
-// ========================================================
-// IMUNIDADE BLINDADA (Força Bruta e Ignora Maiúsculas/Sujeiras)
-// ========================================================
 async function isHubImmune(parcelUuid) {
   if (!parcelUuid) return false;
   let target = parcelUuid.toLowerCase().replace(/[^0-9a-f\-]/g, ""); 
@@ -520,32 +666,20 @@ async function isHubImmune(parcelUuid) {
           if (targetRegionName) break;
       }
 
-      const qBoosted = await db.query(`
-          SELECT id, value FROM kvstore 
-          WHERE id ILIKE '%boost%' 
-             OR id ILIKE '%event%' 
-             OR id ILIKE '%hub%'
-      `);
-      
+      const qBoosted = await db.query(`SELECT id, value FROM kvstore WHERE id ILIKE '%boost%' OR id ILIKE '%event%' OR id ILIKE '%hub%'`);
       for (let row of qBoosted.rows) {
           if (row.value && typeof row.value === 'string') {
               let valStr = row.value.toLowerCase();
               if (valStr.includes(target)) return true;
-              if (targetRegionName && targetRegionName.length > 2 && valStr.includes(targetRegionName)) {
-                  return true; 
-              }
+              if (targetRegionName && targetRegionName.length > 2 && valStr.includes(targetRegionName)) return true; 
           }
       }
-
-  } catch(e) {
-      console.error("Erro na blindagem de imunidade:", e);
-  }
+  } catch(e) { console.error("Erro imunidade:", e); }
   return false; 
 }
 
 async function processParcelDemand(parcelUuid, user) {
   if (!parcelUuid || parcelUuid.length < 36) return 1.0;
-  
   let cleanUuid = parcelUuid.toLowerCase().replace(/[^0-9a-f\-]/g, "");
   if (cleanUuid.length !== 36) return 1.0;
   
@@ -576,11 +710,9 @@ async function processParcelDemand(parcelUuid, user) {
             let recovered = (timeOffline / 600.0) * 0.15;
             parcel.mult = Math.min(1.0, parcel.mult + recovered);
          }
-         
          parcel.history.push(now);
          parcel.last_delivery = now; 
          parcel.user_history[user] = now;
-         
          parcel.mult = Math.max(0.1, parcel.mult - 0.1);
          parcel.mult = Math.round(parcel.mult * 10) / 10;
          await dbSet(key, JSON.stringify(parcel));
@@ -591,10 +723,8 @@ async function processParcelDemand(parcelUuid, user) {
 
 async function getParcelDemandOnly(parcelUuid) {
   if (!parcelUuid || parcelUuid.length < 36) return { mult: 1.0, last_delivery: 0 };
-  
   let cleanUuid = parcelUuid.toLowerCase().replace(/[^0-9a-f\-]/g, "");
   if (cleanUuid.length !== 36) return { mult: 1.0, last_delivery: 0 };
-  
   if (await isHubImmune(cleanUuid)) return { mult: 1.0, last_delivery: 0 };
   
   const key = `PARCEL_${cleanUuid}`;
@@ -604,20 +734,14 @@ async function getParcelDemandOnly(parcelUuid) {
       let parcel = JSON.parse(dataStr);
       let now = getUnixTime();
       let mult = parcel.mult;
-      
       if (parcel.last_delivery > 0 && mult < 1.0) {
          let timeOffline = now - parcel.last_delivery;
          let recovered = (timeOffline / 600.0) * 0.15;
          mult = Math.min(1.0, mult + recovered);
       }
-      
-      return { 
-          mult: Math.round(mult * 10) / 10, 
-          last_delivery: parcel.last_delivery || 0 
-      };
+      return { mult: Math.round(mult * 10) / 10, last_delivery: parcel.last_delivery || 0 };
   } catch (err) { return { mult: 1.0, last_delivery: 0 }; }
 }
-// ========================================================
 
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime, action } = req.body;
@@ -642,26 +766,19 @@ app.post("/action", requireToken, async (req, res) => {
         let demandMult = 1.0;
         let targetParcel = null;
 
-        // ========================================================
-        // ESPERA INTELIGENTE PELO LOG (gfn_admin_logs)
-        // ========================================================
         for (let i = 0; i < 8; i++) {
             if (player.ACTIVE_PARCEL && (now - player.PARCEL_TIME) < 1800) { 
                 targetParcel = player.ACTIVE_PARCEL.toLowerCase(); 
                 break;
             }
-            await new Promise(resolve => setTimeout(resolve, 500)); // Aguarda 500ms
-            player = await getPlayerData(user); // Re-lê os dados atualizados pelo log
+            await new Promise(resolve => setTimeout(resolve, 500));
+            player = await getPlayerData(user);
         }
 
-        if (targetParcel && targetParcel.length >= 36) {
-            demandMult = await processParcelDemand(targetParcel, user);
-        }
+        if (targetParcel && targetParcel.length >= 36) demandMult = await processParcelDemand(targetParcel, user);
 
         let savedParcelForAffinity = targetParcel; 
-
-        player.ACTIVE_PARCEL = "";
-        player.PARCEL_TIME = 0;
+        player.ACTIVE_PARCEL = ""; player.PARCEL_TIME = 0;
 
         if (demandMult < 1.0 && plan !== "EVENT") {
             price = Math.round(price * demandMult);
@@ -669,9 +786,7 @@ app.post("/action", requireToken, async (req, res) => {
             await addPlayerMessage(user, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +15% every 10 minutes without deliveries.`);
         }
 
-        let recebido = 0;
-        let boost_m = 1.0;
-        let currentWeek = getCurrentWeek();
+        let recebido = 0; let boost_m = 1.0; let currentWeek = getCurrentWeek();
 
         if (player.P_W !== currentWeek) { player.P = 0; player.P_W = currentWeek; }
 
@@ -703,19 +818,16 @@ app.post("/action", requireToken, async (req, res) => {
             premiumBonus = Math.floor(price * 0.2); 
             await addPlayerMessage(user, "You won 20% more for being premium.");
           }
-          player.M += (price + premiumBonus);
-          recebido = price + premiumBonus;
+          player.M += (price + premiumBonus); recebido = price + premiumBonus;
           await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         } 
         else if (plan === "TEST_CARGO") {
           if (player.TC_W !== currentWeek) { player.TC_V = 0; player.TC_W = currentWeek; }
-          if (player.TC_V >= MAX_TC) {
-            await addPlayerMessage(user, `You have reached the limit of ${MAX_TC} F₵ in your test cargo plan this week.`);
-          } else {
+          if (player.TC_V >= MAX_TC) await addPlayerMessage(user, `You have reached the limit of ${MAX_TC} F₵ in your test cargo plan this week.`);
+          else {
             if (player.TC_V + price >= MAX_TC) {
               let resto = MAX_TC - player.TC_V;
-              player.TC_V = MAX_TC;
-              player.M += resto; recebido = resto;
+              player.TC_V = MAX_TC; player.M += resto; recebido = resto;
               await addPlayerMessage(user, `You won ${resto} F₵.`);
             } else {
               player.TC_V += price; player.M += price; recebido = price;
@@ -727,13 +839,11 @@ app.post("/action", requireToken, async (req, res) => {
         } 
         else if (plan === "EVENT") {
           if (player.EV_W !== currentWeek) { player.EV_V = 0; player.EV_W = currentWeek; }
-          if (player.EV_V >= MAX_EV) {
-            await addPlayerMessage(user, `You have reached the limit of ${MAX_EV} F₵ in your event plan this week.`);
-          } else {
+          if (player.EV_V >= MAX_EV) await addPlayerMessage(user, `You have reached the limit of ${MAX_EV} F₵ in your event plan this week.`);
+          else {
             if (player.EV_V + price >= MAX_EV) {
               let resto = MAX_EV - player.EV_V;
-              player.EV_V = MAX_EV;
-              player.M += resto; recebido = resto;
+              player.EV_V = MAX_EV; player.M += resto; recebido = resto;
               await addPlayerMessage(user, `You won ${resto} F₵.`);
             } else {
               player.EV_V += price; player.M += price; recebido = price;
@@ -744,13 +854,11 @@ app.post("/action", requireToken, async (req, res) => {
           await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         } 
         else if (plan === "FREE") {
-          if (player.RE >= MAX_F) {
-            await addPlayerMessage(user, `You have reached the limit of ${MAX_F} F₵ in your free plan.`);
-          } else {
+          if (player.RE >= MAX_F) await addPlayerMessage(user, `You have reached the limit of ${MAX_F} F₵ in your free plan.`);
+          else {
             if (player.RE + price >= MAX_F) {
               let resto = MAX_F - player.RE;
-              player.RE = MAX_F;
-              player.M += resto; recebido = resto;
+              player.RE = MAX_F; player.M += resto; recebido = resto;
               await addPlayerMessage(user, `You won ${resto} F₵.`);
             } else {
               player.RE += price; player.M += price; recebido = price;
@@ -760,25 +868,17 @@ app.post("/action", requireToken, async (req, res) => {
           await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         }
 
-        // ========================================================
-        // FEATURE: PROCESSAMENTO E EXPIRAÇÃO INDIVIDUAL DE AFINIDADE
-        // ========================================================
         if (!player.AFFINITY) player.AFFINITY = {};
         if (!player.AFFINITY_TIME) player.AFFINITY_TIME = {};
 
         for (let hubUuid in player.AFFINITY) {
             let lastTime = player.AFFINITY_TIME[hubUuid] || 0;
-            if (lastTime === 0) {
-                player.AFFINITY_TIME[hubUuid] = now;
-            } else if ((now - lastTime) > 604800) {
-                delete player.AFFINITY[hubUuid];
-                delete player.AFFINITY_TIME[hubUuid];
-            }
+            if (lastTime === 0) player.AFFINITY_TIME[hubUuid] = now;
+            else if ((now - lastTime) > 604800) { delete player.AFFINITY[hubUuid]; delete player.AFFINITY_TIME[hubUuid]; }
         }
 
         if (savedParcelForAffinity && savedParcelForAffinity.length >= 36) {
             player.AFFINITY_TIME[savedParcelForAffinity] = now;
-
             let currentAffinity = parseFloat(player.AFFINITY[savedParcelForAffinity]) || 0.0;
             let distance = player.LAST_DIST || 0;
             let addedAffinity = 0;
@@ -789,7 +889,6 @@ app.post("/action", requireToken, async (req, res) => {
                     currentAffinity = Math.min(0.5, currentAffinity + 0.01);
                     currentAffinity = Math.round(currentAffinity * 100) / 100;
                     player.AFFINITY[savedParcelForAffinity] = currentAffinity;
-
                     await addPlayerMessage(user, `Your affinity with this HUB has increased by +${addedAffinity}. You now have ${currentAffinity} total affinity with this HUB.`);
                 }
             }
@@ -797,16 +896,13 @@ app.post("/action", requireToken, async (req, res) => {
             if (currentAffinity > 0 && price > 0) {
                 let affinityBonus = Math.round(price * currentAffinity);
                 if (affinityBonus > 0) {
-                    player.M += affinityBonus;
-                    recebido += affinityBonus;
+                    player.M += affinityBonus; recebido += affinityBonus;
                     await addPlayerMessage(user, `You received an extra payout of ${affinityBonus} F₵ due to the affinity bonus (${currentAffinity}x / ${(currentAffinity * 100).toFixed(0)}%) with this HUB.`);
                     await addPlayerMessage(user, `You have now ${player.M} F₵.`);
                 }
             }
         }
         player.LAST_DIST = 0; 
-        // ========================================================
-
         await savePlayerData(user, player);
         responsePayload.recebido = recebido;
       } 
@@ -816,20 +912,12 @@ app.post("/action", requireToken, async (req, res) => {
         let player = await getPlayerData(user);
         let now = getUnixTime();
 
-        if (add_time > 31536000) {
-            add_time = 604800; 
-        }
-
+        if (add_time > 31536000) add_time = 604800; 
         let current_time = player.B_T;
-        
-        if (current_time < now) {
-            current_time = now;
-        }
+        if (current_time < now) current_time = now;
         
         current_time += add_time; 
-
-        player.B_M = add_mult; 
-        player.B_T = current_time;
+        player.B_M = add_mult; player.B_T = current_time;
         await savePlayerData(user, player);
       }
       else if (safeTopic === "check") {
@@ -857,19 +945,16 @@ app.post("/action", requireToken, async (req, res) => {
       }
       else if (safeTopic === "pay") {
         let amountVal = parseInt(content) || 0;
-        
         if (amountVal <= 0) {
             await addPlayerMessage(user, "⚠️ Denied: You cannot transfer zero or negative amounts.");
             return res.json({ status: "denied" });
         }
-        
         if (amountVal > MAX_TRANSACTION) amountVal = MAX_TRANSACTION;
 
         if (plan === "GOD") {
             let tPlayer = await getPlayerData(target);
             tPlayer.M += amountVal; 
             await savePlayerData(target, tPlayer);
-            
             await addPlayerMessage(user, `[ADMIN PAY] You paid ${amountVal} F₵ to secondlife:///app/agent/${target}/inspect.`);
             await addPlayerMessage(target, `⚠️ An ADMIN has paid you ${amountVal} F₵. Your balance is now ${tPlayer.M} F₵.`);
         } else {
@@ -884,10 +969,8 @@ app.post("/action", requireToken, async (req, res) => {
             }
 
             let tPlayer = await getPlayerData(target);
-            sender.M -= amountVal; 
-            tPlayer.M += amountVal;
-            await savePlayerData(user, sender); 
-            await savePlayerData(target, tPlayer);
+            sender.M -= amountVal; tPlayer.M += amountVal;
+            await savePlayerData(user, sender); await savePlayerData(target, tPlayer);
             
             await addPlayerMessage(user, `You successfully paid ${amountVal} F₵ to secondlife:///app/agent/${target}/about. Your new balance: ${sender.M} F₵`);
             await addPlayerMessage(target, `You received ${amountVal} F₵ from secondlife:///app/agent/${user}/about. Your new balance: ${tPlayer.M} F₵`);
@@ -909,18 +992,13 @@ app.post("/action", requireToken, async (req, res) => {
         await addPlayerMessage(user, `SWEEP COMPLETED! Accounts limited to ${maxValue} F₵.`);
         responsePayload.status = "success";
       }
-      // ========================================================
-      // NOVO COMANDO: ZERAR BOOSTS DE TODOS OS PLAYERS
-      // ========================================================
       else if (safeTopic === "mass_boost_reset") {
         const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
         for (let row of q.rows) {
           try {
             let pData = JSON.parse(row.value);
-            // Só atualiza quem realmente tem boost para economizar I/O no banco
             if (pData.B_T > 0 || pData.B_M !== 1.0) {
-                pData.B_T = 0;
-                pData.B_M = 1.0;
+                pData.B_T = 0; pData.B_M = 1.0;
                 await db.query("UPDATE kvstore SET value = $1 WHERE id = $2", [JSON.stringify(pData), row.id]);
             }
           } catch(e) {}
@@ -928,7 +1006,6 @@ app.post("/action", requireToken, async (req, res) => {
         await addPlayerMessage(user, "SWEEP COMPLETED! All player boosts and weeks have been reset.");
         responsePayload.status = "success";
       }
-      // ========================================================
       else if (safeTopic === "buy") {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) { responsePayload.status = "denied"; return res.json(responsePayload); }
@@ -986,9 +1063,6 @@ app.get("/get", async (req, res) => {
     const q = await db.query("SELECT value FROM kvstore WHERE id=$1", [id]);
     let val = q.rowCount === 0 ? null : q.rows[0].value;
     
-    // ========================================================
-    // CORREÇÃO DO RELÓGIO
-    // ========================================================
     if (val && id.startsWith("PARCEL_")) {
         try {
             let parcel = JSON.parse(val);
@@ -1012,9 +1086,6 @@ app.post("/set", requireToken, async (req, res) => {
   if (!id) return res.status(400).json({ error: "missing id" });
   
   try {
-    // ========================================================
-    // INTERCEPTADOR: LÊ O LOG E ATUALIZA O PLAYER NO BANCO
-    // ========================================================
     if (id === "gfn_admin_logs" && value) {
         let logs = value.split("|#|").filter(Boolean);
         let lastLog = logs[logs.length - 1] || "";
@@ -1033,14 +1104,12 @@ app.post("/set", requireToken, async (req, res) => {
                 
                 let distMatch = lastLog.match(/(?:dist(?:ancia|ance)?[:\s]*)([\d,\.]+)\s*m?/i) || lastLog.match(/([\d,\.]+)\s*m\b/i);
                 let distance = 0;
-                if (distMatch) {
-                    distance = parseFloat(distMatch[1].replace(',', '.')) || 0;
-                } else {
+                if (distMatch) distance = parseFloat(distMatch[1].replace(',', '.')) || 0;
+                else {
                     let numMatch = lastLog.match(/(\d+)\s*(?:m|metros)/i);
                     if (numMatch) distance = parseFloat(numMatch[1]) || 0;
                 }
                 pData.LAST_DIST = distance;
-
                 await savePlayerData(playerUuid, pData);
             } 
             else if (lastLog.toLowerCase().includes("cargo loaded") || lastLog.includes("Action: Cargo Loaded")) {
@@ -1053,21 +1122,12 @@ app.post("/set", requireToken, async (req, res) => {
             }
         }
     }
-    // ========================================================
 
-    await db.query(
-      `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, 
-      [id, value]
-    );
-
-    if (id === "GLOBAL_SETTINGS") {
-        await loadGlobalSettings();
-    }
+    await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, [id, value]);
+    if (id === "GLOBAL_SETTINGS") await loadGlobalSettings();
 
     res.json({ status: "ok", id, value });
-  } catch (e) { 
-    res.status(500).json({ error: "db error" }); 
-  }
+  } catch (e) { res.status(500).json({ error: "db error" }); }
 });
 
 app.get("/", (req, res) => res.json({ status: "ok" }));
