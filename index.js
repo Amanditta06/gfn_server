@@ -399,6 +399,17 @@ app.get('/migu/config', async (req, res) => {
   });
 });
 
+app.get('/migu/check-funds', async (req, res) => {
+  const { uuid } = req.query;
+  let player = await getPlayerData(uuid);
+  
+  if (player.M >= MIGU_CONFIG.cookie_cost) {
+      return res.json({ status: "OK", balance: player.M });
+  } else {
+      return res.json({ status: "INSUFFICIENT", balance: player.M });
+  }
+});
+
 app.get('/migu/catch', async (req, res) => {
   const { uuid, z, water, ground } = req.query;
 
