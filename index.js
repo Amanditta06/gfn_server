@@ -61,13 +61,11 @@ async function loadGlobalSettings() {
       if (parts[8] !== undefined && !isNaN(parseInt(parts[8]))) MAX_F = parseInt(parts[8]);
     }
 
-    // Load Migu Configs
     const mCfgRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["MIGU_CONFIG"]);
     if (mCfgRes.rowCount > 0 && mCfgRes.rows[0].value) {
         MIGU_CONFIG = { ...MIGU_CONFIG, ...JSON.parse(mCfgRes.rows[0].value) };
     }
 
-    // Load Migu Database
     const mListRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["MIGU_LIST"]);
     if (mListRes.rowCount > 0 && mListRes.rows[0].value) {
         MIGU_LIST = JSON.parse(mListRes.rows[0].value);
@@ -288,8 +286,22 @@ async function getPlayerData(uuid) {
       data.LAST_DIST = parseFloat(data.LAST_DIST) || 0;
       data.AFFINITY = parsedData.AFFINITY || {};
       data.AFFINITY_TIME = parsedData.AFFINITY_TIME || {};
-      data.MIGUS = parsedData.MIGUS || [];
       data.ACTIVE_MIGU = parsedData.ACTIVE_MIGU || "";
+
+      // MIGUS CONVERSION & STRUCTURE UPGRADE
+      if (parsedData.MIGUS) {
+        data.MIGUS = parsedData.MIGUS.map(m => {
+            if (typeof m === 'string') {
+                return { name: m, mClass: "Unknown", subClass: "Walker", rarity: "Common", power: 30, maxPower: 130, hp: 30, maxHp: 130 };
+            }
+            if (!m.maxPower) m.maxPower = m.power + 100;
+            if (!m.maxHp) m.maxHp = m.hp + 100;
+            if (!m.rarity) m.rarity = "Common";
+            return m;
+        });
+      } else {
+        data.MIGUS = [];
+      }
 
       let now = getUnixTime();
       let maxAllowedFuture = now + (5 * 365 * 24 * 60 * 60); 
@@ -321,7 +333,6 @@ app.post('/admin/migu/add', requireToken, async (req, res) => {
     const { name, mClass, subClass, image } = req.body;
     if (!name || !mClass || !subClass) return res.status(400).json({ error: "Missing Migu properties" });
 
-    // Check if exists, overwrite if true
     let idx = MIGU_LIST.findIndex(m => m.name.toLowerCase() === name.toLowerCase());
     if (idx !== -1) {
         MIGU_LIST[idx] = { name, mClass, subClass, image };
@@ -337,11 +348,9 @@ app.post('/admin/migu/delete', requireToken, async (req, res) => {
     const { name } = req.body;
     if (!name) return res.status(400).json({ error: "Missing name" });
 
-    // 1. Remove from global list
     MIGU_LIST = MIGU_LIST.filter(m => m.name.toLowerCase() !== name.toLowerCase());
     await dbSet("MIGU_LIST", JSON.stringify(MIGU_LIST));
 
-    // 2. Iterate players and compensate
     let affectedPlayers = 0;
     try {
         const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
@@ -352,13 +361,14 @@ app.post('/admin/migu/delete', requireToken, async (req, res) => {
                     let count = 0;
                     let newInventory = [];
                     for (let m of pData.MIGUS) {
-                        if (m.toLowerCase() === name.toLowerCase()) count++;
+                        let mName = (typeof m === 'string') ? m : m.name;
+                        if (mName.toLowerCase() === name.toLowerCase()) count++;
                         else newInventory.push(m);
                     }
                     if (count > 0) {
                         pData.MIGUS = newInventory;
                         if (pData.ACTIVE_MIGU && pData.ACTIVE_MIGU.toLowerCase() === name.toLowerCase()) {
-                            pData.ACTIVE_MIGU = "";
+                            pData.ACTIVE_MIGU = pData.MIGUS.length > 0 ? pData.MIGUS[0].name : "";
                         }
                         let compensation = count * 10000;
                         pData.M += compensation;
@@ -410,12 +420,40 @@ app.get('/migu/check-funds', async (req, res) => {
   }
 });
 
+app.get('/migu/inventory', async (req, res) => {
+  const { uuid } = req.query;
+  let player = await getPlayerData(uuid);
+  res.json({ status: "OK", migus: player.MIGUS || [] });
+});
+
+app.get('/migu/abandon', async (req, res) => {
+  const { uuid, name } = req.query;
+  await withLock(uuid, async () => {
+      let player = await getPlayerData(uuid);
+      if (!player.MIGUS) player.MIGUS = [];
+      let idx = player.MIGUS.findIndex(m => m.name.toLowerCase() === name.toLowerCase());
+      if (idx === -1) return res.send("Error: Migu not found in inventory.");
+      
+      player.MIGUS.splice(idx, 1);
+      if (player.ACTIVE_MIGU && player.ACTIVE_MIGU.toLowerCase() === name.toLowerCase()) {
+          player.ACTIVE_MIGU = player.MIGUS.length > 0 ? player.MIGUS[0].name : "";
+      }
+      await savePlayerData(uuid, player);
+      return res.send(`SUCCESS: Abandoned [${name}]. Released back into the wild.`);
+  });
+});
+
 app.get('/migu/catch', async (req, res) => {
   const { uuid, z, water, ground } = req.query;
 
   await withLock(uuid, async () => {
       let player = await getPlayerData(uuid);
       if (!player.MIGUS) player.MIGUS = [];
+
+      // Check Inventory Limit (Max 20)
+      if (player.MIGUS.length >= 20) {
+          return res.send(`Failed: Your Migu inventory is full (Max 20). Abandon a Migu to catch more!`);
+      }
 
       if (player.M < MIGU_CONFIG.cookie_cost) {
           return res.send(`Failed: You need ${MIGU_CONFIG.cookie_cost} F₵ to throw a Cookie. Do some GFN deliveries!`);
@@ -431,15 +469,37 @@ app.get('/migu/catch', async (req, res) => {
       
       if (availableMigus.length === 0) {
           await savePlayerData(uuid, player);
-          return res.send(`The Cookie broke! Sadly, no Migus of type [${envClass}] are registered in the ecosystem here. (-${MIGU_CONFIG.cookie_cost} F₵)`);
+          return res.send(`The Cookie broke! Sadly, no Migus of type [${envClass}] are registered here. (-${MIGU_CONFIG.cookie_cost} F₵)`);
       }
 
       if (Math.random() <= MIGU_CONFIG.catch_chance) {
           const selected = availableMigus[Math.floor(Math.random() * availableMigus.length)];
-          player.MIGUS.push(selected.name);
-          player.ACTIVE_MIGU = selected.name; 
+          
+          // RARITY & STATS ROLL (10 to 50 initial)
+          let rarityRoll = Math.random();
+          let rarity = "Common";
+          let minVal = 10, maxVal = 20;
+          if (rarityRoll < 0.10) { rarity = "Rare"; minVal = 36; maxVal = 50; }
+          else if (rarityRoll < 0.40) { rarity = "Uncommon"; minVal = 21; maxVal = 35; }
+
+          let initPower = Math.floor(Math.random() * (maxVal - minVal + 1)) + minVal;
+          let initHp = Math.floor(Math.random() * (maxVal - minVal + 1)) + minVal;
+
+          const newMigu = {
+              name: selected.name,
+              mClass: selected.mClass,
+              subClass: selected.subClass,
+              rarity: rarity,
+              power: initPower,
+              maxPower: initPower + 100,
+              hp: initHp,
+              maxHp: initHp + 100
+          };
+
+          player.MIGUS.push(newMigu);
+          if (!player.ACTIVE_MIGU) player.ACTIVE_MIGU = selected.name; 
           await savePlayerData(uuid, player);
-          return res.send(`SUCCESS! You caught a [${selected.name}] (Class: ${selected.mClass})! (-${MIGU_CONFIG.cookie_cost} F₵) | Balance: ${player.M} F₵`);
+          return res.send(`SUCCESS! You caught a [${selected.name}] (${rarity})! [P: ${initPower} | HP: ${initHp}] (-${MIGU_CONFIG.cookie_cost} F₵) | Slots: ${player.MIGUS.length}/20`);
       } else {
           await savePlayerData(uuid, player);
           return res.send(`The Migu broke the Cookie and fled! (-${MIGU_CONFIG.cookie_cost} F₵) | Balance: ${player.M} F₵`);
@@ -448,7 +508,7 @@ app.get('/migu/catch', async (req, res) => {
 });
 
 app.get('/migu/duel', async (req, res) => {
-  const { p1, p2 } = req.query;
+  const { p1, p2, m1, m2 } = req.query;
   const duelLockStr = [p1, p2].sort().join("_");
   
   await withLock(duelLockStr, async () => {
@@ -458,24 +518,43 @@ app.get('/migu/duel', async (req, res) => {
       if (player1.M < MIGU_CONFIG.duel_wager) return res.send(`Duel Cancelled: Challenger doesn't have ${MIGU_CONFIG.duel_wager} F₵.`);
       if (player2.M < MIGU_CONFIG.duel_wager) return res.send(`Duel Cancelled: Opponent doesn't have ${MIGU_CONFIG.duel_wager} F₵.`);
 
-      if (!player1.ACTIVE_MIGU || player1.ACTIVE_MIGU === "") return res.send("Duel Cancelled: Challenger has no active Migu.");
-      if (!player2.ACTIVE_MIGU || player2.ACTIVE_MIGU === "") return res.send("Duel Cancelled: Opponent has no active Migu.");
+      let p1Migu = player1.MIGUS.find(m => m.name.toLowerCase() === m1.toLowerCase());
+      let p2Migu = player2.MIGUS.find(m => m.name.toLowerCase() === m2.toLowerCase());
 
-      const p1Rolo = Math.random();
-      const p2Rolo = Math.random();
+      if (!p1Migu) return res.send(`Duel Cancelled: Challenger Migu [${m1}] not found.`);
+      if (!p2Migu) return res.send(`Duel Cancelled: Opponent Migu [${m2}] not found.`);
 
-      if (p1Rolo > p2Rolo) {
+      const p1Score = (p1Migu.power * 0.6 + p1Migu.hp * 0.4) * (0.8 + Math.random() * 0.4);
+      const p2Score = (p2Migu.power * 0.6 + p2Migu.hp * 0.4) * (0.8 + Math.random() * 0.4);
+
+      if (p1Score > p2Score) {
           player1.M += MIGU_CONFIG.duel_wager;
           player2.M -= MIGU_CONFIG.duel_wager;
+          
+          // Winner: +10 power, +10 hp (Capped at max)
+          p1Migu.power = Math.min(p1Migu.maxPower, p1Migu.power + 10);
+          p1Migu.hp = Math.min(p1Migu.maxHp, p1Migu.hp + 10);
+          // Loser: +5 power, +5 hp (Capped at max)
+          p2Migu.power = Math.min(p2Migu.maxPower, p2Migu.power + 5);
+          p2Migu.hp = Math.min(p2Migu.maxHp, p2Migu.hp + 5);
+
           await savePlayerData(p1, player1);
           await savePlayerData(p2, player2);
-          return res.send(`⚔️ CHALLENGER WINS! [${player1.ACTIVE_MIGU}] defeated [${player2.ACTIVE_MIGU}]. Won ${MIGU_CONFIG.duel_wager} F₵!`);
+          return res.send(`⚔️ CHALLENGER WINS!\n[${p1Migu.name}] (+10 P/HP) defeated [${p2Migu.name}] (+5 P/HP).\nWon ${MIGU_CONFIG.duel_wager} F₵!`);
       } else {
           player2.M += MIGU_CONFIG.duel_wager;
           player1.M -= MIGU_CONFIG.duel_wager;
+          
+          // Winner: +10 power, +10 hp
+          p2Migu.power = Math.min(p2Migu.maxPower, p2Migu.power + 10);
+          p2Migu.hp = Math.min(p2Migu.maxHp, p2Migu.hp + 10);
+          // Loser: +5 power, +5 hp
+          p1Migu.power = Math.min(p1Migu.maxPower, p1Migu.power + 5);
+          p1Migu.hp = Math.min(p1Migu.maxHp, p1Migu.hp + 5);
+
           await savePlayerData(p1, player1);
           await savePlayerData(p2, player2);
-          return res.send(`⚔️ DEFENDER WINS! [${player2.ACTIVE_MIGU}] destroyed [${player1.ACTIVE_MIGU}]. Challenger lost ${MIGU_CONFIG.duel_wager} F₵!`);
+          return res.send(`⚔️ DEFENDER WINS!\n[${p2Migu.name}] (+10 P/HP) destroyed [${p1Migu.name}] (+5 P/HP).\nChallenger lost ${MIGU_CONFIG.duel_wager} F₵!`);
       }
   });
 });
