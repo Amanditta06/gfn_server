@@ -267,7 +267,7 @@ app.post("/ack-msg", async (req, res) => {
 async function getPlayerData(uuid) {
   if (!uuid) return null;
   const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [`player_${uuid}`]);
-  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0, LAST_DIST: 0, AFFINITY: {}, AFFINITY_TIME: {}, MIGUS: [], ACTIVE_MIGU: "" };
+  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0, LAST_DIST: 0, AFFINITY: {}, AFFINITY_TIME: {}, MIGUS: [], ACTIVE_MIGU: "", COOKIE_STOCK: 0 };
   if (res.rowCount > 0) {
     try { 
       let parsedData = JSON.parse(res.rows[0].value);
@@ -287,8 +287,8 @@ async function getPlayerData(uuid) {
       data.AFFINITY = parsedData.AFFINITY || {};
       data.AFFINITY_TIME = parsedData.AFFINITY_TIME || {};
       data.ACTIVE_MIGU = parsedData.ACTIVE_MIGU || "";
+      data.COOKIE_STOCK = parseInt(data.COOKIE_STOCK, 10) || 0;
 
-      // MIGUS CONVERSION & STRUCTURE UPGRADE
       if (parsedData.MIGUS) {
         data.MIGUS = parsedData.MIGUS.map(m => {
             if (typeof m === 'string') {
@@ -375,7 +375,7 @@ app.post('/admin/migu/delete', requireToken, async (req, res) => {
                         await db.query("UPDATE kvstore SET value = $1 WHERE id = $2", [JSON.stringify(pData), row.id]);
                         
                         let pUuid = row.id.replace("player_", "");
-                        await addPlayerMessage(pUuid, `⚠️ The Migu [${name}] was permanently deleted from the system. You received ${compensation} F₵ as compensation for losing ${count} Migus.`);
+                        await addPlayerMessage(pUuid, `⚠️ The Migu [${name}] was permanently deleted. You received ${compensation} F₵ compensation.`);
                         affectedPlayers++;
                     }
                 }
@@ -413,17 +413,31 @@ app.get('/migu/check-funds', async (req, res) => {
   const { uuid } = req.query;
   let player = await getPlayerData(uuid);
   
-  if (player.M >= MIGU_CONFIG.cookie_cost) {
-      return res.json({ status: "OK", balance: player.M });
+  if (player.COOKIE_STOCK > 0 || player.M >= MIGU_CONFIG.cookie_cost) {
+      return res.json({ status: "OK", balance: player.M, cookie_stock: player.COOKIE_STOCK });
   } else {
-      return res.json({ status: "INSUFFICIENT", balance: player.M });
+      return res.json({ status: "INSUFFICIENT", balance: player.M, cookie_stock: player.COOKIE_STOCK });
   }
+});
+
+app.get('/migu/buy-cookie', async (req, res) => {
+  const { uuid } = req.query;
+  await withLock(uuid, async () => {
+      let player = await getPlayerData(uuid);
+      if (player.M < MIGU_CONFIG.cookie_cost) {
+          return res.send(`Failed: You need ${MIGU_CONFIG.cookie_cost} F₵ to buy a Taming Cookie.`);
+      }
+      player.M -= MIGU_CONFIG.cookie_cost;
+      player.COOKIE_STOCK = (player.COOKIE_STOCK || 0) + 1;
+      await savePlayerData(uuid, player);
+      return res.send(`SUCCESS: Bought 1 Taming Cookie! Stock: ${player.COOKIE_STOCK} | Balance: ${player.M} F₵`);
+  });
 });
 
 app.get('/migu/inventory', async (req, res) => {
   const { uuid } = req.query;
   let player = await getPlayerData(uuid);
-  res.json({ status: "OK", migus: player.MIGUS || [] });
+  res.json({ status: "OK", migus: player.MIGUS || [], cookie_stock: player.COOKIE_STOCK || 0 });
 });
 
 app.get('/migu/abandon', async (req, res) => {
@@ -450,16 +464,21 @@ app.get('/migu/catch', async (req, res) => {
       let player = await getPlayerData(uuid);
       if (!player.MIGUS) player.MIGUS = [];
 
-      // Check Inventory Limit (Max 20)
       if (player.MIGUS.length >= 20) {
           return res.send(`Failed: Your Migu inventory is full (Max 20). Abandon a Migu to catch more!`);
       }
 
-      if (player.M < MIGU_CONFIG.cookie_cost) {
-          return res.send(`Failed: You need ${MIGU_CONFIG.cookie_cost} F₵ to throw a Cookie. Do some GFN deliveries!`);
+      // Check Cookie Stock vs F₵
+      let usedStock = false;
+      if ((player.COOKIE_STOCK || 0) > 0) {
+          player.COOKIE_STOCK -= 1;
+          usedStock = true;
+      } else {
+          if (player.M < MIGU_CONFIG.cookie_cost) {
+              return res.send(`Failed: You need ${MIGU_CONFIG.cookie_cost} F₵ or a Cookie in stock!`);
+          }
+          player.M -= MIGU_CONFIG.cookie_cost;
       }
-      
-      player.M -= MIGU_CONFIG.cookie_cost;
 
       let envClass = "Walker";
       if (parseFloat(z) > 100) envClass = "Flyer";
@@ -469,13 +488,12 @@ app.get('/migu/catch', async (req, res) => {
       
       if (availableMigus.length === 0) {
           await savePlayerData(uuid, player);
-          return res.send(`The Cookie broke! Sadly, no Migus of type [${envClass}] are registered here. (-${MIGU_CONFIG.cookie_cost} F₵)`);
+          return res.send(`The Cookie broke! No Migus of type [${envClass}] registered here.`);
       }
 
       if (Math.random() <= MIGU_CONFIG.catch_chance) {
           const selected = availableMigus[Math.floor(Math.random() * availableMigus.length)];
           
-          // RARITY & STATS ROLL (10 to 50 initial)
           let rarityRoll = Math.random();
           let rarity = "Common";
           let minVal = 10, maxVal = 20;
@@ -499,10 +517,17 @@ app.get('/migu/catch', async (req, res) => {
           player.MIGUS.push(newMigu);
           if (!player.ACTIVE_MIGU) player.ACTIVE_MIGU = selected.name; 
           await savePlayerData(uuid, player);
-          return res.send(`SUCCESS! You caught a [${selected.name}] (${rarity})! [P: ${initPower} | HP: ${initHp}] (-${MIGU_CONFIG.cookie_cost} F₵) | Slots: ${player.MIGUS.length}/20`);
+          return res.send(`SUCCESS! Caught [${selected.name}] (${rarity})! [P:${initPower}|HP:${initHp}] | Stock: ${player.COOKIE_STOCK} | Bal: ${player.M}F₵`);
       } else {
+          // Retry Mechanic: 50% chance the Migu stays in place instead of fleeing
+          let willStay = Math.random() < 0.5;
           await savePlayerData(uuid, player);
-          return res.send(`The Migu broke the Cookie and fled! (-${MIGU_CONFIG.cookie_cost} F₵) | Balance: ${player.M} F₵`);
+
+          if (willStay) {
+              return res.send(`RETRY: The Migu resisted the Cookie, but stayed in place! Try again? (Stock: ${player.COOKIE_STOCK} | Bal: ${player.M}F₵)`);
+          } else {
+              return res.send(`FLED: The Migu broke the Cookie and fled into the wild! (Stock: ${player.COOKIE_STOCK} | Bal: ${player.M}F₵)`);
+          }
       }
   });
 });
@@ -531,10 +556,8 @@ app.get('/migu/duel', async (req, res) => {
           player1.M += MIGU_CONFIG.duel_wager;
           player2.M -= MIGU_CONFIG.duel_wager;
           
-          // Winner: +10 power, +10 hp (Capped at max)
           p1Migu.power = Math.min(p1Migu.maxPower, p1Migu.power + 10);
           p1Migu.hp = Math.min(p1Migu.maxHp, p1Migu.hp + 10);
-          // Loser: +5 power, +5 hp (Capped at max)
           p2Migu.power = Math.min(p2Migu.maxPower, p2Migu.power + 5);
           p2Migu.hp = Math.min(p2Migu.maxHp, p2Migu.hp + 5);
 
@@ -545,10 +568,8 @@ app.get('/migu/duel', async (req, res) => {
           player2.M += MIGU_CONFIG.duel_wager;
           player1.M -= MIGU_CONFIG.duel_wager;
           
-          // Winner: +10 power, +10 hp
           p2Migu.power = Math.min(p2Migu.maxPower, p2Migu.power + 10);
           p2Migu.hp = Math.min(p2Migu.maxHp, p2Migu.hp + 10);
-          // Loser: +5 power, +5 hp
           p1Migu.power = Math.min(p1Migu.maxPower, p1Migu.power + 5);
           p1Migu.hp = Math.min(p1Migu.maxHp, p1Migu.hp + 5);
 
@@ -1013,11 +1034,11 @@ app.post("/action", requireToken, async (req, res) => {
       else if (safeTopic === "check") {
         let player = await getPlayerData(user);
         await addPlayerMessage(user, `You have ${player.M} F₵.`);
-        await addPlayerMessage(user, `You have ${player.P} GFN points this week.`);
+        await addPlayerMessage(user, `You have ${player.COOKIE_STOCK} Taming Cookies in stock.`);
       }
       else if (safeTopic === "godcheck") {
         let tPlayer = await getPlayerData(target);
-        await addPlayerMessage(user, `[ADMIN CHECK] Target secondlife:///app/agent/${target}/inspect Balance: ${tPlayer.M} F₵ | Points: ${tPlayer.P}`);
+        await addPlayerMessage(user, `[ADMIN CHECK] Target secondlife:///app/agent/${target}/inspect Balance: ${tPlayer.M} F₵ | Cookies: ${tPlayer.COOKIE_STOCK}`);
       }
       else if (safeTopic === "m_reset") {
         let tPlayer = await getPlayerData(target);
