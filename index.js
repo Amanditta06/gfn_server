@@ -1033,7 +1033,11 @@ app.post("/action", requireToken, async (req, res) => {
       }
       else if (safeTopic === "check") {
         let player = await getPlayerData(user);
+        let currentWeek = getCurrentWeek();
+        let weeklyPoints = (player.P_W === currentWeek) ? (player.P || 0) : 0;
+        
         await addPlayerMessage(user, `You have ${player.M} F₵.`);
+        await addPlayerMessage(user, `You have ${weeklyPoints} points this week.`);
         await addPlayerMessage(user, `You have ${player.COOKIE_STOCK} Taming Cookies in stock.`);
       }
       else if (safeTopic === "godcheck") {
