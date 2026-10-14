@@ -318,7 +318,6 @@ async function savePlayerData(uuid, data) {
 // ========================================================
 // MIGUS ADMIN ROUTES
 // ========================================================
-
 app.post('/admin/migu/config', requireToken, async (req, res) => {
     const { version, duel_wager, cookie_cost } = req.body;
     if (version) MIGU_CONFIG.version = version;
@@ -391,7 +390,6 @@ app.post('/admin/migu/delete', requireToken, async (req, res) => {
 // ========================================================
 // MIGUS GAMEPLAY ROUTES
 // ========================================================
-
 app.get('/migu/config', async (req, res) => {
   const { version, uuid } = req.query;
   if (version !== MIGU_CONFIG.version) return res.json({ status: "OUTDATED" });
@@ -468,7 +466,6 @@ app.get('/migu/catch', async (req, res) => {
           return res.send(`Failed: Your Migu inventory is full (Max 20). Abandon a Migu to catch more!`);
       }
 
-      // Check Cookie Stock vs F₵
       let usedStock = false;
       if ((player.COOKIE_STOCK || 0) > 0) {
           player.COOKIE_STOCK -= 1;
@@ -519,7 +516,6 @@ app.get('/migu/catch', async (req, res) => {
           await savePlayerData(uuid, player);
           return res.send(`SUCCESS! Caught [${selected.name}] (${rarity})! [P:${initPower}|HP:${initHp}] | Stock: ${player.COOKIE_STOCK} | Bal: ${player.M}F₵`);
       } else {
-          // Retry Mechanic: 50% chance the Migu stays in place instead of fleeing
           let willStay = Math.random() < 0.5;
           await savePlayerData(uuid, player);
 
@@ -584,7 +580,9 @@ app.get('/migu/duel', async (req, res) => {
 // ========================================================
 
 
-// YOUR EXISTING ROUTES (UNCHANGED)
+// ========================================================
+// CORE ADMIN PARCEL ROUTE
+// ========================================================
 app.post('/admin/parcel', requireToken, async (req, res) => {
   const { action, serverId, uuid, pos, regionName, num, newPos } = req.body;
   if (!serverId) return res.status(400).json({ error: "serverId obrigatório" });
@@ -647,6 +645,52 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       targetNamesList.push(cleanRegion);
       await saveServerChunks(targetServer, targetMainList, targetNamesList);
     } 
+    // ==============================================
+    // NOVO BLOCO: TRANSFERÊNCIA PERFEITA DE CONTINENTE
+    // ==============================================
+    else if (action === "MOVE_HUB") {
+      let foundItem = null;
+      let foundName = null;
+      let originServer = null;
+
+      // 1. Procurar a parcela em TODOS os continentes e REMOVÊ-LA
+      for (let srv of servers) {
+        let mData = await dbGet(srv) || "";
+        let mList = mData ? mData.split("ç") : [];
+        
+        let idx = mList.findIndex(item => item.startsWith(uuid + "#"));
+        if (idx !== -1) {
+          originServer = srv;
+          let joined = [await dbGet(`${srv}_NAMES_1`), await dbGet(`${srv}_NAMES_2`), await dbGet(`${srv}_NAMES_3`), await dbGet(`${srv}_NAMES_4`), await dbGet(`${srv}_NAMES_5`)].filter(Boolean).join("ç");
+          let nList = joined ? joined.split("ç") : [];
+          while (nList.length < mList.length) nList.push("NULL");
+
+          // Remove da origem mantendo o valor extato intacto
+          foundItem = mList.splice(idx, 1)[0];
+          foundName = nList.splice(idx, 1)[0];
+
+          await saveServerChunks(srv, mList, nList);
+          break; // Encontrado e limpo, sai do loop
+        }
+      }
+
+      if (!foundItem) {
+          return res.status(404).json({ error: "Parcela não encontrada em nenhum continente ativo para mover." });
+      }
+
+      // 2. Inserir a parcela no servidor DESTINO (targetServer)
+      let destMainData = await dbGet(targetServer) || "";
+      let destMainList = destMainData ? destMainData.split("ç") : [];
+      let tJoined = [await dbGet(`${targetServer}_NAMES_1`), await dbGet(`${targetServer}_NAMES_2`), await dbGet(`${targetServer}_NAMES_3`), await dbGet(`${targetServer}_NAMES_4`), await dbGet(`${targetServer}_NAMES_5`)].filter(Boolean).join("ç");
+      let destNamesList = tJoined ? tJoined.split("ç") : [];
+      while (destNamesList.length < destMainList.length) destNamesList.push("NULL");
+
+      destMainList.push(foundItem);
+      destNamesList.push(foundName);
+      await saveServerChunks(targetServer, destMainList, destNamesList);
+      
+    }
+    // ==============================================
     else {
       let mainData = await dbGet(targetServer) || ""; 
       let mainList = mainData ? mainData.split("ç") : [];
