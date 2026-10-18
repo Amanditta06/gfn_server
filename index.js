@@ -33,6 +33,31 @@ let MAX_TRANSACTION = 1000000;
 let MIGU_CONFIG = { version: "1.0", duel_wager: 50, cookie_cost: 10, catch_chance: 0.55 };
 let MIGU_LIST = []; // Array of { name, mClass, subClass, image }
 
+// ========================================================
+// DREDGE SYSTEM GLOBAL CACHE & CONSTANTS
+// ========================================================
+const DREDGE_RADIUS = 25.0; // 25m radius = 50m total diameter
+const DREDGE_DIAMETER = 50.0; // Minimum center-to-center distance for zero overlap
+const DREDGE_RESTORE_SECONDS = 86400; // 24 hours (1 full day)
+
+let DREDGE_VERSION = "1.0";
+let DREDGE_CONFIG = {
+  sandPrice: 0.5,
+  gravelPrice: 1.0,
+  clayPrice: 1.8,
+  ironPrice: 3.5,
+  copperPrice: 7.0,
+  titaniumPrice: 14.0,
+  silverPrice: 30.0,
+  goldPrice: 75.0,
+  platinumPrice: 150.0,
+  diamondPrice: 400.0,
+  weightMult: 1.0,
+  maxCapacityKg: 5000.0,
+  pointsPct: 0.10
+};
+let DREDGE_ZONES = []; // Array of { x: float, y: float, time: unixTimestamp }
+
 const globalDebounce = new Set();
 const mutexes = {};
 
@@ -51,6 +76,150 @@ async function withLock(key, fn) {
   }
 }
 
+const getUnixTime = () => Math.floor(Date.now() / 1000);
+const getCurrentWeek = () => Math.floor((getUnixTime() + 345600) / 604800);
+let activeServerWeek = getCurrentWeek();
+
+function parseDredgeSettingsString(valStr) {
+  if (!valStr) return;
+  const parts = valStr.split("|");
+  if (parts.length >= 13) {
+    DREDGE_CONFIG.sandPrice = parseFloat(parts[0]) || 0.5;
+    DREDGE_CONFIG.gravelPrice = parseFloat(parts[1]) || 1.0;
+    DREDGE_CONFIG.clayPrice = parseFloat(parts[2]) || 1.8;
+    DREDGE_CONFIG.ironPrice = parseFloat(parts[3]) || 3.5;
+    DREDGE_CONFIG.copperPrice = parseFloat(parts[4]) || 7.0;
+    DREDGE_CONFIG.titaniumPrice = parseFloat(parts[5]) || 14.0;
+    DREDGE_CONFIG.silverPrice = parseFloat(parts[6]) || 30.0;
+    DREDGE_CONFIG.goldPrice = parseFloat(parts[7]) || 75.0;
+    DREDGE_CONFIG.platinumPrice = parseFloat(parts[8]) || 150.0;
+    DREDGE_CONFIG.diamondPrice = parseFloat(parts[9]) || 400.0;
+    DREDGE_CONFIG.weightMult = parseFloat(parts[10]) || 1.0;
+    DREDGE_CONFIG.maxCapacityKg = parseFloat(parts[11]) || 5000.0;
+    DREDGE_CONFIG.pointsPct = parseFloat(parts[12]) || 0.10;
+  }
+}
+
+async function pruneExpiredDredgeZones() {
+  const now = getUnixTime();
+  const initialLen = DREDGE_ZONES.length;
+  DREDGE_ZONES = DREDGE_ZONES.filter(z => (now - z.time) < DREDGE_RESTORE_SECONDS);
+  if (DREDGE_ZONES.length !== initialLen && DATABASE_URL) {
+    try {
+      await db.query(
+        `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`,
+        ["DREDGE_ZONES", JSON.stringify(DREDGE_ZONES)]
+      );
+    } catch (e) {}
+  }
+}
+
+// Calculates exact geometric overlap fraction of a 25m-radius (50m diameter) circle at (targetX, targetY)
+// against all active depleted 25m-radius circles in DREDGE_ZONES.
+function calculateDredgeDepletion(targetX, targetY) {
+  const now = getUnixTime();
+  const overlapping = [];
+  let maxRestoreTime = 0;
+
+  for (const z of DREDGE_ZONES) {
+    if ((now - z.time) >= DREDGE_RESTORE_SECONDS) continue;
+    const dx = targetX - z.x;
+    const dy = targetY - z.y;
+    const dist = Math.hypot(dx, dy);
+    if (dist < DREDGE_DIAMETER) {
+      overlapping.push({ x: z.x, y: z.y, time: z.time, dist });
+      const restoreAt = z.time + DREDGE_RESTORE_SECONDS;
+      if (restoreAt > maxRestoreTime) maxRestoreTime = restoreAt;
+    }
+  }
+
+  if (overlapping.length === 0) {
+    return { depletedFraction: 0.0, remainingSeconds: 0 };
+  }
+
+  const remainingSeconds = Math.max(1, maxRestoreTime - now);
+
+  // Direct hit on an already depleted center
+  for (const z of overlapping) {
+    if (z.dist <= 0.05) {
+      return { depletedFraction: 1.0, remainingSeconds };
+    }
+  }
+
+  const R = DREDGE_RADIUS;
+
+  // Exact analytical Circle-Circle intersection formula when overlapping 1 zone
+  if (overlapping.length === 1) {
+    const d = overlapping[0].dist;
+    const part1 = 2.0 * R * R * Math.acos(d / (2.0 * R));
+    const part2 = 0.5 * d * Math.sqrt(4.0 * R * R - d * d);
+    const intersectionArea = part1 - part2;
+    const totalArea = Math.PI * R * R;
+    const frac = Math.min(1.0, Math.max(0.0, intersectionArea / totalArea));
+    return { depletedFraction: frac, remainingSeconds };
+  }
+
+  // High-precision 2D grid integration (~31,415 points) when overlapping multiple zones
+  const R2 = R * R;
+  const step = 0.25;
+  let totalPoints = 0;
+  let coveredPoints = 0;
+
+  for (let ox = -R; ox <= R; ox += step) {
+    for (let oy = -R; oy <= R; oy += step) {
+      if (ox * ox + oy * oy <= R2) {
+        totalPoints++;
+        const px = targetX + ox;
+        const py = targetY + oy;
+        for (let i = 0; i < overlapping.length; i++) {
+          const dx = px - overlapping[i].x;
+          const dy = py - overlapping[i].y;
+          if (dx * dx + dy * dy <= R2) {
+            coveredPoints++;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  const frac = totalPoints > 0 ? coveredPoints / totalPoints : 0.0;
+  return {
+    depletedFraction: Math.min(1.0, Math.max(0.0, frac)),
+    remainingSeconds
+  };
+}
+
+function formatDuration(seconds) {
+  const hrs = Math.floor(seconds / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  return `${hrs}h ${mins}m`;
+}
+
+async function isValidGfnHub(parcelUuid) {
+  if (!parcelUuid) return false;
+  const cleanTarget = parcelUuid.toLowerCase().replace(/[^0-9a-f\-]/g, "");
+  if (cleanTarget.length !== 36) return false;
+
+  try {
+    const serversRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["SERVERS"]);
+    if (serversRes.rowCount === 0 || !serversRes.rows[0].value) return false;
+    const continents = serversRes.rows[0].value.split("ç").filter(Boolean);
+
+    for (const cont of continents) {
+      const cRes = await db.query("SELECT value FROM kvstore WHERE id=$1", [cont]);
+      if (cRes.rowCount > 0 && cRes.rows[0].value) {
+        const hubs = cRes.rows[0].value.split("ç").filter(Boolean);
+        for (const h of hubs) {
+          const hubUuid = h.split("#")[0].toLowerCase().replace(/[^0-9a-f\-]/g, "");
+          if (hubUuid === cleanTarget) return true;
+        }
+      }
+    }
+  } catch (e) {}
+  return false;
+}
+
 async function loadGlobalSettings() {
   try {
     const res = await db.query("SELECT value FROM kvstore WHERE id=$1", ["GLOBAL_SETTINGS"]);
@@ -63,12 +232,43 @@ async function loadGlobalSettings() {
 
     const mCfgRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["MIGU_CONFIG"]);
     if (mCfgRes.rowCount > 0 && mCfgRes.rows[0].value) {
-        MIGU_CONFIG = { ...MIGU_CONFIG, ...JSON.parse(mCfgRes.rows[0].value) };
+      MIGU_CONFIG = { ...MIGU_CONFIG, ...JSON.parse(mCfgRes.rows[0].value) };
     }
 
     const mListRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["MIGU_LIST"]);
     if (mListRes.rowCount > 0 && mListRes.rows[0].value) {
-        MIGU_LIST = JSON.parse(mListRes.rows[0].value);
+      MIGU_LIST = JSON.parse(mListRes.rows[0].value);
+    }
+
+    const dVerRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["DREDGE_VERSION"]);
+    if (dVerRes.rowCount > 0 && dVerRes.rows[0].value) {
+      DREDGE_VERSION = dVerRes.rows[0].value.trim();
+    } else {
+      await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`, ["DREDGE_VERSION", DREDGE_VERSION]);
+    }
+
+    const dSetRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["DREDGE_SETTINGS"]);
+    if (dSetRes.rowCount > 0 && dSetRes.rows[0].value) {
+      parseDredgeSettingsString(dSetRes.rows[0].value);
+    } else {
+      const defaultStr = [
+        DREDGE_CONFIG.sandPrice, DREDGE_CONFIG.gravelPrice, DREDGE_CONFIG.clayPrice,
+        DREDGE_CONFIG.ironPrice, DREDGE_CONFIG.copperPrice, DREDGE_CONFIG.titaniumPrice,
+        DREDGE_CONFIG.silverPrice, DREDGE_CONFIG.goldPrice, DREDGE_CONFIG.platinumPrice,
+        DREDGE_CONFIG.diamondPrice, DREDGE_CONFIG.weightMult, DREDGE_CONFIG.maxCapacityKg,
+        DREDGE_CONFIG.pointsPct
+      ].join("|");
+      await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`, ["DREDGE_SETTINGS", defaultStr]);
+    }
+
+    const dZonesRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["DREDGE_ZONES"]);
+    if (dZonesRes.rowCount > 0 && dZonesRes.rows[0].value) {
+      try {
+        DREDGE_ZONES = JSON.parse(dZonesRes.rows[0].value) || [];
+      } catch (e) {
+        DREDGE_ZONES = [];
+      }
+      await pruneExpiredDredgeZones();
     }
   } catch (e) {}
 }
@@ -110,6 +310,7 @@ async function cleanupStaleAffinities() {
 }
 
 setInterval(cleanupStaleAffinities, 24 * 60 * 60 * 1000);
+setInterval(pruneExpiredDredgeZones, 15 * 60 * 1000);
 
 async function processHallOfFame(rankString) {
   if (!rankString || rankString.length <= 5 || rankString.includes("Waiting")) return;
@@ -175,10 +376,6 @@ async function ensureTable() {
   } catch (e) {}
 }
 ensureTable();
-
-const getUnixTime = () => Math.floor(Date.now() / 1000);
-const getCurrentWeek = () => Math.floor((getUnixTime() + 345600) / 604800);
-let activeServerWeek = getCurrentWeek();
 
 setInterval(async () => {
   let currentNowWeek = getCurrentWeek();
@@ -314,6 +511,111 @@ async function getPlayerData(uuid) {
 async function savePlayerData(uuid, data) {
   await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, [`player_${uuid}`, JSON.stringify(data)]);
 }
+
+// ========================================================
+// DREDGE SYSTEM ROUTES
+// ========================================================
+app.get('/dredge/check-zone', async (req, res) => {
+  const { x, y, version } = req.query;
+  if (version && version !== DREDGE_VERSION) {
+    return res.json({ status: "OUTDATED", serverVersion: DREDGE_VERSION });
+  }
+
+  const worldX = parseFloat(x);
+  const worldY = parseFloat(y);
+  if (isNaN(worldX) || isNaN(worldY)) {
+    return res.status(400).json({ status: "ERROR", message: "Invalid world coordinates." });
+  }
+
+  await pruneExpiredDredgeZones();
+  const { depletedFraction, remainingSeconds } = calculateDredgeDepletion(worldX, worldY);
+
+  // If 99.5% or more of the 50m area is already exhausted, block operation
+  if (depletedFraction >= 0.995) {
+    return res.json({
+      status: "DEPLETED",
+      depletedPct: 100,
+      efficiency: 0.0,
+      restoreText: formatDuration(remainingSeconds)
+    });
+  }
+
+  const depletedPct = Math.round(depletedFraction * 1000) / 10; // e.g., 12.5%
+  const efficiency = Math.round((1.0 - depletedFraction) * 1000) / 1000; // e.g., 0.875
+
+  return res.json({
+    status: "OK",
+    depletedPct,
+    efficiency
+  });
+});
+
+app.post('/dredge/complete-batch', requireToken, async (req, res) => {
+  const { x, y, user } = req.body;
+  const worldX = parseFloat(x);
+  const worldY = parseFloat(y);
+
+  if (isNaN(worldX) || isNaN(worldY)) {
+    return res.status(400).json({ status: "ERROR", message: "Invalid coordinates." });
+  }
+
+  await withLock("DREDGE_ZONES_LOCK", async () => {
+    await pruneExpiredDredgeZones();
+    const { depletedFraction, remainingSeconds } = calculateDredgeDepletion(worldX, worldY);
+
+    if (depletedFraction >= 0.995) {
+      return res.json({
+        status: "DEPLETED",
+        restoreText: formatDuration(remainingSeconds)
+      });
+    }
+
+    const efficiency = Math.max(0.01, 1.0 - depletedFraction);
+    const mult = DREDGE_CONFIG.weightMult * efficiency;
+
+    const randRange = (min, max) => min + Math.random() * (max - min);
+    const roundKg = (val) => Math.round(val * 10) / 10;
+
+    // Roll each resource by rarity (in kg) scaled by non-depleted area efficiency
+    let sandKg = roundKg(randRange(120, 240) * mult);
+    let gravelKg = Math.random() <= 0.90 ? roundKg(randRange(60, 130) * mult) : 0;
+    let clayKg = Math.random() <= 0.75 ? roundKg(randRange(30, 75) * mult) : 0;
+    let ironKg = Math.random() <= 0.60 ? roundKg(randRange(15, 45) * mult) : 0;
+    let copperKg = Math.random() <= 0.40 ? roundKg(randRange(8, 24) * mult) : 0;
+    let titaniumKg = Math.random() <= 0.25 ? roundKg(randRange(4, 14) * mult) : 0;
+    let silverKg = Math.random() <= 0.15 ? roundKg(randRange(2, 8) * mult) : 0;
+    let goldKg = Math.random() <= 0.08 ? roundKg(randRange(1.0, 4.0) * mult) : 0;
+    let platinumKg = Math.random() <= 0.04 ? roundKg(randRange(0.5, 2.5) * mult) : 0;
+    let diamondKg = Math.random() <= 0.015 ? roundKg(randRange(0.3, 1.2) * mult) : 0;
+
+    // Record this 50m zone as depleted for 24 hours (86,400s)
+    DREDGE_ZONES.push({
+      x: Math.round(worldX * 100) / 100,
+      y: Math.round(worldY * 100) / 100,
+      time: getUnixTime(),
+      by: user || "unknown"
+    });
+
+    await dbSet("DREDGE_ZONES", JSON.stringify(DREDGE_ZONES));
+
+    const weightsStr = [
+      sandKg, gravelKg, clayKg, ironKg, copperKg,
+      titaniumKg, silverKg, goldKg, platinumKg, diamondKg
+    ].join("|");
+
+    return res.json({
+      status: "OK",
+      efficiencyPct: Math.round(efficiency * 1000) / 10,
+      weights: weightsStr
+    });
+  });
+});
+
+app.post('/admin/dredge/clear-zones', requireToken, async (req, res) => {
+  DREDGE_ZONES = [];
+  await dbSet("DREDGE_ZONES", "[]");
+  res.json({ status: "ok", message: "All depleted dredge zones have been restored." });
+});
 
 // ========================================================
 // MIGUS ADMIN ROUTES
@@ -575,10 +877,6 @@ app.get('/migu/duel', async (req, res) => {
       }
   });
 });
-// ========================================================
-// END MIGUS ROUTES
-// ========================================================
-
 
 // ========================================================
 // CORE ADMIN PARCEL ROUTE
@@ -645,32 +943,25 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       targetNamesList.push(cleanRegion);
       await saveServerChunks(targetServer, targetMainList, targetNamesList);
     } 
-    // ==============================================
-    // NOVO BLOCO: TRANSFERÊNCIA PERFEITA DE CONTINENTE
-    // ==============================================
     else if (action === "MOVE_HUB") {
       let foundItem = null;
       let foundName = null;
-      let originServer = null;
 
-      // 1. Procurar a parcela em TODOS os continentes e REMOVÊ-LA
       for (let srv of servers) {
         let mData = await dbGet(srv) || "";
         let mList = mData ? mData.split("ç") : [];
         
         let idx = mList.findIndex(item => item.startsWith(uuid + "#"));
         if (idx !== -1) {
-          originServer = srv;
           let joined = [await dbGet(`${srv}_NAMES_1`), await dbGet(`${srv}_NAMES_2`), await dbGet(`${srv}_NAMES_3`), await dbGet(`${srv}_NAMES_4`), await dbGet(`${srv}_NAMES_5`)].filter(Boolean).join("ç");
           let nList = joined ? joined.split("ç") : [];
           while (nList.length < mList.length) nList.push("NULL");
 
-          // Remove da origem mantendo o valor extato intacto
           foundItem = mList.splice(idx, 1)[0];
           foundName = nList.splice(idx, 1)[0];
 
           await saveServerChunks(srv, mList, nList);
-          break; // Encontrado e limpo, sai do loop
+          break;
         }
       }
 
@@ -678,7 +969,6 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
           return res.status(404).json({ error: "Parcela não encontrada em nenhum continente ativo para mover." });
       }
 
-      // 2. Inserir a parcela no servidor DESTINO (targetServer)
       let destMainData = await dbGet(targetServer) || "";
       let destMainList = destMainData ? destMainData.split("ç") : [];
       let tJoined = [await dbGet(`${targetServer}_NAMES_1`), await dbGet(`${targetServer}_NAMES_2`), await dbGet(`${targetServer}_NAMES_3`), await dbGet(`${targetServer}_NAMES_4`), await dbGet(`${targetServer}_NAMES_5`)].filter(Boolean).join("ç");
@@ -688,9 +978,7 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       destMainList.push(foundItem);
       destNamesList.push(foundName);
       await saveServerChunks(targetServer, destMainList, destNamesList);
-      
     }
-    // ==============================================
     else {
       let mainData = await dbGet(targetServer) || ""; 
       let mainList = mainData ? mainData.split("ç") : [];
@@ -741,7 +1029,6 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
         let namesList = originalNames ? originalNames.split("ç") : [];
         while (namesList.length < mainList.length) namesList.push("NULL");
 
-        let updatedCount = 0;
         for (let i = 0; i < mainList.length; i++) {
           let uuid = mainList[i].split("#")[0];
           if (uuid && uuid.length === 36) {
@@ -771,7 +1058,6 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
                   extractedRegion = extractedRegion.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
                   if (namesList[i] !== extractedRegion && extractedRegion !== "Second Life") {
                     namesList[i] = extractedRegion;
-                    updatedCount++;
                   }
                 }
               }
@@ -914,7 +1200,120 @@ app.post("/action", requireToken, async (req, res) => {
       let player = await getPlayerData(user);
       let now = getUnixTime();
 
-      if (safeTopic === "cargo sell") {
+      if (safeTopic === "dredge sell") {
+        // Verify if the dredge is currently parked inside a valid GFN HUB parcel
+        const isHub = await isValidGfnHub(target);
+        if (!isHub) {
+          responsePayload = { status: "not_a_hub" };
+          return res.json(responsePayload);
+        }
+
+        // Parse 10 resource weights (in kg)
+        // Format: sand|gravel|clay|iron|copper|titanium|silver|gold|platinum|diamond
+        const wParts = (content || "").split("|").map(v => Math.max(0, parseFloat(v) || 0));
+        while (wParts.length < 10) wParts.push(0);
+
+        const prices = [
+          DREDGE_CONFIG.sandPrice,
+          DREDGE_CONFIG.gravelPrice,
+          DREDGE_CONFIG.clayPrice,
+          DREDGE_CONFIG.ironPrice,
+          DREDGE_CONFIG.copperPrice,
+          DREDGE_CONFIG.titaniumPrice,
+          DREDGE_CONFIG.silverPrice,
+          DREDGE_CONFIG.goldPrice,
+          DREDGE_CONFIG.platinumPrice,
+          DREDGE_CONFIG.diamondPrice
+        ];
+
+        let rawTotal = 0;
+        let totalKg = 0;
+        for (let i = 0; i < 10; i++) {
+          rawTotal += wParts[i] * prices[i];
+          totalKg += wParts[i];
+        }
+
+        let price = Math.round(rawTotal);
+        if (price <= 0) {
+          responsePayload = { status: "empty" };
+          return res.json(responsePayload);
+        }
+        if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
+
+        let recebido = 0;
+        let boost_m = 1.0;
+        let currentWeek = getCurrentWeek();
+
+        if (player.P_W !== currentWeek) { player.P = 0; player.P_W = currentWeek; }
+
+        if (player.B_T > now) {
+          boost_m = parseFloat(player.B_M) || 1.0;
+          if (boost_m > 1.0) price = Math.round(price * boost_m);
+        } else if (player.B_T > 0) {
+          player.B_M = 1.0;
+          player.B_T = 0;
+        }
+
+        const ptsMult = DREDGE_CONFIG.pointsPct || 0.10;
+
+        if (plan !== "FREE" && plan !== "EVENT" && plan !== "TEST_CARGO") {
+          if (boost_m > 1.0) await addPlayerMessage(user, `⚓ Dredge payout boosted by ${boost_m}X!`);
+          await addPlayerMessage(user, `⚓ Sold ${Math.round(totalKg * 10) / 10} kg of dredged minerals for ${price} F₵.`);
+
+          player.P += Math.round(price * ptsMult);
+          if (player.AT !== "A") { player.AT = "A"; responsePayload.newBuyer = true; }
+
+          let premiumBonus = 0;
+          if (plan === "PREMIUM") {
+            premiumBonus = Math.floor(price * 0.2);
+            await addPlayerMessage(user, "You won 20% more for being PREMIUM.");
+          }
+          player.M += (price + premiumBonus);
+          recebido = price + premiumBonus;
+          await addPlayerMessage(user, `You have now ${player.M} F₵.`);
+        } else if (plan === "TEST_CARGO") {
+          if (player.TC_W !== currentWeek) { player.TC_V = 0; player.TC_W = currentWeek; }
+          if (player.TC_V >= MAX_TC) {
+            await addPlayerMessage(user, `You have reached the limit of ${MAX_TC} F₵ in your test plan this week.`);
+          } else {
+            let grant = (player.TC_V + price >= MAX_TC) ? (MAX_TC - player.TC_V) : price;
+            player.TC_V += grant;
+            player.M += grant;
+            recebido = grant;
+            await addPlayerMessage(user, `⚓ Sold dredged minerals for ${grant} F₵.`);
+          }
+          player.P += Math.round((recebido * 0.8) * ptsMult);
+          await addPlayerMessage(user, `You have now ${player.M} F₵.`);
+        } else if (plan === "EVENT") {
+          if (player.EV_W !== currentWeek) { player.EV_V = 0; player.EV_W = currentWeek; }
+          if (player.EV_V >= MAX_EV) {
+            await addPlayerMessage(user, `You have reached the limit of ${MAX_EV} F₵ in your event plan this week.`);
+          } else {
+            let grant = (player.EV_V + price >= MAX_EV) ? (MAX_EV - player.EV_V) : price;
+            player.EV_V += grant;
+            player.M += grant;
+            recebido = grant;
+            await addPlayerMessage(user, `⚓ Sold dredged minerals for ${grant} F₵.`);
+          }
+          player.P += Math.round((recebido * 0.5) * ptsMult);
+          await addPlayerMessage(user, `You have now ${player.M} F₵.`);
+        } else if (plan === "FREE") {
+          if (player.RE >= MAX_F) {
+            await addPlayerMessage(user, `You have reached the limit of ${MAX_F} F₵ in your free plan.`);
+          } else {
+            let grant = (player.RE + price >= MAX_F) ? (MAX_F - player.RE) : price;
+            player.RE += grant;
+            player.M += grant;
+            recebido = grant;
+            await addPlayerMessage(user, `⚓ Sold dredged minerals for ${grant} F₵.`);
+          }
+          await addPlayerMessage(user, `You have now ${player.M} F₵.`);
+        }
+
+        await savePlayerData(user, player);
+        responsePayload.recebido = recebido;
+      }
+      else if (safeTopic === "cargo sell") {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
 
@@ -1284,6 +1683,8 @@ app.post("/set", requireToken, async (req, res) => {
 
     await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, [id, value]);
     if (id === "GLOBAL_SETTINGS") await loadGlobalSettings();
+    if (id === "DREDGE_SETTINGS") parseDredgeSettingsString(value);
+    if (id === "DREDGE_VERSION" && value) DREDGE_VERSION = value.trim();
 
     res.json({ status: "ok", id, value });
   } catch (e) { res.status(500).json({ error: "db error" }); }
