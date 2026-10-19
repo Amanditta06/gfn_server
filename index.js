@@ -77,6 +77,9 @@ let DREDGE_CELLS = new Map();
 // Map key = msgId, value = { msgId, dredgeUuid, weights, addedKg, spotEfficiency, restoreText, status, createdAt }
 let DREDGE_RETURNS = new Map();
 
+// Tracks last known (x, y, time) per dredgeUuid so continuous movement across 5s batches has no gaps
+let DREDGE_LAST_POS = new Map();
+
 const globalDebounce = new Set();
 const mutexes = {};
 
@@ -149,12 +152,16 @@ function deserializeDredgeCells(rawStr) {
   } catch (e) {}
 }
 
-// Automatically deletes any unacknowledged dredge return message older than 5 minutes (300 seconds)
 function pruneExpiredDredgeReturns() {
   const now = getUnixTime();
   for (const [msgId, pkg] of DREDGE_RETURNS.entries()) {
     if ((now - pkg.createdAt) >= DREDGE_RETURN_TTL) {
       DREDGE_RETURNS.delete(msgId);
+    }
+  }
+  for (const [dUuid, posObj] of DREDGE_LAST_POS.entries()) {
+    if ((now - posObj.t) >= 60) {
+      DREDGE_LAST_POS.delete(dUuid);
     }
   }
 }
@@ -216,8 +223,7 @@ function inspectBrushArea(targetX, targetY) {
 }
 
 // Paints an 8m circular brush stamp at exact world coordinates (targetX, targetY).
-// Every 1m x 1m cell yields resources strictly proportional to what is still left in that specific meter!
-// If Dredge 2 crosses Dredge 1's trail, the cells inside Dredge 1's trail have lower 'avail' and yield less.
+// Every 1m x 1m cell yields resources strictly proportional to what is left in that meter.
 function paintBrushStamp(targetX, targetY, opacity, now) {
   const baseX = Math.floor(targetX);
   const baseY = Math.floor(targetY);
@@ -243,7 +249,6 @@ function paintBrushStamp(targetX, targetY, opacity, now) {
         const avail = Math.max(0.0, 1.0 - currentDep);
         if (avail > 0.0) {
           const depletionAdded = Math.min(avail, opacity);
-          // Dynamic yield per meter: scaled by 'avail' (how much resource actually remains in this 1m² cell)
           const cellYield = depletionAdded * avail;
           weightedYieldSum += cellYield;
 
@@ -260,13 +265,13 @@ function paintBrushStamp(targetX, targetY, opacity, now) {
   return weightedYieldSum / denom;
 }
 
-// Interpolates between (x1, y1) and (x2, y2) if the dredge moved more than 0.75m between samples
-// so the trail ("rastro") is 100% continuous without skipping any meters.
+// Interpolates between (x1, y1) and (x2, y2) for normal navigation (0.75m to 15m),
+// or stamps directly at (x2, y2) if stationary or if dragged a long distance (>15m) with Edit tool.
 function applyContinuousStrokeSegment(x1, y1, x2, y2, ticks, now) {
   let extracted = 0.0;
   const dist = Math.hypot(x2 - x1, y2 - y1);
 
-  if (dist <= 0.75 || isNaN(x1) || isNaN(y1)) {
+  if (dist <= 0.75 || dist > 15.0 || isNaN(x1) || isNaN(y1)) {
     for (let t = 0; t < ticks; t++) {
       extracted += paintBrushStamp(x2, y2, BRUSH_TICK_OPACITY, now);
     }
@@ -402,7 +407,6 @@ async function cleanupStaleAffinities() {
 
 setInterval(cleanupStaleAffinities, 24 * 60 * 60 * 1000);
 setInterval(pruneExpiredDredgeZones, 15 * 60 * 1000);
-// Background timer to automatically purge unacknowledged dredge returns older than 5 minutes
 setInterval(pruneExpiredDredgeReturns, 30 * 1000);
 
 async function processHallOfFame(rankString) {
@@ -643,11 +647,11 @@ app.get('/dredge/check-zone', async (req, res) => {
 });
 
 // Receives the 5-second batch of 0.3s strokes along with the dredge's UUID.
-// Calculates per-meter dynamic extraction, tags the return package with dredgeUuid,
-// and places it on the network return queue with a 5-minute auto-delete timer.
 app.post('/dredge/sync-brush', requireToken, async (req, res) => {
-  const { dredgeUuid, ackMsgId, strokes } = req.body;
-  if (!dredgeUuid || !strokes || typeof strokes !== "string") {
+  const { dredgeUuid, user, ackMsgId, strokes } = req.body;
+  const effectiveUuid = String(dredgeUuid || user || "").trim();
+
+  if (!effectiveUuid || !strokes || typeof strokes !== "string") {
     return res.status(400).json({ status: "ERROR", message: "Missing dredgeUuid or strokes." });
   }
 
@@ -655,15 +659,24 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
     const now = getUnixTime();
     pruneExpiredDredgeReturns();
 
-    // If the dredge piggybacked an ACK from a previous batch, delete it immediately
     if (ackMsgId && DREDGE_RETURNS.has(String(ackMsgId))) {
       DREDGE_RETURNS.delete(String(ackMsgId));
     }
 
     const strokeList = strokes.split("|").filter(Boolean);
     let totalExtractedUnits = 0.0;
+
+    // Resume from last known world coordinate if the dredge synced within the last 12 seconds
     let prevX = NaN;
     let prevY = NaN;
+    if (DREDGE_LAST_POS.has(effectiveUuid)) {
+      const lastPos = DREDGE_LAST_POS.get(effectiveUuid);
+      if ((now - lastPos.t) <= 12) {
+        prevX = lastPos.x;
+        prevY = lastPos.y;
+      }
+    }
+
     let lastX = NaN;
     let lastY = NaN;
 
@@ -672,7 +685,15 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
       if (parts.length >= 3) {
         const sx = parseFloat(parts[0]);
         const sy = parseFloat(parts[1]);
-        const ticks = Math.min(35, Math.max(1, parseInt(parts[2], 10) || 1));
+        const rawVal = parseFloat(parts[2]) || 1;
+        // Supports both integer tick counts (1, 2, 16) and float opacity (0.03, 0.48)
+        let ticks = 1;
+        if (rawVal < 1.0 && rawVal > 0.0) {
+          ticks = Math.max(1, Math.round(rawVal / BRUSH_TICK_OPACITY));
+        } else {
+          ticks = Math.min(40, Math.max(1, Math.round(rawVal)));
+        }
+
         if (!isNaN(sx) && !isNaN(sy)) {
           totalExtractedUnits += applyContinuousStrokeSegment(prevX, prevY, sx, sy, ticks, now);
           prevX = sx;
@@ -683,6 +704,10 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
       }
     }
 
+    if (!isNaN(lastX) && !isNaN(lastY)) {
+      DREDGE_LAST_POS.set(effectiveUuid, { x: lastX, y: lastY, t: now });
+    }
+
     let spotEfficiency = 1.0;
     let restoreText = "24h 0m";
     if (!isNaN(lastX) && !isNaN(lastY)) {
@@ -691,13 +716,13 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
       restoreText = formatDuration(remainingSeconds);
     }
 
-    const msgId = `${dredgeUuid.substring(0, 8)}_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    const msgId = `${effectiveUuid.substring(0, 8)}_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
     let returnPkg;
 
     if (totalExtractedUnits <= 0.0001) {
       returnPkg = {
         msgId,
-        dredgeUuid,
+        dredgeUuid: effectiveUuid,
         status: "DEPLETED",
         spotEfficiency: 0.0,
         restoreText,
@@ -708,7 +733,6 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
     } else {
       await dbSet("DREDGE_ZONES", serializeDredgeCells());
 
-      // Normalize so a full 10-second virgin extraction equals 1.0 full weightMult cycle
       const mult = DREDGE_CONFIG.weightMult * (totalExtractedUnits * 2.0);
       const randRange = (min, max) => min + Math.random() * (max - min);
       const roundKg = (val) => Math.round(val * 10) / 10;
@@ -736,7 +760,7 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
 
       returnPkg = {
         msgId,
-        dredgeUuid,
+        dredgeUuid: effectiveUuid,
         status: "OK",
         spotEfficiency,
         restoreText,
@@ -746,18 +770,14 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
       };
     }
 
-    // Remove any older unacknowledged message for this same dredgeUuid before queuing the new one
     for (const [oldId, oldPkg] of DREDGE_RETURNS.entries()) {
-      if (oldPkg.dredgeUuid === dredgeUuid) {
+      if (oldPkg.dredgeUuid === effectiveUuid) {
         DREDGE_RETURNS.delete(oldId);
       }
     }
 
-    // Store in the 5-minute network queue tagged with dredgeUuid
     DREDGE_RETURNS.set(msgId, returnPkg);
 
-    // Build compact network broadcast list (matching dredgeUuid + up to 2 other active packages)
-    // so every dredge checks the UUID of incoming packages without exceeding LSL's 64KB memory
     const broadcastList = [returnPkg];
     for (const [id, pkg] of DREDGE_RETURNS.entries()) {
       if (id !== msgId && broadcastList.length < 3) {
@@ -772,8 +792,6 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
   });
 });
 
-// Explicit ACK endpoint: when a dredge verifies that a return package matches its UUID and stores
-// the resources, it calls this endpoint to immediately delete the message from Render.
 app.post('/dredge/ack-return', requireToken, async (req, res) => {
   const { dredgeUuid, msgId } = req.body;
   pruneExpiredDredgeReturns();
@@ -791,6 +809,7 @@ app.post('/dredge/ack-return', requireToken, async (req, res) => {
 app.post('/admin/dredge/clear-zones', requireToken, async (req, res) => {
   DREDGE_CELLS.clear();
   DREDGE_RETURNS.clear();
+  DREDGE_LAST_POS.clear();
   await dbSet("DREDGE_ZONES", "[]");
   res.json({ status: "ok", message: "All depleted dredge zones and pending return queues have been cleared." });
 });
