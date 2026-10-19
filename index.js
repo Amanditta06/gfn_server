@@ -34,11 +34,24 @@ let MIGU_CONFIG = { version: "1.0", duel_wager: 50, cookie_cost: 10, catch_chanc
 let MIGU_LIST = []; // Array of { name, mClass, subClass, image }
 
 // ========================================================
-// DREDGE SYSTEM GLOBAL CACHE & CONSTANTS
+// DREDGE BRUSH & UUID RETURN QUEUE CONSTANTS (8m DIAMETER)
 // ========================================================
-const DREDGE_RADIUS = 25.0; // 25m radius = 50m total diameter
-const DREDGE_DIAMETER = 50.0; // Minimum center-to-center distance for zero overlap
-const DREDGE_RESTORE_SECONDS = 86400; // 24 hours (1 full day)
+const DREDGE_RADIUS = 4.0; // 4m radius = 8m total diameter
+const DREDGE_RADIUS_SQ = DREDGE_RADIUS * DREDGE_RADIUS; // 16.0
+const DREDGE_RESTORE_SECONDS = 86400; // 24 hours (1 full day) to restore seabed
+const DREDGE_RETURN_TTL = 300; // 5 minutes (300 seconds) auto-delete for unacknowledged dredge returns
+const BRUSH_TICK_OPACITY = 0.03; // 3% per 0.3s tick = 10% per second (10s = 100% depleted)
+
+// Count of 1m x 1m cells inside a 4m radius circle (49 cells)
+const CELLS_PER_BRUSH = (() => {
+  let count = 0;
+  for (let dx = -4; dx <= 4; dx++) {
+    for (let dy = -4; dy <= 4; dy++) {
+      if (dx * dx + dy * dy <= DREDGE_RADIUS_SQ) count++;
+    }
+  }
+  return count; // 49
+})();
 
 let DREDGE_VERSION = "1.0";
 let DREDGE_CONFIG = {
@@ -56,8 +69,13 @@ let DREDGE_CONFIG = {
   maxCapacityKg: 5000.0,
   pointsPct: 0.10
 };
-// Array of { x: float, y: float, time: unixTimestamp, depletion: float (0.0 to 1.0), by: uuid }
-let DREDGE_ZONES = [];
+
+// Spatial Hash Map of 1m x 1m world seabed cells: key = "gx_gy", value = { d: depletion (0.0-1.0), t: unixTime }
+let DREDGE_CELLS = new Map();
+
+// Pending Return Queue tagged by Dredge UUID (Auto-deleted on ACK or after 5 minutes)
+// Map key = msgId, value = { msgId, dredgeUuid, weights, addedKg, spotEfficiency, restoreText, status, createdAt }
+let DREDGE_RETURNS = new Map();
 
 const globalDebounce = new Set();
 const mutexes = {};
@@ -101,97 +119,171 @@ function parseDredgeSettingsString(valStr) {
   }
 }
 
+function serializeDredgeCells() {
+  const now = getUnixTime();
+  const arr = [];
+  for (const [key, val] of DREDGE_CELLS.entries()) {
+    if ((now - val.t) < DREDGE_RESTORE_SECONDS && val.d > 0.001) {
+      arr.push([key, Math.round(val.d * 1000) / 1000, val.t]);
+    }
+  }
+  return JSON.stringify(arr);
+}
+
+function deserializeDredgeCells(rawStr) {
+  DREDGE_CELLS.clear();
+  if (!rawStr) return;
+  try {
+    const parsed = JSON.parse(rawStr);
+    const now = getUnixTime();
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) {
+        if (Array.isArray(item) && item.length >= 3) {
+          const [key, d, t] = item;
+          if ((now - t) < DREDGE_RESTORE_SECONDS && d > 0) {
+            DREDGE_CELLS.set(String(key), { d: Math.min(1.0, Number(d)), t: Number(t) });
+          }
+        }
+      }
+    }
+  } catch (e) {}
+}
+
+// Automatically deletes any unacknowledged dredge return message older than 5 minutes (300 seconds)
+function pruneExpiredDredgeReturns() {
+  const now = getUnixTime();
+  for (const [msgId, pkg] of DREDGE_RETURNS.entries()) {
+    if ((now - pkg.createdAt) >= DREDGE_RETURN_TTL) {
+      DREDGE_RETURNS.delete(msgId);
+    }
+  }
+}
+
 async function pruneExpiredDredgeZones() {
   const now = getUnixTime();
-  const initialLen = DREDGE_ZONES.length;
-  DREDGE_ZONES = DREDGE_ZONES.filter(z => (now - z.time) < DREDGE_RESTORE_SECONDS);
-  if (DREDGE_ZONES.length !== initialLen && DATABASE_URL) {
+  let removed = 0;
+  for (const [key, val] of DREDGE_CELLS.entries()) {
+    if ((now - val.t) >= DREDGE_RESTORE_SECONDS) {
+      DREDGE_CELLS.delete(key);
+      removed++;
+    }
+  }
+  if (removed > 0 && DATABASE_URL) {
     try {
       await db.query(
         `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`,
-        ["DREDGE_ZONES", JSON.stringify(DREDGE_ZONES)]
+        ["DREDGE_ZONES", serializeDredgeCells()]
       );
     } catch (e) {}
   }
 }
 
-// Calculates exact geometric & cumulative partial depletion of a 25m-radius (50m diameter) circle
-// at (targetX, targetY) against all active partially or fully depleted circles in DREDGE_ZONES.
-function calculateDredgeDepletion(targetX, targetY) {
+// Inspects the 8m circle (4m radius) around (targetX, targetY) without modifying it
+function inspectBrushArea(targetX, targetY) {
   const now = getUnixTime();
-  const overlapping = [];
+  const baseX = Math.floor(targetX);
+  const baseY = Math.floor(targetY);
+  let totalDepletion = 0.0;
+  let cellCount = 0;
   let maxRestoreTime = 0;
 
-  for (const z of DREDGE_ZONES) {
-    if ((now - z.time) >= DREDGE_RESTORE_SECONDS) continue;
-    const dx = targetX - z.x;
-    const dy = targetY - z.y;
-    const dist = Math.hypot(dx, dy);
-    if (dist < DREDGE_DIAMETER) {
-      const dep = (z.depletion !== undefined && !isNaN(parseFloat(z.depletion))) ? parseFloat(z.depletion) : 1.0;
-      overlapping.push({ x: z.x, y: z.y, time: z.time, dist, depletion: Math.min(1.0, Math.max(0.0, dep)) });
-      const restoreAt = z.time + DREDGE_RESTORE_SECONDS;
-      if (restoreAt > maxRestoreTime) maxRestoreTime = restoreAt;
-    }
-  }
-
-  if (overlapping.length === 0) {
-    return { depletedFraction: 0.0, remainingSeconds: 0 };
-  }
-
-  const remainingSeconds = Math.max(1, maxRestoreTime - now);
-  const R = DREDGE_RADIUS;
-
-  // Exact analytical Circle-Circle intersection formula when overlapping a single zone
-  if (overlapping.length === 1) {
-    const z = overlapping[0];
-    if (z.dist <= 0.05) {
-      return { depletedFraction: z.depletion, remainingSeconds };
-    }
-    const d = z.dist;
-    const part1 = 2.0 * R * R * Math.acos(d / (2.0 * R));
-    const part2 = 0.5 * d * Math.sqrt(4.0 * R * R - d * d);
-    const intersectionArea = part1 - part2;
-    const totalArea = Math.PI * R * R;
-    const areaOverlapRatio = Math.min(1.0, Math.max(0.0, intersectionArea / totalArea));
-    const weightedDepletion = areaOverlapRatio * z.depletion;
-    return { depletedFraction: Math.min(1.0, Math.max(0.0, weightedDepletion)), remainingSeconds };
-  }
-
-  // High-precision 2D grid integration (~31,415 points) when overlapping multiple partial/full zones
-  const R2 = R * R;
-  const step = 0.25;
-  let totalPoints = 0;
-  let accumulatedDepletion = 0.0;
-
-  for (let ox = -R; ox <= R; ox += step) {
-    for (let oy = -R; oy <= R; oy += step) {
-      if (ox * ox + oy * oy <= R2) {
-        totalPoints++;
-        const px = targetX + ox;
-        const py = targetY + oy;
-        let pointDep = 0.0;
-        for (let i = 0; i < overlapping.length; i++) {
-          const dx = px - overlapping[i].x;
-          const dy = py - overlapping[i].y;
-          if (dx * dx + dy * dy <= R2) {
-            pointDep += overlapping[i].depletion;
-            if (pointDep >= 1.0) {
-              pointDep = 1.0;
-              break;
-            }
+  for (let dx = -5; dx <= 5; dx++) {
+    for (let dy = -5; dy <= 5; dy++) {
+      const gx = baseX + dx;
+      const gy = baseY + dy;
+      const distSq = (gx + 0.5 - targetX) * (gx + 0.5 - targetX) + (gy + 0.5 - targetY) * (gy + 0.5 - targetY);
+      if (distSq <= DREDGE_RADIUS_SQ) {
+        cellCount++;
+        const key = `${gx}_${gy}`;
+        const cell = DREDGE_CELLS.get(key);
+        if (cell) {
+          if ((now - cell.t) < DREDGE_RESTORE_SECONDS) {
+            totalDepletion += cell.d;
+            const restoreAt = cell.t + DREDGE_RESTORE_SECONDS;
+            if (restoreAt > maxRestoreTime) maxRestoreTime = restoreAt;
+          } else {
+            DREDGE_CELLS.delete(key);
           }
         }
-        accumulatedDepletion += pointDep;
       }
     }
   }
 
-  const frac = totalPoints > 0 ? (accumulatedDepletion / totalPoints) : 0.0;
-  return {
-    depletedFraction: Math.min(1.0, Math.max(0.0, frac)),
-    remainingSeconds
-  };
+  const denom = cellCount > 0 ? cellCount : CELLS_PER_BRUSH;
+  const depletedFraction = Math.min(1.0, Math.max(0.0, totalDepletion / denom));
+  const remainingSeconds = maxRestoreTime > now ? (maxRestoreTime - now) : 0;
+  return { depletedFraction, remainingSeconds };
+}
+
+// Paints an 8m circular brush stamp at exact world coordinates (targetX, targetY).
+// Every 1m x 1m cell yields resources strictly proportional to what is still left in that specific meter!
+// If Dredge 2 crosses Dredge 1's trail, the cells inside Dredge 1's trail have lower 'avail' and yield less.
+function paintBrushStamp(targetX, targetY, opacity, now) {
+  const baseX = Math.floor(targetX);
+  const baseY = Math.floor(targetY);
+  let weightedYieldSum = 0.0;
+  let cellCount = 0;
+
+  for (let dx = -5; dx <= 5; dx++) {
+    for (let dy = -5; dy <= 5; dy++) {
+      const gx = baseX + dx;
+      const gy = baseY + dy;
+      const distSq = (gx + 0.5 - targetX) * (gx + 0.5 - targetX) + (gy + 0.5 - targetY) * (gy + 0.5 - targetY);
+
+      if (distSq <= DREDGE_RADIUS_SQ) {
+        cellCount++;
+        const key = `${gx}_${gy}`;
+        const cell = DREDGE_CELLS.get(key);
+        let currentDep = 0.0;
+
+        if (cell && (now - cell.t) < DREDGE_RESTORE_SECONDS) {
+          currentDep = cell.d;
+        }
+
+        const avail = Math.max(0.0, 1.0 - currentDep);
+        if (avail > 0.0) {
+          const depletionAdded = Math.min(avail, opacity);
+          // Dynamic yield per meter: scaled by 'avail' (how much resource actually remains in this 1m² cell)
+          const cellYield = depletionAdded * avail;
+          weightedYieldSum += cellYield;
+
+          DREDGE_CELLS.set(key, {
+            d: Math.min(1.0, currentDep + depletionAdded),
+            t: now
+          });
+        }
+      }
+    }
+  }
+
+  const denom = cellCount > 0 ? cellCount : CELLS_PER_BRUSH;
+  return weightedYieldSum / denom;
+}
+
+// Interpolates between (x1, y1) and (x2, y2) if the dredge moved more than 0.75m between samples
+// so the trail ("rastro") is 100% continuous without skipping any meters.
+function applyContinuousStrokeSegment(x1, y1, x2, y2, ticks, now) {
+  let extracted = 0.0;
+  const dist = Math.hypot(x2 - x1, y2 - y1);
+
+  if (dist <= 0.75 || isNaN(x1) || isNaN(y1)) {
+    for (let t = 0; t < ticks; t++) {
+      extracted += paintBrushStamp(x2, y2, BRUSH_TICK_OPACITY, now);
+    }
+    return extracted;
+  }
+
+  const steps = Math.max(1, Math.min(20, Math.ceil(dist / 0.5)));
+  const totalOpacity = ticks * BRUSH_TICK_OPACITY;
+  const stepOpacity = totalOpacity / steps;
+
+  for (let s = 1; s <= steps; s++) {
+    const ratio = s / steps;
+    const ix = x1 + (x2 - x1) * ratio;
+    const iy = y1 + (y2 - y1) * ratio;
+    extracted += paintBrushStamp(ix, iy, stepOpacity, now);
+  }
+  return extracted;
 }
 
 function formatDuration(seconds) {
@@ -267,12 +359,7 @@ async function loadGlobalSettings() {
 
     const dZonesRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["DREDGE_ZONES"]);
     if (dZonesRes.rowCount > 0 && dZonesRes.rows[0].value) {
-      try {
-        DREDGE_ZONES = JSON.parse(dZonesRes.rows[0].value) || [];
-      } catch (e) {
-        DREDGE_ZONES = [];
-      }
-      await pruneExpiredDredgeZones();
+      deserializeDredgeCells(dZonesRes.rows[0].value);
     }
   } catch (e) {}
 }
@@ -315,6 +402,8 @@ async function cleanupStaleAffinities() {
 
 setInterval(cleanupStaleAffinities, 24 * 60 * 60 * 1000);
 setInterval(pruneExpiredDredgeZones, 15 * 60 * 1000);
+// Background timer to automatically purge unacknowledged dredge returns older than 5 minutes
+setInterval(pruneExpiredDredgeReturns, 30 * 1000);
 
 async function processHallOfFame(rankString) {
   if (!rankString || rankString.length <= 5 || rankString.includes("Waiting")) return;
@@ -517,7 +606,7 @@ async function savePlayerData(uuid, data) {
 }
 
 // ========================================================
-// DREDGE SYSTEM ROUTES (DYNAMIC PARTIAL & FULL DEPLETION)
+// DREDGE BRUSH & UUID RETURN QUEUE ROUTES
 // ========================================================
 app.get('/dredge/check-zone', async (req, res) => {
   const { x, y, version } = req.query;
@@ -531,10 +620,9 @@ app.get('/dredge/check-zone', async (req, res) => {
     return res.status(400).json({ status: "ERROR", message: "Invalid world coordinates." });
   }
 
-  await pruneExpiredDredgeZones();
-  const { depletedFraction, remainingSeconds } = calculateDredgeDepletion(worldX, worldY);
+  pruneExpiredDredgeReturns();
+  const { depletedFraction, remainingSeconds } = inspectBrushArea(worldX, worldY);
 
-  // If 99.5% or more of the 50m area's capacity is exhausted, block operation
   if (depletedFraction >= 0.995) {
     return res.json({
       status: "DEPLETED",
@@ -544,8 +632,8 @@ app.get('/dredge/check-zone', async (req, res) => {
     });
   }
 
-  const depletedPct = Math.round(depletedFraction * 1000) / 10; // e.g., 12.5%
-  const efficiency = Math.round((1.0 - depletedFraction) * 1000) / 1000; // e.g., 0.875
+  const depletedPct = Math.round(depletedFraction * 1000) / 10;
+  const efficiency = Math.round((1.0 - depletedFraction) * 1000) / 1000;
 
   return res.json({
     status: "OK",
@@ -554,96 +642,157 @@ app.get('/dredge/check-zone', async (req, res) => {
   });
 });
 
-app.post('/dredge/complete-batch', requireToken, async (req, res) => {
-  const { x, y, user, progress, aborted } = req.body;
-  const worldX = parseFloat(x);
-  const worldY = parseFloat(y);
-
-  // progress is between 0.0 and 1.0 (1.0 = full 5 minutes, < 1.0 = partial abort/stop)
-  let timeProgress = 1.0;
-  if (progress !== undefined && !isNaN(parseFloat(progress))) {
-    timeProgress = Math.min(1.0, Math.max(0.0, parseFloat(progress)));
-  }
-
-  if (isNaN(worldX) || isNaN(worldY)) {
-    return res.status(400).json({ status: "ERROR", message: "Invalid coordinates." });
+// Receives the 5-second batch of 0.3s strokes along with the dredge's UUID.
+// Calculates per-meter dynamic extraction, tags the return package with dredgeUuid,
+// and places it on the network return queue with a 5-minute auto-delete timer.
+app.post('/dredge/sync-brush', requireToken, async (req, res) => {
+  const { dredgeUuid, ackMsgId, strokes } = req.body;
+  if (!dredgeUuid || !strokes || typeof strokes !== "string") {
+    return res.status(400).json({ status: "ERROR", message: "Missing dredgeUuid or strokes." });
   }
 
   await withLock("DREDGE_ZONES_LOCK", async () => {
-    await pruneExpiredDredgeZones();
-    const { depletedFraction, remainingSeconds } = calculateDredgeDepletion(worldX, worldY);
+    const now = getUnixTime();
+    pruneExpiredDredgeReturns();
 
-    if (depletedFraction >= 0.995) {
-      return res.json({
+    // If the dredge piggybacked an ACK from a previous batch, delete it immediately
+    if (ackMsgId && DREDGE_RETURNS.has(String(ackMsgId))) {
+      DREDGE_RETURNS.delete(String(ackMsgId));
+    }
+
+    const strokeList = strokes.split("|").filter(Boolean);
+    let totalExtractedUnits = 0.0;
+    let prevX = NaN;
+    let prevY = NaN;
+    let lastX = NaN;
+    let lastY = NaN;
+
+    for (const s of strokeList) {
+      const parts = s.split(",");
+      if (parts.length >= 3) {
+        const sx = parseFloat(parts[0]);
+        const sy = parseFloat(parts[1]);
+        const ticks = Math.min(35, Math.max(1, parseInt(parts[2], 10) || 1));
+        if (!isNaN(sx) && !isNaN(sy)) {
+          totalExtractedUnits += applyContinuousStrokeSegment(prevX, prevY, sx, sy, ticks, now);
+          prevX = sx;
+          prevY = sy;
+          lastX = sx;
+          lastY = sy;
+        }
+      }
+    }
+
+    let spotEfficiency = 1.0;
+    let restoreText = "24h 0m";
+    if (!isNaN(lastX) && !isNaN(lastY)) {
+      const { depletedFraction, remainingSeconds } = inspectBrushArea(lastX, lastY);
+      spotEfficiency = Math.round(Math.max(0.0, 1.0 - depletedFraction) * 1000) / 1000;
+      restoreText = formatDuration(remainingSeconds);
+    }
+
+    const msgId = `${dredgeUuid.substring(0, 8)}_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+    let returnPkg;
+
+    if (totalExtractedUnits <= 0.0001) {
+      returnPkg = {
+        msgId,
+        dredgeUuid,
         status: "DEPLETED",
-        restoreText: formatDuration(remainingSeconds)
-      });
-    }
+        spotEfficiency: 0.0,
+        restoreText,
+        addedKg: 0.0,
+        weights: "0|0|0|0|0|0|0|0|0|0",
+        createdAt: now
+      };
+    } else {
+      await dbSet("DREDGE_ZONES", serializeDredgeCells());
 
-    const availableEfficiency = Math.max(0.0, 1.0 - depletedFraction);
-    // Effective extraction is the available seabed capacity multiplied by the fraction of time mined
-    const effectiveYield = availableEfficiency * timeProgress;
-    const depletionAdded = Math.min(availableEfficiency, effectiveYield);
-    const remainingCapacityAfter = Math.max(0.0, availableEfficiency - depletionAdded);
+      // Normalize so a full 10-second virgin extraction equals 1.0 full weightMult cycle
+      const mult = DREDGE_CONFIG.weightMult * (totalExtractedUnits * 2.0);
+      const randRange = (min, max) => min + Math.random() * (max - min);
+      const roundKg = (val) => Math.round(val * 10) / 10;
 
-    if (effectiveYield <= 0.001) {
-      return res.json({
+      let sandKg     = roundKg(randRange(25, 45) * mult);
+      let gravelKg   = Math.random() <= 0.90 ? roundKg(randRange(12, 26) * mult) : 0;
+      let clayKg     = Math.random() <= 0.75 ? roundKg(randRange(6, 15) * mult) : 0;
+      let ironKg     = Math.random() <= 0.60 ? roundKg(randRange(3, 9) * mult) : 0;
+      let copperKg   = Math.random() <= 0.40 ? roundKg(randRange(1.5, 5.0) * mult) : 0;
+      let titaniumKg = Math.random() <= 0.25 ? roundKg(randRange(0.8, 3.0) * mult) : 0;
+      let silverKg   = Math.random() <= 0.15 ? roundKg(randRange(0.4, 1.6) * mult) : 0;
+      let goldKg     = Math.random() <= 0.08 ? roundKg(randRange(0.2, 0.9) * mult) : 0;
+      let platinumKg = Math.random() <= 0.04 ? roundKg(randRange(0.1, 0.5) * mult) : 0;
+      let diamondKg  = Math.random() <= 0.015 ? roundKg(randRange(0.1, 0.3) * mult) : 0;
+
+      const addedKg = roundKg(
+        sandKg + gravelKg + clayKg + ironKg + copperKg +
+        titaniumKg + silverKg + goldKg + platinumKg + diamondKg
+      );
+
+      const weightsStr = [
+        sandKg, gravelKg, clayKg, ironKg, copperKg,
+        titaniumKg, silverKg, goldKg, platinumKg, diamondKg
+      ].join("|");
+
+      returnPkg = {
+        msgId,
+        dredgeUuid,
         status: "OK",
-        aborted: !!aborted,
-        progressPct: Math.round(timeProgress * 1000) / 10,
-        efficiencyPct: 0.0,
-        remainingZonePct: Math.round(remainingCapacityAfter * 1000) / 10,
-        weights: "0|0|0|0|0|0|0|0|0|0"
-      });
+        spotEfficiency,
+        restoreText,
+        addedKg,
+        weights: weightsStr,
+        createdAt: now
+      };
     }
 
-    const mult = DREDGE_CONFIG.weightMult * effectiveYield;
-    const randRange = (min, max) => min + Math.random() * (max - min);
-    const roundKg = (val) => Math.round(val * 10) / 10;
+    // Remove any older unacknowledged message for this same dredgeUuid before queuing the new one
+    for (const [oldId, oldPkg] of DREDGE_RETURNS.entries()) {
+      if (oldPkg.dredgeUuid === dredgeUuid) {
+        DREDGE_RETURNS.delete(oldId);
+      }
+    }
 
-    // Roll each resource by rarity (in kg) scaled by effectiveYield (area availability * time mined)
-    let sandKg = roundKg(randRange(120, 240) * mult);
-    let gravelKg = Math.random() <= 0.90 ? roundKg(randRange(60, 130) * mult) : 0;
-    let clayKg = Math.random() <= 0.75 ? roundKg(randRange(30, 75) * mult) : 0;
-    let ironKg = Math.random() <= 0.60 ? roundKg(randRange(15, 45) * mult) : 0;
-    let copperKg = Math.random() <= 0.40 ? roundKg(randRange(8, 24) * mult) : 0;
-    let titaniumKg = Math.random() <= 0.25 ? roundKg(randRange(4, 14) * mult) : 0;
-    let silverKg = Math.random() <= 0.15 ? roundKg(randRange(2, 8) * mult) : 0;
-    let goldKg = Math.random() <= 0.08 ? roundKg(randRange(1.0, 4.0) * mult) : 0;
-    let platinumKg = Math.random() <= 0.04 ? roundKg(randRange(0.5, 2.5) * mult) : 0;
-    let diamondKg = Math.random() <= 0.015 ? roundKg(randRange(0.3, 1.2) * mult) : 0;
+    // Store in the 5-minute network queue tagged with dredgeUuid
+    DREDGE_RETURNS.set(msgId, returnPkg);
 
-    // Record the exact depletion fraction consumed at this 50m zone for 24 hours (86,400s)
-    DREDGE_ZONES.push({
-      x: Math.round(worldX * 100) / 100,
-      y: Math.round(worldY * 100) / 100,
-      time: getUnixTime(),
-      depletion: Math.round(depletionAdded * 10000) / 10000,
-      by: user || "unknown"
-    });
-
-    await dbSet("DREDGE_ZONES", JSON.stringify(DREDGE_ZONES));
-
-    const weightsStr = [
-      sandKg, gravelKg, clayKg, ironKg, copperKg,
-      titaniumKg, silverKg, goldKg, platinumKg, diamondKg
-    ].join("|");
+    // Build compact network broadcast list (matching dredgeUuid + up to 2 other active packages)
+    // so every dredge checks the UUID of incoming packages without exceeding LSL's 64KB memory
+    const broadcastList = [returnPkg];
+    for (const [id, pkg] of DREDGE_RETURNS.entries()) {
+      if (id !== msgId && broadcastList.length < 3) {
+        broadcastList.push(pkg);
+      }
+    }
 
     return res.json({
-      status: "OK",
-      aborted: !!aborted,
-      progressPct: Math.round(timeProgress * 1000) / 10,
-      efficiencyPct: Math.round(effectiveYield * 1000) / 10,
-      remainingZonePct: Math.round(remainingCapacityAfter * 1000) / 10,
-      weights: weightsStr
+      status: "QUEUED",
+      returns: broadcastList
     });
   });
 });
 
+// Explicit ACK endpoint: when a dredge verifies that a return package matches its UUID and stores
+// the resources, it calls this endpoint to immediately delete the message from Render.
+app.post('/dredge/ack-return', requireToken, async (req, res) => {
+  const { dredgeUuid, msgId } = req.body;
+  pruneExpiredDredgeReturns();
+
+  if (msgId && DREDGE_RETURNS.has(String(msgId))) {
+    const pkg = DREDGE_RETURNS.get(String(msgId));
+    if (!dredgeUuid || pkg.dredgeUuid === String(dredgeUuid)) {
+      DREDGE_RETURNS.delete(String(msgId));
+      return res.json({ status: "DELETED", msgId });
+    }
+  }
+  return res.json({ status: "NOT_FOUND_OR_EXPIRED" });
+});
+
 app.post('/admin/dredge/clear-zones', requireToken, async (req, res) => {
-  DREDGE_ZONES = [];
+  DREDGE_CELLS.clear();
+  DREDGE_RETURNS.clear();
   await dbSet("DREDGE_ZONES", "[]");
-  res.json({ status: "ok", message: "All depleted dredge zones have been restored." });
+  res.json({ status: "ok", message: "All depleted dredge zones and pending return queues have been cleared." });
 });
 
 // ========================================================
