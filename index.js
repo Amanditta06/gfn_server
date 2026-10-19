@@ -56,7 +56,8 @@ let DREDGE_CONFIG = {
   maxCapacityKg: 5000.0,
   pointsPct: 0.10
 };
-let DREDGE_ZONES = []; // Array of { x: float, y: float, time: unixTimestamp }
+// Array of { x: float, y: float, time: unixTimestamp, depletion: float (0.0 to 1.0), by: uuid }
+let DREDGE_ZONES = [];
 
 const globalDebounce = new Set();
 const mutexes = {};
@@ -114,8 +115,8 @@ async function pruneExpiredDredgeZones() {
   }
 }
 
-// Calculates exact geometric overlap fraction of a 25m-radius (50m diameter) circle at (targetX, targetY)
-// against all active depleted 25m-radius circles in DREDGE_ZONES.
+// Calculates exact geometric & cumulative partial depletion of a 25m-radius (50m diameter) circle
+// at (targetX, targetY) against all active partially or fully depleted circles in DREDGE_ZONES.
 function calculateDredgeDepletion(targetX, targetY) {
   const now = getUnixTime();
   const overlapping = [];
@@ -127,7 +128,8 @@ function calculateDredgeDepletion(targetX, targetY) {
     const dy = targetY - z.y;
     const dist = Math.hypot(dx, dy);
     if (dist < DREDGE_DIAMETER) {
-      overlapping.push({ x: z.x, y: z.y, time: z.time, dist });
+      const dep = (z.depletion !== undefined && !isNaN(parseFloat(z.depletion))) ? parseFloat(z.depletion) : 1.0;
+      overlapping.push({ x: z.x, y: z.y, time: z.time, dist, depletion: Math.min(1.0, Math.max(0.0, dep)) });
       const restoreAt = z.time + DREDGE_RESTORE_SECONDS;
       if (restoreAt > maxRestoreTime) maxRestoreTime = restoreAt;
     }
@@ -138,32 +140,29 @@ function calculateDredgeDepletion(targetX, targetY) {
   }
 
   const remainingSeconds = Math.max(1, maxRestoreTime - now);
-
-  // Direct hit on an already depleted center
-  for (const z of overlapping) {
-    if (z.dist <= 0.05) {
-      return { depletedFraction: 1.0, remainingSeconds };
-    }
-  }
-
   const R = DREDGE_RADIUS;
 
-  // Exact analytical Circle-Circle intersection formula when overlapping 1 zone
+  // Exact analytical Circle-Circle intersection formula when overlapping a single zone
   if (overlapping.length === 1) {
-    const d = overlapping[0].dist;
+    const z = overlapping[0];
+    if (z.dist <= 0.05) {
+      return { depletedFraction: z.depletion, remainingSeconds };
+    }
+    const d = z.dist;
     const part1 = 2.0 * R * R * Math.acos(d / (2.0 * R));
     const part2 = 0.5 * d * Math.sqrt(4.0 * R * R - d * d);
     const intersectionArea = part1 - part2;
     const totalArea = Math.PI * R * R;
-    const frac = Math.min(1.0, Math.max(0.0, intersectionArea / totalArea));
-    return { depletedFraction: frac, remainingSeconds };
+    const areaOverlapRatio = Math.min(1.0, Math.max(0.0, intersectionArea / totalArea));
+    const weightedDepletion = areaOverlapRatio * z.depletion;
+    return { depletedFraction: Math.min(1.0, Math.max(0.0, weightedDepletion)), remainingSeconds };
   }
 
-  // High-precision 2D grid integration (~31,415 points) when overlapping multiple zones
+  // High-precision 2D grid integration (~31,415 points) when overlapping multiple partial/full zones
   const R2 = R * R;
   const step = 0.25;
   let totalPoints = 0;
-  let coveredPoints = 0;
+  let accumulatedDepletion = 0.0;
 
   for (let ox = -R; ox <= R; ox += step) {
     for (let oy = -R; oy <= R; oy += step) {
@@ -171,19 +170,24 @@ function calculateDredgeDepletion(targetX, targetY) {
         totalPoints++;
         const px = targetX + ox;
         const py = targetY + oy;
+        let pointDep = 0.0;
         for (let i = 0; i < overlapping.length; i++) {
           const dx = px - overlapping[i].x;
           const dy = py - overlapping[i].y;
           if (dx * dx + dy * dy <= R2) {
-            coveredPoints++;
-            break;
+            pointDep += overlapping[i].depletion;
+            if (pointDep >= 1.0) {
+              pointDep = 1.0;
+              break;
+            }
           }
         }
+        accumulatedDepletion += pointDep;
       }
     }
   }
 
-  const frac = totalPoints > 0 ? coveredPoints / totalPoints : 0.0;
+  const frac = totalPoints > 0 ? (accumulatedDepletion / totalPoints) : 0.0;
   return {
     depletedFraction: Math.min(1.0, Math.max(0.0, frac)),
     remainingSeconds
@@ -513,7 +517,7 @@ async function savePlayerData(uuid, data) {
 }
 
 // ========================================================
-// DREDGE SYSTEM ROUTES
+// DREDGE SYSTEM ROUTES (DYNAMIC PARTIAL & FULL DEPLETION)
 // ========================================================
 app.get('/dredge/check-zone', async (req, res) => {
   const { x, y, version } = req.query;
@@ -530,7 +534,7 @@ app.get('/dredge/check-zone', async (req, res) => {
   await pruneExpiredDredgeZones();
   const { depletedFraction, remainingSeconds } = calculateDredgeDepletion(worldX, worldY);
 
-  // If 99.5% or more of the 50m area is already exhausted, block operation
+  // If 99.5% or more of the 50m area's capacity is exhausted, block operation
   if (depletedFraction >= 0.995) {
     return res.json({
       status: "DEPLETED",
@@ -551,9 +555,15 @@ app.get('/dredge/check-zone', async (req, res) => {
 });
 
 app.post('/dredge/complete-batch', requireToken, async (req, res) => {
-  const { x, y, user } = req.body;
+  const { x, y, user, progress, aborted } = req.body;
   const worldX = parseFloat(x);
   const worldY = parseFloat(y);
+
+  // progress is between 0.0 and 1.0 (1.0 = full 5 minutes, < 1.0 = partial abort/stop)
+  let timeProgress = 1.0;
+  if (progress !== undefined && !isNaN(parseFloat(progress))) {
+    timeProgress = Math.min(1.0, Math.max(0.0, parseFloat(progress)));
+  }
 
   if (isNaN(worldX) || isNaN(worldY)) {
     return res.status(400).json({ status: "ERROR", message: "Invalid coordinates." });
@@ -570,13 +580,28 @@ app.post('/dredge/complete-batch', requireToken, async (req, res) => {
       });
     }
 
-    const efficiency = Math.max(0.01, 1.0 - depletedFraction);
-    const mult = DREDGE_CONFIG.weightMult * efficiency;
+    const availableEfficiency = Math.max(0.0, 1.0 - depletedFraction);
+    // Effective extraction is the available seabed capacity multiplied by the fraction of time mined
+    const effectiveYield = availableEfficiency * timeProgress;
+    const depletionAdded = Math.min(availableEfficiency, effectiveYield);
+    const remainingCapacityAfter = Math.max(0.0, availableEfficiency - depletionAdded);
 
+    if (effectiveYield <= 0.001) {
+      return res.json({
+        status: "OK",
+        aborted: !!aborted,
+        progressPct: Math.round(timeProgress * 1000) / 10,
+        efficiencyPct: 0.0,
+        remainingZonePct: Math.round(remainingCapacityAfter * 1000) / 10,
+        weights: "0|0|0|0|0|0|0|0|0|0"
+      });
+    }
+
+    const mult = DREDGE_CONFIG.weightMult * effectiveYield;
     const randRange = (min, max) => min + Math.random() * (max - min);
     const roundKg = (val) => Math.round(val * 10) / 10;
 
-    // Roll each resource by rarity (in kg) scaled by non-depleted area efficiency
+    // Roll each resource by rarity (in kg) scaled by effectiveYield (area availability * time mined)
     let sandKg = roundKg(randRange(120, 240) * mult);
     let gravelKg = Math.random() <= 0.90 ? roundKg(randRange(60, 130) * mult) : 0;
     let clayKg = Math.random() <= 0.75 ? roundKg(randRange(30, 75) * mult) : 0;
@@ -588,11 +613,12 @@ app.post('/dredge/complete-batch', requireToken, async (req, res) => {
     let platinumKg = Math.random() <= 0.04 ? roundKg(randRange(0.5, 2.5) * mult) : 0;
     let diamondKg = Math.random() <= 0.015 ? roundKg(randRange(0.3, 1.2) * mult) : 0;
 
-    // Record this 50m zone as depleted for 24 hours (86,400s)
+    // Record the exact depletion fraction consumed at this 50m zone for 24 hours (86,400s)
     DREDGE_ZONES.push({
       x: Math.round(worldX * 100) / 100,
       y: Math.round(worldY * 100) / 100,
       time: getUnixTime(),
+      depletion: Math.round(depletionAdded * 10000) / 10000,
       by: user || "unknown"
     });
 
@@ -605,7 +631,10 @@ app.post('/dredge/complete-batch', requireToken, async (req, res) => {
 
     return res.json({
       status: "OK",
-      efficiencyPct: Math.round(efficiency * 1000) / 10,
+      aborted: !!aborted,
+      progressPct: Math.round(timeProgress * 1000) / 10,
+      efficiencyPct: Math.round(effectiveYield * 1000) / 10,
+      remainingZonePct: Math.round(remainingCapacityAfter * 1000) / 10,
       weights: weightsStr
     });
   });
@@ -1201,15 +1230,12 @@ app.post("/action", requireToken, async (req, res) => {
       let now = getUnixTime();
 
       if (safeTopic === "dredge sell") {
-        // Verify if the dredge is currently parked inside a valid GFN HUB parcel
         const isHub = await isValidGfnHub(target);
         if (!isHub) {
           responsePayload = { status: "not_a_hub" };
           return res.json(responsePayload);
         }
 
-        // Parse 10 resource weights (in kg)
-        // Format: sand|gravel|clay|iron|copper|titanium|silver|gold|platinum|diamond
         const wParts = (content || "").split("|").map(v => Math.max(0, parseFloat(v) || 0));
         while (wParts.length < 10) wParts.push(0);
 
