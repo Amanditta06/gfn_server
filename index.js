@@ -1052,49 +1052,126 @@ app.post("/oil/stop-extract", requireToken, async (req, res) => {
 });
 
 app.post("/oil/transfer-to-refinery", requireToken, async (req, res) => {
-  const { tankUuid, tankOwner, refineryOwner, requestedOil, plan } = req.body;
+  const { mode, tankUuid, tankOwner, refineryOwner, requestedOil, plan } = req.body;
+  const effMode = String(mode || "PAY").toUpperCase().trim();
   const effTank = String(tankUuid || "").trim();
   const sOwner = String(tankOwner || "").trim();
   const rOwner = String(refineryOwner || "").trim();
 
-  if (!effTank || !sOwner || !rOwner) return res.status(400).json({ status: "ERROR", message: "Missing parameters" });
+  if (!effTank || !sOwner || !rOwner) {
+    return res.status(400).json({ status: "ERROR", message: "Missing parameters" });
+  }
 
   const lockKey = [sOwner, rOwner, "OIL_REF"].sort().join("_");
   await withLock(lockKey, async () => {
-    const tankRecord = OIL_TANK_LEDGER.get(effTank);
-    const verifiedAvailable = tankRecord ? tankRecord.oil : 0.0;
+    const now = getUnixTime();
+    let reqLiters = Math.round((parseFloat(requestedOil) || 0.0) * 10) / 10;
 
-    let reqLiters = parseFloat(requestedOil) || 0.0;
-    let deliverableOil = Math.round(Math.min(reqLiters, verifiedAvailable) * 10) / 10;
-
-    if (deliverableOil <= 0.05) {
-      return res.json({ status: "EMPTY_OR_UNVERIFIED", transferredOil: 0, remainingTankOil: verifiedAvailable, paidFc: 0 });
+    if (reqLiters <= 0.05) {
+      return res.json({ status: "EMPTY_OR_UNVERIFIED", transferredOil: 0, remainingTankOil: 0, paidFc: 0 });
     }
 
+    // Sincroniza o ledger caso o servidor tenha reiniciado ou dessincronizado
+    let tankRecord = OIL_TANK_LEDGER.get(effTank);
+    if (!tankRecord || tankRecord.oil < reqLiters) {
+      tankRecord = {
+        oil: Math.min(5000.0, reqLiters),
+        owner: sOwner,
+        updatedAt: now
+      };
+      OIL_TANK_LEDGER.set(effTank, tankRecord);
+    }
+
+    let deliverableOil = Math.round(Math.min(reqLiters, tankRecord.oil) * 10) / 10;
+    const unitPrice = OIL_CONFIG.oilPricePerLiter || 2.5;
+
+    // ====================================================
+    // MODO 1: CHECK (Valida fundos e calcula limite antes de bombear)
+    // ====================================================
+    if (effMode === "CHECK") {
+      if (sOwner === rOwner) {
+        return res.json({
+          status: "CHECK_OK",
+          sameOwner: true,
+          maxTransferOil: deliverableOil,
+          unitPrice
+        });
+      }
+
+      let buyerData = await getPlayerData(rOwner);
+      const buyerBalance = parseInt(buyerData.M, 10) || 0;
+
+      if (buyerBalance <= 0) {
+        return res.json({ status: "NO_FUNDS", maxTransferOil: 0, buyerBalance: 0 });
+      }
+
+      const fullCost = Math.ceil(deliverableOil * unitPrice);
+      let maxAllowedOil = deliverableOil;
+      let checkStatus = "CHECK_OK";
+
+      if (buyerBalance < fullCost) {
+        maxAllowedOil = Math.floor((buyerBalance / unitPrice) * 10) / 10;
+        if (maxAllowedOil <= 0.05) {
+          return res.json({ status: "NO_FUNDS", maxTransferOil: 0, buyerBalance });
+        }
+        checkStatus = "CHECK_PARTIAL";
+      }
+
+      return res.json({
+        status: checkStatus,
+        sameOwner: false,
+        maxTransferOil: maxAllowedOil,
+        unitPrice,
+        buyerBalance
+      });
+    }
+
+    // ====================================================
+    // MODO 2: PAY (Liquida e paga o valor exato transferido ao finalizar ou dar STOP)
+    // ====================================================
     if (sOwner === rOwner) {
       tankRecord.oil = Math.round(Math.max(0, tankRecord.oil - deliverableOil) * 10) / 10;
-      tankRecord.updatedAt = getUnixTime();
+      tankRecord.updatedAt = now;
       OIL_TANK_LEDGER.set(effTank, tankRecord);
       await dbSet("OIL_TANKS", serializeOilTanks());
-      return res.json({ status: "OK_SAME_OWNER", transferredOil: deliverableOil, remainingTankOil: tankRecord.oil, paidFc: 0 });
+      return res.json({
+        status: "OK_SAME_OWNER",
+        transferredOil: deliverableOil,
+        remainingTankOil: tankRecord.oil,
+        paidFc: 0
+      });
     }
 
     let buyerData = await getPlayerData(rOwner);
     let sellerData = await getPlayerData(sOwner);
     const buyerBalance = parseInt(buyerData.M, 10) || 0;
 
-    if (buyerBalance <= 0) return res.json({ status: "NO_FUNDS", transferredOil: 0, remainingTankOil: tankRecord.oil, paidFc: 0, buyerBalance: buyerBalance });
+    if (buyerBalance <= 0) {
+      return res.json({
+        status: "NO_FUNDS",
+        transferredOil: 0,
+        remainingTankOil: tankRecord.oil,
+        paidFc: 0,
+        buyerBalance: 0
+      });
+    }
 
-    const unitPrice = OIL_CONFIG.oilPricePerLiter || 2.5;
     const fullCost = Math.ceil(deliverableOil * unitPrice);
-
     let finalOilTransferred = deliverableOil;
     let finalCostFc = fullCost;
     let transferStatus = "OK_PAID_FULL";
 
     if (buyerBalance < fullCost) {
       finalOilTransferred = Math.floor((buyerBalance / unitPrice) * 10) / 10;
-      if (finalOilTransferred <= 0.05) return res.json({ status: "NO_FUNDS", transferredOil: 0, remainingTankOil: tankRecord.oil, paidFc: 0, buyerBalance: buyerBalance });
+      if (finalOilTransferred <= 0.05) {
+        return res.json({
+          status: "NO_FUNDS",
+          transferredOil: 0,
+          remainingTankOil: tankRecord.oil,
+          paidFc: 0,
+          buyerBalance
+        });
+      }
       finalCostFc = Math.min(buyerBalance, Math.ceil(finalOilTransferred * unitPrice));
       transferStatus = "OK_PAID_PARTIAL";
     }
@@ -1103,21 +1180,31 @@ app.post("/oil/transfer-to-refinery", requireToken, async (req, res) => {
     sellerData.M += finalCostFc;
 
     const currentWeek = getCurrentWeek();
-    if (sellerData.P_W !== currentWeek) { sellerData.P = 0; sellerData.P_W = currentWeek; }
+    if (sellerData.P_W !== currentWeek) {
+      sellerData.P = 0;
+      sellerData.P_W = currentWeek;
+    }
     sellerData.P += Math.round(finalCostFc * (OIL_CONFIG.pointsPct || 0.10));
 
     await savePlayerData(rOwner, buyerData);
     await savePlayerData(sOwner, sellerData);
 
     tankRecord.oil = Math.round(Math.max(0, tankRecord.oil - finalOilTransferred) * 10) / 10;
-    tankRecord.updatedAt = getUnixTime();
+    tankRecord.updatedAt = now;
     OIL_TANK_LEDGER.set(effTank, tankRecord);
     await dbSet("OIL_TANKS", serializeOilTanks());
 
     await addPlayerMessage(sOwner, `🛢️ Sold ${finalOilTransferred} L of Crude Oil to secondlife:///app/agent/${rOwner}/inspect's Refinery for ${finalCostFc} F₵. Balance: ${sellerData.M} F₵`);
     await addPlayerMessage(rOwner, `🛢️ Your Refinery purchased ${finalOilTransferred} L of Crude Oil from secondlife:///app/agent/${sOwner}/inspect for ${finalCostFc} F₵. Balance: ${buyerData.M} F₵`);
 
-    return res.json({ status: transferStatus, transferredOil: finalOilTransferred, remainingTankOil: tankRecord.oil, paidFc: finalCostFc });
+    return res.json({
+      status: transferStatus,
+      transferredOil: finalOilTransferred,
+      remainingTankOil: tankRecord.oil,
+      paidFc: finalCostFc,
+      sellerBalance: sellerData.M,
+      buyerBalance: buyerData.M
+    });
   });
 });
 
@@ -1146,7 +1233,7 @@ app.post('/admin/migu/add', requireToken, async (req, res) => {
 
   let idx = MIGU_LIST.findIndex(m => m.name.toLowerCase() === name.toLowerCase());
   if (idx !== -1) MIGU_LIST[idx] = { name, mClass, subClass, image };
-  else MIGU_LIST.push({ name, mClass, subClass, image });
+  else MIGU_LIST.push({ name, mClass, subClass, image };
   
   await dbSet("MIGU_LIST", JSON.stringify(MIGU_LIST));
   res.json({ success: true, message: `Migu [${name}] added to the Database.` });
@@ -2045,6 +2132,8 @@ app.post("/set", requireToken, async (req, res) => {
     if (id === "GLOBAL_SETTINGS") await loadGlobalSettings();
     if (id === "DREDGE_SETTINGS") parseDredgeSettingsString(value);
     if (id === "DREDGE_VERSION" && value) DREDGE_VERSION = value.trim();
+    if (id === "OIL_SETTINGS") parseOilSettingsString(value);
+    if (id === "OIL_VERSION" && value) OIL_VERSION = value.trim();
 
     res.json({ status: "ok", id, value });
   } catch (e) { res.status(500).json({ error: "db error" }); }
