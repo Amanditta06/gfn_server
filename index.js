@@ -31,18 +31,17 @@ let MAX_TRANSACTION = 1000000;
 // MIGUS GLOBAL CACHE
 // ========================================================
 let MIGU_CONFIG = { version: "1.0", duel_wager: 50, cookie_cost: 10, catch_chance: 0.55 };
-let MIGU_LIST = []; // Array of { name, mClass, subClass, image }
+let MIGU_LIST = []; 
 
 // ========================================================
 // DREDGE BRUSH & UUID RETURN QUEUE CONSTANTS (8m DIAMETER)
 // ========================================================
-const DREDGE_RADIUS = 4.0; // 4m radius = 8m total diameter
-const DREDGE_RADIUS_SQ = DREDGE_RADIUS * DREDGE_RADIUS; // 16.0
-const DREDGE_RESTORE_SECONDS = 86400; // 24 hours (1 full day) to restore seabed
-const DREDGE_RETURN_TTL = 300; // 5 minutes (300 seconds) auto-delete for unacknowledged dredge returns
-const BRUSH_TICK_OPACITY = 0.03; // 3% per 0.3s tick = 10% per second (10s = 100% depleted)
+const DREDGE_RADIUS = 4.0; 
+const DREDGE_RADIUS_SQ = DREDGE_RADIUS * DREDGE_RADIUS; 
+const DREDGE_RESTORE_SECONDS = 86400; 
+const DREDGE_RETURN_TTL = 300; 
+const BRUSH_TICK_OPACITY = 0.03; 
 
-// Count of 1m x 1m cells inside a 4m radius circle (49 cells)
 const CELLS_PER_BRUSH = (() => {
   let count = 0;
   for (let dx = -4; dx <= 4; dx++) {
@@ -50,36 +49,42 @@ const CELLS_PER_BRUSH = (() => {
       if (dx * dx + dy * dy <= DREDGE_RADIUS_SQ) count++;
     }
   }
-  return count; // 49
+  return count;
 })();
 
 let DREDGE_VERSION = "1.0";
 let DREDGE_CONFIG = {
-  sandPrice: 0.5,
-  gravelPrice: 1.0,
-  clayPrice: 1.8,
-  ironPrice: 3.5,
-  copperPrice: 7.0,
-  titaniumPrice: 14.0,
-  silverPrice: 30.0,
-  goldPrice: 75.0,
-  platinumPrice: 150.0,
-  diamondPrice: 400.0,
-  weightMult: 1.0,
-  maxCapacityKg: 5000.0,
+  sandPrice: 0.5, gravelPrice: 1.0, clayPrice: 1.8, ironPrice: 3.5, copperPrice: 7.0,
+  titaniumPrice: 14.0, silverPrice: 30.0, goldPrice: 75.0, platinumPrice: 150.0,
+  diamondPrice: 400.0, weightMult: 1.0, maxCapacityKg: 5000.0, pointsPct: 0.10
+};
+
+let DREDGE_CELLS = new Map();
+let DREDGE_RETURNS = new Map();
+let DREDGE_LAST_POS = new Map();
+
+// ========================================================
+// OIL DRILLING & EXTRACTION SYSTEM CONSTANTS
+// ========================================================
+const OIL_ZONE_DIAMETER = 30.0; 
+const OIL_LOCK_TIMEOUT = 18;    
+
+let OIL_VERSION = "1.0";
+let OIL_CONFIG = {
+  oilPricePerLiter: 2.5,      
+  minWellOil: 5000.0,         
+  maxWellOil: 15000.0,        
+  maxExtractPerTick: 250.0,   
   pointsPct: 0.10
 };
 
-// Spatial Hash Map of 1m x 1m world seabed cells: key = "gx_gy", value = { d: depletion (0.0-1.0), t: unixTime }
-let DREDGE_CELLS = new Map();
+let OIL_ZONES = new Map();
+let OIL_TANK_LEDGER = new Map();
+let OIL_SCAN_COOLDOWN = new Map();
 
-// Pending Return Queue tagged by Dredge UUID (Auto-deleted on ACK or after 5 minutes)
-// Map key = msgId, value = { msgId, dredgeUuid, weights, addedKg, spotEfficiency, restoreText, status, createdAt }
-let DREDGE_RETURNS = new Map();
-
-// Tracks last known (x, y, time) per dredgeUuid so continuous movement across 5s batches has no gaps
-let DREDGE_LAST_POS = new Map();
-
+// ========================================================
+// CORE HELPERS & LOCKS
+// ========================================================
 const globalDebounce = new Set();
 const mutexes = {};
 
@@ -102,6 +107,9 @@ const getUnixTime = () => Math.floor(Date.now() / 1000);
 const getCurrentWeek = () => Math.floor((getUnixTime() + 345600) / 604800);
 let activeServerWeek = getCurrentWeek();
 
+// ========================================================
+// DREDGE FUNCTIONS
+// ========================================================
 function parseDredgeSettingsString(valStr) {
   if (!valStr) return;
   const parts = valStr.split("|");
@@ -177,15 +185,11 @@ async function pruneExpiredDredgeZones() {
   }
   if (removed > 0 && DATABASE_URL) {
     try {
-      await db.query(
-        `INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`,
-        ["DREDGE_ZONES", serializeDredgeCells()]
-      );
+      await dbSet("DREDGE_ZONES", serializeDredgeCells());
     } catch (e) {}
   }
 }
 
-// Inspects the 8m circle (4m radius) around (targetX, targetY) without modifying it
 function inspectBrushArea(targetX, targetY) {
   const now = getUnixTime();
   const baseX = Math.floor(targetX);
@@ -222,8 +226,6 @@ function inspectBrushArea(targetX, targetY) {
   return { depletedFraction, remainingSeconds };
 }
 
-// Paints an 8m circular brush stamp at exact world coordinates (targetX, targetY).
-// Every 1m x 1m cell yields resources strictly proportional to what is left in that meter.
 function paintBrushStamp(targetX, targetY, opacity, now) {
   const baseX = Math.floor(targetX);
   const baseY = Math.floor(targetY);
@@ -260,13 +262,10 @@ function paintBrushStamp(targetX, targetY, opacity, now) {
       }
     }
   }
-
   const denom = cellCount > 0 ? cellCount : CELLS_PER_BRUSH;
   return weightedYieldSum / denom;
 }
 
-// Interpolates between (x1, y1) and (x2, y2) for normal navigation (0.75m to 15m),
-// or stamps directly at (x2, y2) if stationary or if dragged a long distance (>15m) with Edit tool.
 function applyContinuousStrokeSegment(x1, y1, x2, y2, ticks, now) {
   let extracted = 0.0;
   const dist = Math.hypot(x2 - x1, y2 - y1);
@@ -291,6 +290,131 @@ function applyContinuousStrokeSegment(x1, y1, x2, y2, ticks, now) {
   return extracted;
 }
 
+// ========================================================
+// OIL DRILLING FUNCTIONS
+// ========================================================
+function getOilGridKey(worldX, worldY) {
+  const gx = Math.floor(worldX / OIL_ZONE_DIAMETER);
+  const gy = Math.floor(worldY / OIL_ZONE_DIAMETER);
+  return {
+    key: `${gx}_${gy}`,
+    centerX: (gx * OIL_ZONE_DIAMETER) + (OIL_ZONE_DIAMETER * 0.5),
+    centerY: (gy * OIL_ZONE_DIAMETER) + (OIL_ZONE_DIAMETER * 0.5)
+  };
+}
+
+function parseOilSettingsString(valStr) {
+  if (!valStr) return;
+  const parts = valStr.split("|");
+  if (parts.length >= 5) {
+    OIL_CONFIG.oilPricePerLiter = parseFloat(parts[0]) || 2.5;
+    OIL_CONFIG.minWellOil = parseFloat(parts[1]) || 5000.0;
+    OIL_CONFIG.maxWellOil = parseFloat(parts[2]) || 15000.0;
+    OIL_CONFIG.maxExtractPerTick = parseFloat(parts[3]) || 250.0;
+    OIL_CONFIG.pointsPct = parseFloat(parts[4]) || 0.10;
+  }
+}
+
+function serializeOilZones() {
+  const arr = [];
+  for (const [key, val] of OIL_ZONES.entries()) {
+    arr.push([
+      key,
+      val.hasWell ? 1 : 0,
+      Math.round(val.oilLeft * 10) / 10,
+      Math.round(val.maxOil * 10) / 10,
+      Math.round(val.x * 10) / 10,
+      Math.round(val.y * 10) / 10,
+      val.week || getCurrentWeek()
+    ]);
+  }
+  return JSON.stringify(arr);
+}
+
+function deserializeOilZones(rawStr) {
+  OIL_ZONES.clear();
+  if (!rawStr) return;
+  try {
+    const parsed = JSON.parse(rawStr);
+    const curWeek = getCurrentWeek();
+    if (Array.isArray(parsed)) {
+      for (const item of parsed) {
+        if (Array.isArray(item) && item.length >= 6) {
+          const [key, hasWellInt, oilLeft, maxOil, x, y, wk] = item;
+          if (!wk || wk === curWeek) {
+            OIL_ZONES.set(String(key), {
+              hasWell: Boolean(hasWellInt),
+              oilLeft: Math.max(0, Number(oilLeft) || 0),
+              maxOil: Math.max(0, Number(maxOil) || 0),
+              x: Number(x) || 0,
+              y: Number(y) || 0,
+              activeRig: "",
+              lastTick: 0,
+              week: curWeek
+            });
+          }
+        }
+      }
+    }
+  } catch (e) {}
+}
+
+function serializeOilTanks() {
+  const obj = {};
+  const now = getUnixTime();
+  for (const [k, v] of OIL_TANK_LEDGER.entries()) {
+    if (v.oil > 0.05 && (now - v.updatedAt) < 604800) {
+      obj[k] = v;
+    }
+  }
+  return JSON.stringify(obj);
+}
+
+function deserializeOilTanks(rawStr) {
+  OIL_TANK_LEDGER.clear();
+  if (!rawStr) return;
+  try {
+    const obj = JSON.parse(rawStr);
+    for (const k in obj) {
+      if (obj[k] && typeof obj[k].oil === "number") {
+        OIL_TANK_LEDGER.set(k, obj[k]);
+      }
+    }
+  } catch (e) {}
+}
+
+async function initOilSystemOnBoot() {
+  if (!DATABASE_URL) return;
+  try {
+    const oVer = await dbGet("OIL_VERSION");
+    if (oVer) OIL_VERSION = oVer.trim();
+    else await dbSet("OIL_VERSION", OIL_VERSION);
+
+    const oSet = await dbGet("OIL_SETTINGS");
+    if (oSet) parseOilSettingsString(oSet);
+    else {
+      const def = [OIL_CONFIG.oilPricePerLiter, OIL_CONFIG.minWellOil, OIL_CONFIG.maxWellOil, OIL_CONFIG.maxExtractPerTick, OIL_CONFIG.pointsPct].join("|");
+      await dbSet("OIL_SETTINGS", def);
+    }
+
+    const oZones = await dbGet("OIL_ZONES");
+    if (oZones) deserializeOilZones(oZones);
+
+    const oTanks = await dbGet("OIL_TANKS");
+    if (oTanks) deserializeOilTanks(oTanks);
+  } catch (e) {}
+}
+
+async function resetWeeklyOilSeabed() {
+  OIL_ZONES.clear();
+  OIL_SCAN_COOLDOWN.clear();
+  await dbSet("OIL_ZONES", "[]");
+}
+
+
+// ========================================================
+// SHARED DB HELPERS
+// ========================================================
 function formatDuration(seconds) {
   const hrs = Math.floor(seconds / 3600);
   const mins = Math.floor((seconds % 3600) / 60);
@@ -303,14 +427,14 @@ async function isValidGfnHub(parcelUuid) {
   if (cleanTarget.length !== 36) return false;
 
   try {
-    const serversRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["SERVERS"]);
-    if (serversRes.rowCount === 0 || !serversRes.rows[0].value) return false;
-    const continents = serversRes.rows[0].value.split("ç").filter(Boolean);
+    const serversRes = await dbGet("SERVERS");
+    if (!serversRes) return false;
+    const continents = serversRes.split("ç").filter(Boolean);
 
     for (const cont of continents) {
-      const cRes = await db.query("SELECT value FROM kvstore WHERE id=$1", [cont]);
-      if (cRes.rowCount > 0 && cRes.rows[0].value) {
-        const hubs = cRes.rows[0].value.split("ç").filter(Boolean);
+      const cRes = await dbGet(cont);
+      if (cRes) {
+        const hubs = cRes.split("ç").filter(Boolean);
         for (const h of hubs) {
           const hubUuid = h.split("#")[0].toLowerCase().replace(/[^0-9a-f\-]/g, "");
           if (hubUuid === cleanTarget) return true;
@@ -321,37 +445,42 @@ async function isValidGfnHub(parcelUuid) {
   return false;
 }
 
+async function dbGet(id) {
+  try {
+    const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [id]);
+    return res.rowCount > 0 ? res.rows[0].value : null;
+  } catch (e) { return null; }
+}
+
+async function dbSet(id, value) {
+  try {
+    await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, [id, value]);
+  } catch (e) {}
+}
+
 async function loadGlobalSettings() {
   try {
-    const res = await db.query("SELECT value FROM kvstore WHERE id=$1", ["GLOBAL_SETTINGS"]);
-    if (res.rowCount > 0 && res.rows[0].value) {
-      const parts = res.rows[0].value.split("|");
+    const res = await dbGet("GLOBAL_SETTINGS");
+    if (res) {
+      const parts = res.split("|");
       if (parts[6] !== undefined && !isNaN(parseInt(parts[6]))) MAX_TC = parseInt(parts[6]);
       if (parts[7] !== undefined && !isNaN(parseInt(parts[7]))) MAX_EV = parseInt(parts[7]);
       if (parts[8] !== undefined && !isNaN(parseInt(parts[8]))) MAX_F = parseInt(parts[8]);
     }
 
-    const mCfgRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["MIGU_CONFIG"]);
-    if (mCfgRes.rowCount > 0 && mCfgRes.rows[0].value) {
-      MIGU_CONFIG = { ...MIGU_CONFIG, ...JSON.parse(mCfgRes.rows[0].value) };
-    }
+    const mCfgRes = await dbGet("MIGU_CONFIG");
+    if (mCfgRes) MIGU_CONFIG = { ...MIGU_CONFIG, ...JSON.parse(mCfgRes) };
 
-    const mListRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["MIGU_LIST"]);
-    if (mListRes.rowCount > 0 && mListRes.rows[0].value) {
-      MIGU_LIST = JSON.parse(mListRes.rows[0].value);
-    }
+    const mListRes = await dbGet("MIGU_LIST");
+    if (mListRes) MIGU_LIST = JSON.parse(mListRes);
 
-    const dVerRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["DREDGE_VERSION"]);
-    if (dVerRes.rowCount > 0 && dVerRes.rows[0].value) {
-      DREDGE_VERSION = dVerRes.rows[0].value.trim();
-    } else {
-      await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`, ["DREDGE_VERSION", DREDGE_VERSION]);
-    }
+    const dVerRes = await dbGet("DREDGE_VERSION");
+    if (dVerRes) DREDGE_VERSION = dVerRes.trim();
+    else await dbSet("DREDGE_VERSION", DREDGE_VERSION);
 
-    const dSetRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["DREDGE_SETTINGS"]);
-    if (dSetRes.rowCount > 0 && dSetRes.rows[0].value) {
-      parseDredgeSettingsString(dSetRes.rows[0].value);
-    } else {
+    const dSetRes = await dbGet("DREDGE_SETTINGS");
+    if (dSetRes) parseDredgeSettingsString(dSetRes);
+    else {
       const defaultStr = [
         DREDGE_CONFIG.sandPrice, DREDGE_CONFIG.gravelPrice, DREDGE_CONFIG.clayPrice,
         DREDGE_CONFIG.ironPrice, DREDGE_CONFIG.copperPrice, DREDGE_CONFIG.titaniumPrice,
@@ -359,13 +488,12 @@ async function loadGlobalSettings() {
         DREDGE_CONFIG.diamondPrice, DREDGE_CONFIG.weightMult, DREDGE_CONFIG.maxCapacityKg,
         DREDGE_CONFIG.pointsPct
       ].join("|");
-      await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING`, ["DREDGE_SETTINGS", defaultStr]);
+      await dbSet("DREDGE_SETTINGS", defaultStr);
     }
 
-    const dZonesRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["DREDGE_ZONES"]);
-    if (dZonesRes.rowCount > 0 && dZonesRes.rows[0].value) {
-      deserializeDredgeCells(dZonesRes.rows[0].value);
-    }
+    const dZonesRes = await dbGet("DREDGE_ZONES");
+    if (dZonesRes) deserializeDredgeCells(dZonesRes);
+
   } catch (e) {}
 }
 
@@ -402,7 +530,7 @@ async function cleanupStaleAffinities() {
         if (modified) await db.query("UPDATE kvstore SET value = $1 WHERE id = $2", [JSON.stringify(pData), row.id]);
       } catch (e) {}
     }
-  } catch (e) { console.error("Erro afinidades:", e); }
+  } catch (e) {}
 }
 
 setInterval(cleanupStaleAffinities, 24 * 60 * 60 * 1000);
@@ -412,9 +540,9 @@ setInterval(pruneExpiredDredgeReturns, 30 * 1000);
 async function processHallOfFame(rankString) {
   if (!rankString || rankString.length <= 5 || rankString.includes("Waiting")) return;
   try {
-    let hofRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["HALL_OF_FAME"]);
+    let hofRes = await dbGet("HALL_OF_FAME");
     let hofList = [];
-    if (hofRes.rowCount > 0 && hofRes.rows[0].value) { try { hofList = JSON.parse(hofRes.rows[0].value); } catch(e){} }
+    if (hofRes) { try { hofList = JSON.parse(hofRes); } catch(e){} }
     
     let playerRecords = new Map();
     hofList.forEach(p => {
@@ -453,7 +581,7 @@ async function processHallOfFame(rankString) {
     hofList.sort((a, b) => b.score - a.score);
     hofList = hofList.slice(0, 3);
     
-    await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, ["HALL_OF_FAME", JSON.stringify(hofList)]);
+    await dbSet("HALL_OF_FAME", JSON.stringify(hofList));
   } catch(e) {}
 }
 
@@ -465,27 +593,31 @@ async function ensureTable() {
     await clearAllMessageQueues();
     await db.query("DELETE FROM kvstore WHERE id LIKE 'PARCEL_%'");
     await cleanupStaleAffinities();
+    await initOilSystemOnBoot();
     
-    const lastRankRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["lastWeekTopFive"]);
-    if (lastRankRes.rowCount > 0 && lastRankRes.rows[0].value) {
-       await processHallOfFame(lastRankRes.rows[0].value);
+    const lastRankRes = await dbGet("lastWeekTopFive");
+    if (lastRankRes) {
+       await processHallOfFame(lastRankRes);
     }
   } catch (e) {}
 }
 ensureTable();
 
+// WEEKLY RESET INTERVAL
 setInterval(async () => {
   let currentNowWeek = getCurrentWeek();
   if (currentNowWeek !== activeServerWeek) {
     try {
-      const oldRankRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["weeklyTopFive"]);
-      let oldRank = oldRankRes.rowCount > 0 ? oldRankRes.rows[0].value : "";
-
+      const oldRank = await dbGet("weeklyTopFive") || "";
       if (oldRank && oldRank.length > 5 && !oldRank.includes("Waiting")) {
-        await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, ["lastWeekTopFive", oldRank]);
+        await dbSet("lastWeekTopFive", oldRank);
         await processHallOfFame(oldRank);
       }
-      await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, ["weeklyTopFive", "Waiting for new deliveries..."]);
+      await dbSet("weeklyTopFive", "Waiting for new deliveries...");
+      
+      // Reseta os mares de petróleo
+      await resetWeeklyOilSeabed();
+
       activeServerWeek = currentNowWeek;
     } catch (e) {}
   }
@@ -495,19 +627,6 @@ function requireToken(req, res, next) {
   const token = req.header("x-api-token");
   if (!token || token !== API_TOKEN) return res.status(401).json({ error: "invalid token" });
   next();
-}
-
-async function dbGet(id) {
-  try {
-    const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [id]);
-    return res.rowCount > 0 ? res.rows[0].value : null;
-  } catch (e) { return null; }
-}
-
-async function dbSet(id, value) {
-  try {
-    await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, [id, value]);
-  } catch (e) {}
 }
 
 async function saveServerChunks(srvName, mainList, namesList) {
@@ -531,40 +650,22 @@ async function saveServerChunks(srvName, mainList, namesList) {
 async function addPlayerMessage(uuid, msg) {
   const keyId = `${uuid}_MSG`;
   try {
-    const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [keyId]);
+    const res = await dbGet(keyId);
     let messages = [];
-    if (res.rowCount > 0 && res.rows[0].value) { try { messages = JSON.parse(res.rows[0].value); } catch(e) {} }
+    if (res) { try { messages = JSON.parse(res); } catch(e) {} }
     messages.push(msg);
     if (messages.length > 20) messages = messages.slice(-20);
-    await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, [keyId, JSON.stringify(messages)]);
+    await dbSet(keyId, JSON.stringify(messages));
   } catch (e) {}
 }
 
-app.get("/get-msg", async (req, res) => {
-  const uuid = req.query.uuid;
-  if (!uuid) return res.status(400).json({ error: "missing uuid" });
-  try {
-    const q = await db.query("SELECT value FROM kvstore WHERE id=$1", [`${uuid}_MSG`]);
-    res.json({ messages: (q.rowCount > 0 && q.rows[0].value) ? JSON.parse(q.rows[0].value) : [] });
-  } catch (e) { res.status(500).json({ error: "db error" }); }
-});
-
-app.post("/ack-msg", async (req, res) => {
-  const { uuid } = req.body;
-  if (!uuid) return res.status(400).json({ error: "missing uuid" });
-  try {
-    await db.query("DELETE FROM kvstore WHERE id=$1", [`${uuid}_MSG`]);
-    res.json({ status: "cleared" });
-  } catch (e) { res.status(500).json({ error: "db error" }); }
-});
-
 async function getPlayerData(uuid) {
   if (!uuid) return null;
-  const res = await db.query("SELECT value FROM kvstore WHERE id=$1", [`player_${uuid}`]);
+  const res = await dbGet(`player_${uuid}`);
   let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0, LAST_DIST: 0, AFFINITY: {}, AFFINITY_TIME: {}, MIGUS: [], ACTIVE_MIGU: "", COOKIE_STOCK: 0 };
-  if (res.rowCount > 0) {
+  if (res) {
     try { 
-      let parsedData = JSON.parse(res.rows[0].value);
+      let parsedData = JSON.parse(res);
       data = { ...data, ...parsedData }; 
       data.M = parseInt(data.M, 10) || 0;
       data.P = parseInt(data.P, 10) || 0;
@@ -606,11 +707,33 @@ async function getPlayerData(uuid) {
 }
 
 async function savePlayerData(uuid, data) {
-  await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, [`player_${uuid}`, JSON.stringify(data)]);
+  await dbSet(`player_${uuid}`, JSON.stringify(data));
 }
 
 // ========================================================
-// DREDGE BRUSH & UUID RETURN QUEUE ROUTES
+// API ROUTES
+// ========================================================
+
+app.get("/get-msg", async (req, res) => {
+  const uuid = req.query.uuid;
+  if (!uuid) return res.status(400).json({ error: "missing uuid" });
+  try {
+    const q = await dbGet(`${uuid}_MSG`);
+    res.json({ messages: q ? JSON.parse(q) : [] });
+  } catch (e) { res.status(500).json({ error: "db error" }); }
+});
+
+app.post("/ack-msg", async (req, res) => {
+  const { uuid } = req.body;
+  if (!uuid) return res.status(400).json({ error: "missing uuid" });
+  try {
+    await db.query("DELETE FROM kvstore WHERE id=$1", [`${uuid}_MSG`]);
+    res.json({ status: "cleared" });
+  } catch (e) { res.status(500).json({ error: "db error" }); }
+});
+
+// ========================================================
+// DREDGE BRUSH ROUTES
 // ========================================================
 app.get('/dredge/check-zone', async (req, res) => {
   const { x, y, version } = req.query;
@@ -646,7 +769,6 @@ app.get('/dredge/check-zone', async (req, res) => {
   });
 });
 
-// Receives the 5-second batch of 0.3s strokes along with the dredge's UUID.
 app.post('/dredge/sync-brush', requireToken, async (req, res) => {
   const { dredgeUuid, user, ackMsgId, strokes } = req.body;
   const effectiveUuid = String(dredgeUuid || user || "").trim();
@@ -666,27 +788,22 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
     const strokeList = strokes.split("|").filter(Boolean);
     let totalExtractedUnits = 0.0;
 
-    // Resume from last known world coordinate if the dredge synced within the last 12 seconds
-    let prevX = NaN;
-    let prevY = NaN;
+    let prevX = NaN; let prevY = NaN;
     if (DREDGE_LAST_POS.has(effectiveUuid)) {
       const lastPos = DREDGE_LAST_POS.get(effectiveUuid);
       if ((now - lastPos.t) <= 12) {
-        prevX = lastPos.x;
-        prevY = lastPos.y;
+        prevX = lastPos.x; prevY = lastPos.y;
       }
     }
 
-    let lastX = NaN;
-    let lastY = NaN;
-
+    let lastX = NaN; let lastY = NaN;
     for (const s of strokeList) {
       const parts = s.split(",");
       if (parts.length >= 3) {
         const sx = parseFloat(parts[0]);
         const sy = parseFloat(parts[1]);
         const rawVal = parseFloat(parts[2]) || 1;
-        // Supports both integer tick counts (1, 2, 16) and float opacity (0.03, 0.48)
+        
         let ticks = 1;
         if (rawVal < 1.0 && rawVal > 0.0) {
           ticks = Math.max(1, Math.round(rawVal / BRUSH_TICK_OPACITY));
@@ -696,10 +813,7 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
 
         if (!isNaN(sx) && !isNaN(sy)) {
           totalExtractedUnits += applyContinuousStrokeSegment(prevX, prevY, sx, sy, ticks, now);
-          prevX = sx;
-          prevY = sy;
-          lastX = sx;
-          lastY = sy;
+          prevX = sx; prevY = sy; lastX = sx; lastY = sy;
         }
       }
     }
@@ -721,14 +835,8 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
 
     if (totalExtractedUnits <= 0.0001) {
       returnPkg = {
-        msgId,
-        dredgeUuid: effectiveUuid,
-        status: "DEPLETED",
-        spotEfficiency: 0.0,
-        restoreText,
-        addedKg: 0.0,
-        weights: "0|0|0|0|0|0|0|0|0|0",
-        createdAt: now
+        msgId, dredgeUuid: effectiveUuid, status: "DEPLETED", spotEfficiency: 0.0,
+        restoreText, addedKg: 0.0, weights: "0|0|0|0|0|0|0|0|0|0", createdAt: now
       };
     } else {
       await dbSet("DREDGE_ZONES", serializeDredgeCells());
@@ -748,25 +856,12 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
       let platinumKg = Math.random() <= 0.04 ? roundKg(randRange(0.1, 0.5) * mult) : 0;
       let diamondKg  = Math.random() <= 0.015 ? roundKg(randRange(0.1, 0.3) * mult) : 0;
 
-      const addedKg = roundKg(
-        sandKg + gravelKg + clayKg + ironKg + copperKg +
-        titaniumKg + silverKg + goldKg + platinumKg + diamondKg
-      );
-
-      const weightsStr = [
-        sandKg, gravelKg, clayKg, ironKg, copperKg,
-        titaniumKg, silverKg, goldKg, platinumKg, diamondKg
-      ].join("|");
+      const addedKg = roundKg(sandKg + gravelKg + clayKg + ironKg + copperKg + titaniumKg + silverKg + goldKg + platinumKg + diamondKg);
+      const weightsStr = [sandKg, gravelKg, clayKg, ironKg, copperKg, titaniumKg, silverKg, goldKg, platinumKg, diamondKg].join("|");
 
       returnPkg = {
-        msgId,
-        dredgeUuid: effectiveUuid,
-        status: "OK",
-        spotEfficiency,
-        restoreText,
-        addedKg,
-        weights: weightsStr,
-        createdAt: now
+        msgId, dredgeUuid: effectiveUuid, status: "OK", spotEfficiency,
+        restoreText, addedKg, weights: weightsStr, createdAt: now
       };
     }
 
@@ -775,7 +870,6 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
         DREDGE_RETURNS.delete(oldId);
       }
     }
-
     DREDGE_RETURNS.set(msgId, returnPkg);
 
     const broadcastList = [returnPkg];
@@ -785,10 +879,7 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
       }
     }
 
-    return res.json({
-      status: "QUEUED",
-      returns: broadcastList
-    });
+    return res.json({ status: "QUEUED", returns: broadcastList });
   });
 });
 
@@ -814,76 +905,287 @@ app.post('/admin/dredge/clear-zones', requireToken, async (req, res) => {
   res.json({ status: "ok", message: "All depleted dredge zones and pending return queues have been cleared." });
 });
 
+
+// ========================================================
+// OIL DRILLING & EXTRACTION ROUTES
+// ========================================================
+app.post("/oil/scan-zone", requireToken, async (req, res) => {
+  const { rigUuid, user, x, y, hasWell, oilAmount, version } = req.body;
+  if (version && String(version) !== OIL_VERSION) {
+    return res.json({ status: "OUTDATED", serverVersion: OIL_VERSION });
+  }
+
+  const worldX = parseFloat(x);
+  const worldY = parseFloat(y);
+  const effRig = String(rigUuid || "").trim();
+
+  if (!effRig || isNaN(worldX) || isNaN(worldY)) {
+    return res.status(400).json({ status: "ERROR", message: "Invalid coordinates or rigUuid" });
+  }
+
+  await withLock("OIL_ZONES_LOCK", async () => {
+    const now = getUnixTime();
+    const curWeek = getCurrentWeek();
+    const { key, centerX, centerY } = getOilGridKey(worldX, worldY);
+
+    if (OIL_ZONES.has(key)) {
+      const existing = OIL_ZONES.get(key);
+      if (existing.week === curWeek) {
+        if (!existing.hasWell) {
+          return res.json({ status: "NO_WELL", alreadyMapped: true, zoneKey: key, wellX: existing.x, wellY: existing.y, oilLeft: 0 });
+        }
+        if (existing.oilLeft <= 0.1) {
+          return res.json({ status: "DEPLETED", alreadyMapped: true, zoneKey: key, wellX: existing.x, wellY: existing.y, oilLeft: 0, maxOil: existing.maxOil });
+        }
+        const isBusy = existing.activeRig && existing.activeRig !== effRig && (now - existing.lastTick) < OIL_LOCK_TIMEOUT;
+        return res.json({ status: "HAS_WELL", alreadyMapped: true, zoneKey: key, wellX: existing.x, wellY: existing.y, oilLeft: existing.oilLeft, maxOil: existing.maxOil, busy: isBusy });
+      }
+    }
+
+    const lastScan = OIL_SCAN_COOLDOWN.get(effRig) || 0;
+    if ((Date.now() - lastScan) < 3800) {
+      return res.json({ status: "RATE_LIMIT" });
+    }
+    OIL_SCAN_COOLDOWN.set(effRig, Date.now());
+
+    let clientReportedWell = Boolean(hasWell === true || hasWell === 1 || hasWell === "1");
+    let finalHasWell = clientReportedWell;
+    let initialOil = 0.0;
+    
+    if (finalHasWell) {
+      let rawOil = parseFloat(oilAmount) || OIL_CONFIG.minWellOil;
+      initialOil = Math.min(OIL_CONFIG.maxWellOil, Math.max(OIL_CONFIG.minWellOil, Math.round(rawOil * 10) / 10));
+    }
+
+    const newZone = { hasWell: finalHasWell, oilLeft: initialOil, maxOil: initialOil, x: centerX, y: centerY, activeRig: "", lastTick: 0, week: curWeek };
+    OIL_ZONES.set(key, newZone);
+    await dbSet("OIL_ZONES", serializeOilZones());
+
+    if (!finalHasWell) return res.json({ status: "NO_WELL", alreadyMapped: false, zoneKey: key, wellX: centerX, wellY: centerY, oilLeft: 0 });
+    return res.json({ status: "HAS_WELL", alreadyMapped: false, zoneKey: key, wellX: centerX, wellY: centerY, oilLeft: initialOil, maxOil: initialOil, busy: false });
+  });
+});
+
+app.post("/oil/lock-well", requireToken, async (req, res) => {
+  const { rigUuid, x, y, version } = req.body;
+  if (version && String(version) !== OIL_VERSION) return res.json({ status: "OUTDATED" });
+
+  const worldX = parseFloat(x);
+  const worldY = parseFloat(y);
+  const effRig = String(rigUuid || "").trim();
+
+  await withLock("OIL_ZONES_LOCK", async () => {
+    const now = getUnixTime();
+    const { key } = getOilGridKey(worldX, worldY);
+    const zone = OIL_ZONES.get(key);
+
+    if (!zone || !zone.hasWell) return res.json({ status: "NO_WELL" });
+    if (zone.oilLeft <= 0.1) return res.json({ status: "DEPLETED", oilLeft: 0 });
+    if (zone.activeRig && zone.activeRig !== effRig && (now - zone.lastTick) < OIL_LOCK_TIMEOUT) return res.json({ status: "BUSY_OTHER_RIG" });
+
+    zone.activeRig = effRig;
+    zone.lastTick = now;
+    OIL_ZONES.set(key, zone);
+
+    return res.json({ status: "LOCKED", zoneKey: key, oilLeft: zone.oilLeft, maxOil: zone.maxOil });
+  });
+});
+
+app.post("/oil/extract-tick", requireToken, async (req, res) => {
+  const { rigUuid, tankUuid, tankOwner, x, y, requestedOil } = req.body;
+  const effRig = String(rigUuid || "").trim();
+  const effTank = String(tankUuid || "").trim();
+  const worldX = parseFloat(x);
+  const worldY = parseFloat(y);
+
+  if (!effRig || !effTank || isNaN(worldX) || isNaN(worldY)) return res.status(400).json({ status: "ERROR" });
+
+  await withLock("OIL_ZONES_LOCK", async () => {
+    const now = getUnixTime();
+    const { key } = getOilGridKey(worldX, worldY);
+    const zone = OIL_ZONES.get(key);
+
+    if (!zone || !zone.hasWell) return res.json({ status: "NO_WELL", extracted: 0, oilLeft: 0 });
+    if (zone.activeRig && zone.activeRig !== effRig && (now - zone.lastTick) < OIL_LOCK_TIMEOUT) return res.json({ status: "BUSY_OTHER_RIG", extracted: 0, oilLeft: zone.oilLeft });
+    if (zone.oilLeft <= 0.05) {
+      zone.oilLeft = 0; zone.activeRig = "";
+      await dbSet("OIL_ZONES", serializeOilZones());
+      return res.json({ status: "DEPLETED", extracted: 0, oilLeft: 0 });
+    }
+
+    let reqAmt = parseFloat(requestedOil) || 0;
+    reqAmt = Math.min(OIL_CONFIG.maxExtractPerTick, Math.max(0, reqAmt));
+
+    const actualExtracted = Math.round(Math.min(zone.oilLeft, reqAmt) * 10) / 10;
+    zone.oilLeft = Math.round(Math.max(0, zone.oilLeft - actualExtracted) * 10) / 10;
+    zone.activeRig = effRig;
+    zone.lastTick = now;
+    OIL_ZONES.set(key, zone);
+
+    const tankEntry = OIL_TANK_LEDGER.get(effTank) || { oil: 0.0, owner: String(tankOwner || ""), updatedAt: now };
+    tankEntry.oil = Math.round((tankEntry.oil + actualExtracted) * 10) / 10;
+    if (tankOwner) tankEntry.owner = String(tankOwner);
+    tankEntry.updatedAt = now;
+    OIL_TANK_LEDGER.set(effTank, tankEntry);
+
+    await dbSet("OIL_ZONES", serializeOilZones());
+    await dbSet("OIL_TANKS", serializeOilTanks());
+
+    return res.json({ status: zone.oilLeft <= 0.05 ? "DEPLETED" : "OK", extracted: actualExtracted, oilLeft: zone.oilLeft, maxOil: zone.maxOil, tankVerifiedOil: tankEntry.oil });
+  });
+});
+
+app.post("/oil/stop-extract", requireToken, async (req, res) => {
+  const { rigUuid, x, y } = req.body;
+  const effRig = String(rigUuid || "").trim();
+  const worldX = parseFloat(x);
+  const worldY = parseFloat(y);
+
+  await withLock("OIL_ZONES_LOCK", async () => {
+    const { key } = getOilGridKey(worldX, worldY);
+    const zone = OIL_ZONES.get(key);
+    if (zone && zone.activeRig === effRig) {
+      zone.activeRig = ""; zone.lastTick = 0; OIL_ZONES.set(key, zone);
+    }
+    return res.json({ status: "RELEASED" });
+  });
+});
+
+app.post("/oil/transfer-to-refinery", requireToken, async (req, res) => {
+  const { tankUuid, tankOwner, refineryOwner, requestedOil, plan } = req.body;
+  const effTank = String(tankUuid || "").trim();
+  const sOwner = String(tankOwner || "").trim();
+  const rOwner = String(refineryOwner || "").trim();
+
+  if (!effTank || !sOwner || !rOwner) return res.status(400).json({ status: "ERROR", message: "Missing parameters" });
+
+  const lockKey = [sOwner, rOwner, "OIL_REF"].sort().join("_");
+  await withLock(lockKey, async () => {
+    const tankRecord = OIL_TANK_LEDGER.get(effTank);
+    const verifiedAvailable = tankRecord ? tankRecord.oil : 0.0;
+
+    let reqLiters = parseFloat(requestedOil) || 0.0;
+    let deliverableOil = Math.round(Math.min(reqLiters, verifiedAvailable) * 10) / 10;
+
+    if (deliverableOil <= 0.05) {
+      return res.json({ status: "EMPTY_OR_UNVERIFIED", transferredOil: 0, remainingTankOil: verifiedAvailable, paidFc: 0 });
+    }
+
+    if (sOwner === rOwner) {
+      tankRecord.oil = Math.round(Math.max(0, tankRecord.oil - deliverableOil) * 10) / 10;
+      tankRecord.updatedAt = getUnixTime();
+      OIL_TANK_LEDGER.set(effTank, tankRecord);
+      await dbSet("OIL_TANKS", serializeOilTanks());
+      return res.json({ status: "OK_SAME_OWNER", transferredOil: deliverableOil, remainingTankOil: tankRecord.oil, paidFc: 0 });
+    }
+
+    let buyerData = await getPlayerData(rOwner);
+    let sellerData = await getPlayerData(sOwner);
+    const buyerBalance = parseInt(buyerData.M, 10) || 0;
+
+    if (buyerBalance <= 0) return res.json({ status: "NO_FUNDS", transferredOil: 0, remainingTankOil: tankRecord.oil, paidFc: 0, buyerBalance: buyerBalance });
+
+    const unitPrice = OIL_CONFIG.oilPricePerLiter || 2.5;
+    const fullCost = Math.ceil(deliverableOil * unitPrice);
+
+    let finalOilTransferred = deliverableOil;
+    let finalCostFc = fullCost;
+    let transferStatus = "OK_PAID_FULL";
+
+    if (buyerBalance < fullCost) {
+      finalOilTransferred = Math.floor((buyerBalance / unitPrice) * 10) / 10;
+      if (finalOilTransferred <= 0.05) return res.json({ status: "NO_FUNDS", transferredOil: 0, remainingTankOil: tankRecord.oil, paidFc: 0, buyerBalance: buyerBalance });
+      finalCostFc = Math.min(buyerBalance, Math.ceil(finalOilTransferred * unitPrice));
+      transferStatus = "OK_PAID_PARTIAL";
+    }
+
+    buyerData.M -= finalCostFc;
+    sellerData.M += finalCostFc;
+
+    const currentWeek = getCurrentWeek();
+    if (sellerData.P_W !== currentWeek) { sellerData.P = 0; sellerData.P_W = currentWeek; }
+    sellerData.P += Math.round(finalCostFc * (OIL_CONFIG.pointsPct || 0.10));
+
+    await savePlayerData(rOwner, buyerData);
+    await savePlayerData(sOwner, sellerData);
+
+    tankRecord.oil = Math.round(Math.max(0, tankRecord.oil - finalOilTransferred) * 10) / 10;
+    tankRecord.updatedAt = getUnixTime();
+    OIL_TANK_LEDGER.set(effTank, tankRecord);
+    await dbSet("OIL_TANKS", serializeOilTanks());
+
+    await addPlayerMessage(sOwner, `🛢️ Sold ${finalOilTransferred} L of Crude Oil to secondlife:///app/agent/${rOwner}/inspect's Refinery for ${finalCostFc} F₵. Balance: ${sellerData.M} F₵`);
+    await addPlayerMessage(rOwner, `🛢️ Your Refinery purchased ${finalOilTransferred} L of Crude Oil from secondlife:///app/agent/${sOwner}/inspect for ${finalCostFc} F₵. Balance: ${buyerData.M} F₵`);
+
+    return res.json({ status: transferStatus, transferredOil: finalOilTransferred, remainingTankOil: tankRecord.oil, paidFc: finalCostFc });
+  });
+});
+
+app.post("/admin/oil/clear-zones", requireToken, async (req, res) => {
+  await resetWeeklyOilSeabed();
+  res.json({ status: "ok", message: "All oil wells and scanned 30m sectors have been cleared." });
+});
+
+
 // ========================================================
 // MIGUS ADMIN ROUTES
 // ========================================================
 app.post('/admin/migu/config', requireToken, async (req, res) => {
-    const { version, duel_wager, cookie_cost } = req.body;
-    if (version) MIGU_CONFIG.version = version;
-    if (duel_wager !== undefined) MIGU_CONFIG.duel_wager = parseInt(duel_wager);
-    if (cookie_cost !== undefined) MIGU_CONFIG.cookie_cost = parseInt(cookie_cost);
-    
-    await dbSet("MIGU_CONFIG", JSON.stringify(MIGU_CONFIG));
-    res.json({ success: true, message: "Global Migu Configuration Updated", config: MIGU_CONFIG });
+  const { version, duel_wager, cookie_cost } = req.body;
+  if (version) MIGU_CONFIG.version = version;
+  if (duel_wager !== undefined) MIGU_CONFIG.duel_wager = parseInt(duel_wager);
+  if (cookie_cost !== undefined) MIGU_CONFIG.cookie_cost = parseInt(cookie_cost);
+  
+  await dbSet("MIGU_CONFIG", JSON.stringify(MIGU_CONFIG));
+  res.json({ success: true, message: "Global Migu Configuration Updated", config: MIGU_CONFIG });
 });
 
 app.post('/admin/migu/add', requireToken, async (req, res) => {
-    const { name, mClass, subClass, image } = req.body;
-    if (!name || !mClass || !subClass) return res.status(400).json({ error: "Missing Migu properties" });
+  const { name, mClass, subClass, image } = req.body;
+  if (!name || !mClass || !subClass) return res.status(400).json({ error: "Missing Migu properties" });
 
-    let idx = MIGU_LIST.findIndex(m => m.name.toLowerCase() === name.toLowerCase());
-    if (idx !== -1) {
-        MIGU_LIST[idx] = { name, mClass, subClass, image };
-    } else {
-        MIGU_LIST.push({ name, mClass, subClass, image });
-    }
-    
-    await dbSet("MIGU_LIST", JSON.stringify(MIGU_LIST));
-    res.json({ success: true, message: `Migu [${name}] added to the Database.` });
+  let idx = MIGU_LIST.findIndex(m => m.name.toLowerCase() === name.toLowerCase());
+  if (idx !== -1) MIGU_LIST[idx] = { name, mClass, subClass, image };
+  else MIGU_LIST.push({ name, mClass, subClass, image });
+  
+  await dbSet("MIGU_LIST", JSON.stringify(MIGU_LIST));
+  res.json({ success: true, message: `Migu [${name}] added to the Database.` });
 });
 
 app.post('/admin/migu/delete', requireToken, async (req, res) => {
-    const { name } = req.body;
-    if (!name) return res.status(400).json({ error: "Missing name" });
+  const { name } = req.body;
+  if (!name) return res.status(400).json({ error: "Missing name" });
 
-    MIGU_LIST = MIGU_LIST.filter(m => m.name.toLowerCase() !== name.toLowerCase());
-    await dbSet("MIGU_LIST", JSON.stringify(MIGU_LIST));
+  MIGU_LIST = MIGU_LIST.filter(m => m.name.toLowerCase() !== name.toLowerCase());
+  await dbSet("MIGU_LIST", JSON.stringify(MIGU_LIST));
 
-    let affectedPlayers = 0;
-    try {
-        const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
-        for (let row of q.rows) {
-            try {
-                let pData = JSON.parse(row.value);
-                if (pData.MIGUS && pData.MIGUS.length > 0) {
-                    let count = 0;
-                    let newInventory = [];
-                    for (let m of pData.MIGUS) {
-                        let mName = (typeof m === 'string') ? m : m.name;
-                        if (mName.toLowerCase() === name.toLowerCase()) count++;
-                        else newInventory.push(m);
-                    }
-                    if (count > 0) {
-                        pData.MIGUS = newInventory;
-                        if (pData.ACTIVE_MIGU && pData.ACTIVE_MIGU.toLowerCase() === name.toLowerCase()) {
-                            pData.ACTIVE_MIGU = pData.MIGUS.length > 0 ? pData.MIGUS[0].name : "";
-                        }
-                        let compensation = count * 10000;
-                        pData.M += compensation;
-                        await db.query("UPDATE kvstore SET value = $1 WHERE id = $2", [JSON.stringify(pData), row.id]);
-                        
-                        let pUuid = row.id.replace("player_", "");
-                        await addPlayerMessage(pUuid, `⚠️ The Migu [${name}] was permanently deleted. You received ${compensation} F₵ compensation.`);
-                        affectedPlayers++;
-                    }
-                }
-            } catch(e) {}
+  let affectedPlayers = 0;
+  try {
+    const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
+    for (let row of q.rows) {
+      try {
+        let pData = JSON.parse(row.value);
+        if (pData.MIGUS && pData.MIGUS.length > 0) {
+          let count = 0; let newInventory = [];
+          for (let m of pData.MIGUS) {
+            let mName = (typeof m === 'string') ? m : m.name;
+            if (mName.toLowerCase() === name.toLowerCase()) count++; else newInventory.push(m);
+          }
+          if (count > 0) {
+            pData.MIGUS = newInventory;
+            if (pData.ACTIVE_MIGU && pData.ACTIVE_MIGU.toLowerCase() === name.toLowerCase()) {
+              pData.ACTIVE_MIGU = pData.MIGUS.length > 0 ? pData.MIGUS[0].name : "";
+            }
+            let compensation = count * 10000; pData.M += compensation;
+            await db.query("UPDATE kvstore SET value = $1 WHERE id = $2", [JSON.stringify(pData), row.id]);
+            await addPlayerMessage(row.id.replace("player_", ""), `⚠️ The Migu [${name}] was permanently deleted. You received ${compensation} F₵ compensation.`);
+            affectedPlayers++;
+          }
         }
-    } catch(err) {
-        return res.status(500).json({ error: "Database error during mass compensation." });
+      } catch(e) {}
     }
-
-    res.json({ success: true, message: `Migu [${name}] deleted. Compensated ${affectedPlayers} players.` });
+  } catch(err) { return res.status(500).json({ error: "Database error during mass compensation." }); }
+  res.json({ success: true, message: `Migu [${name}] deleted. Compensated ${affectedPlayers} players.` });
 });
 
 // ========================================================
@@ -899,35 +1201,24 @@ app.get('/migu/config', async (req, res) => {
   if (!player.ACTIVE_MIGU) { player.ACTIVE_MIGU = ""; updated = true; }
   if (updated) await savePlayerData(uuid, player);
 
-  return res.json({
-      status: "OK",
-      duel_wager: MIGU_CONFIG.duel_wager,
-      cookie_cost: MIGU_CONFIG.cookie_cost
-  });
+  return res.json({ status: "OK", duel_wager: MIGU_CONFIG.duel_wager, cookie_cost: MIGU_CONFIG.cookie_cost });
 });
 
 app.get('/migu/check-funds', async (req, res) => {
   const { uuid } = req.query;
   let player = await getPlayerData(uuid);
-  
-  if (player.COOKIE_STOCK > 0 || player.M >= MIGU_CONFIG.cookie_cost) {
-      return res.json({ status: "OK", balance: player.M, cookie_stock: player.COOKIE_STOCK });
-  } else {
-      return res.json({ status: "INSUFFICIENT", balance: player.M, cookie_stock: player.COOKIE_STOCK });
-  }
+  if (player.COOKIE_STOCK > 0 || player.M >= MIGU_CONFIG.cookie_cost) return res.json({ status: "OK", balance: player.M, cookie_stock: player.COOKIE_STOCK });
+  else return res.json({ status: "INSUFFICIENT", balance: player.M, cookie_stock: player.COOKIE_STOCK });
 });
 
 app.get('/migu/buy-cookie', async (req, res) => {
   const { uuid } = req.query;
   await withLock(uuid, async () => {
-      let player = await getPlayerData(uuid);
-      if (player.M < MIGU_CONFIG.cookie_cost) {
-          return res.send(`Failed: You need ${MIGU_CONFIG.cookie_cost} F₵ to buy a Taming Cookie.`);
-      }
-      player.M -= MIGU_CONFIG.cookie_cost;
-      player.COOKIE_STOCK = (player.COOKIE_STOCK || 0) + 1;
-      await savePlayerData(uuid, player);
-      return res.send(`SUCCESS: Bought 1 Taming Cookie! Stock: ${player.COOKIE_STOCK} | Balance: ${player.M} F₵`);
+    let player = await getPlayerData(uuid);
+    if (player.M < MIGU_CONFIG.cookie_cost) return res.send(`Failed: You need ${MIGU_CONFIG.cookie_cost} F₵ to buy a Taming Cookie.`);
+    player.M -= MIGU_CONFIG.cookie_cost; player.COOKIE_STOCK = (player.COOKIE_STOCK || 0) + 1;
+    await savePlayerData(uuid, player);
+    return res.send(`SUCCESS: Bought 1 Taming Cookie! Stock: ${player.COOKIE_STOCK} | Balance: ${player.M} F₵`);
   });
 });
 
@@ -940,90 +1231,64 @@ app.get('/migu/inventory', async (req, res) => {
 app.get('/migu/abandon', async (req, res) => {
   const { uuid, name } = req.query;
   await withLock(uuid, async () => {
-      let player = await getPlayerData(uuid);
-      if (!player.MIGUS) player.MIGUS = [];
-      let idx = player.MIGUS.findIndex(m => m.name.toLowerCase() === name.toLowerCase());
-      if (idx === -1) return res.send("Error: Migu not found in inventory.");
-      
-      player.MIGUS.splice(idx, 1);
-      if (player.ACTIVE_MIGU && player.ACTIVE_MIGU.toLowerCase() === name.toLowerCase()) {
-          player.ACTIVE_MIGU = player.MIGUS.length > 0 ? player.MIGUS[0].name : "";
-      }
-      await savePlayerData(uuid, player);
-      return res.send(`SUCCESS: Abandoned [${name}]. Released back into the wild.`);
+    let player = await getPlayerData(uuid);
+    if (!player.MIGUS) player.MIGUS = [];
+    let idx = player.MIGUS.findIndex(m => m.name.toLowerCase() === name.toLowerCase());
+    if (idx === -1) return res.send("Error: Migu not found in inventory.");
+    
+    player.MIGUS.splice(idx, 1);
+    if (player.ACTIVE_MIGU && player.ACTIVE_MIGU.toLowerCase() === name.toLowerCase()) {
+      player.ACTIVE_MIGU = player.MIGUS.length > 0 ? player.MIGUS[0].name : "";
+    }
+    await savePlayerData(uuid, player);
+    return res.send(`SUCCESS: Abandoned [${name}]. Released back into the wild.`);
   });
 });
 
 app.get('/migu/catch', async (req, res) => {
   const { uuid, z, water, ground } = req.query;
-
   await withLock(uuid, async () => {
-      let player = await getPlayerData(uuid);
-      if (!player.MIGUS) player.MIGUS = [];
+    let player = await getPlayerData(uuid);
+    if (!player.MIGUS) player.MIGUS = [];
+    if (player.MIGUS.length >= 20) return res.send(`Failed: Your Migu inventory is full (Max 20). Abandon a Migu to catch more!`);
 
-      if (player.MIGUS.length >= 20) {
-          return res.send(`Failed: Your Migu inventory is full (Max 20). Abandon a Migu to catch more!`);
-      }
+    let usedStock = false;
+    if ((player.COOKIE_STOCK || 0) > 0) { player.COOKIE_STOCK -= 1; usedStock = true; } 
+    else {
+      if (player.M < MIGU_CONFIG.cookie_cost) return res.send(`Failed: You need ${MIGU_CONFIG.cookie_cost} F₵ or a Cookie in stock!`);
+      player.M -= MIGU_CONFIG.cookie_cost;
+    }
 
-      let usedStock = false;
-      if ((player.COOKIE_STOCK || 0) > 0) {
-          player.COOKIE_STOCK -= 1;
-          usedStock = true;
-      } else {
-          if (player.M < MIGU_CONFIG.cookie_cost) {
-              return res.send(`Failed: You need ${MIGU_CONFIG.cookie_cost} F₵ or a Cookie in stock!`);
-          }
-          player.M -= MIGU_CONFIG.cookie_cost;
-      }
+    let envClass = "Walker";
+    if (parseFloat(z) > 100) envClass = "Flyer";
+    else if (parseFloat(water) > parseFloat(ground)) envClass = "Swimmer";
 
-      let envClass = "Walker";
-      if (parseFloat(z) > 100) envClass = "Flyer";
-      else if (parseFloat(water) > parseFloat(ground)) envClass = "Swimmer";
+    let availableMigus = MIGU_LIST.filter(m => m.subClass.toLowerCase() === envClass.toLowerCase());
+    if (availableMigus.length === 0) {
+      await savePlayerData(uuid, player);
+      return res.send(`The Cookie broke! No Migus of type [${envClass}] registered here.`);
+    }
 
-      let availableMigus = MIGU_LIST.filter(m => m.subClass.toLowerCase() === envClass.toLowerCase());
-      
-      if (availableMigus.length === 0) {
-          await savePlayerData(uuid, player);
-          return res.send(`The Cookie broke! No Migus of type [${envClass}] registered here.`);
-      }
+    if (Math.random() <= MIGU_CONFIG.catch_chance) {
+      const selected = availableMigus[Math.floor(Math.random() * availableMigus.length)];
+      let rarityRoll = Math.random(); let rarity = "Common"; let minVal = 10, maxVal = 20;
+      if (rarityRoll < 0.10) { rarity = "Rare"; minVal = 36; maxVal = 50; }
+      else if (rarityRoll < 0.40) { rarity = "Uncommon"; minVal = 21; maxVal = 35; }
 
-      if (Math.random() <= MIGU_CONFIG.catch_chance) {
-          const selected = availableMigus[Math.floor(Math.random() * availableMigus.length)];
-          
-          let rarityRoll = Math.random();
-          let rarity = "Common";
-          let minVal = 10, maxVal = 20;
-          if (rarityRoll < 0.10) { rarity = "Rare"; minVal = 36; maxVal = 50; }
-          else if (rarityRoll < 0.40) { rarity = "Uncommon"; minVal = 21; maxVal = 35; }
+      let initPower = Math.floor(Math.random() * (maxVal - minVal + 1)) + minVal;
+      let initHp = Math.floor(Math.random() * (maxVal - minVal + 1)) + minVal;
 
-          let initPower = Math.floor(Math.random() * (maxVal - minVal + 1)) + minVal;
-          let initHp = Math.floor(Math.random() * (maxVal - minVal + 1)) + minVal;
-
-          const newMigu = {
-              name: selected.name,
-              mClass: selected.mClass,
-              subClass: selected.subClass,
-              rarity: rarity,
-              power: initPower,
-              maxPower: initPower + 100,
-              hp: initHp,
-              maxHp: initHp + 100
-          };
-
-          player.MIGUS.push(newMigu);
-          if (!player.ACTIVE_MIGU) player.ACTIVE_MIGU = selected.name; 
-          await savePlayerData(uuid, player);
-          return res.send(`SUCCESS! Caught [${selected.name}] (${rarity})! [P:${initPower}|HP:${initHp}] | Stock: ${player.COOKIE_STOCK} | Bal: ${player.M}F₵`);
-      } else {
-          let willStay = Math.random() < 0.5;
-          await savePlayerData(uuid, player);
-
-          if (willStay) {
-              return res.send(`RETRY: The Migu resisted the Cookie, but stayed in place! Try again? (Stock: ${player.COOKIE_STOCK} | Bal: ${player.M}F₵)`);
-          } else {
-              return res.send(`FLED: The Migu broke the Cookie and fled into the wild! (Stock: ${player.COOKIE_STOCK} | Bal: ${player.M}F₵)`);
-          }
-      }
+      const newMigu = { name: selected.name, mClass: selected.mClass, subClass: selected.subClass, rarity: rarity, power: initPower, maxPower: initPower + 100, hp: initHp, maxHp: initHp + 100 };
+      player.MIGUS.push(newMigu);
+      if (!player.ACTIVE_MIGU) player.ACTIVE_MIGU = selected.name; 
+      await savePlayerData(uuid, player);
+      return res.send(`SUCCESS! Caught [${selected.name}] (${rarity})! [P:${initPower}|HP:${initHp}] | Stock: ${player.COOKIE_STOCK} | Bal: ${player.M}F₵`);
+    } else {
+      let willStay = Math.random() < 0.5;
+      await savePlayerData(uuid, player);
+      if (willStay) return res.send(`RETRY: The Migu resisted the Cookie, but stayed in place! Try again? (Stock: ${player.COOKIE_STOCK} | Bal: ${player.M}F₵)`);
+      else return res.send(`FLED: The Migu broke the Cookie and fled into the wild! (Stock: ${player.COOKIE_STOCK} | Bal: ${player.M}F₵)`);
+    }
   });
 });
 
@@ -1032,46 +1297,31 @@ app.get('/migu/duel', async (req, res) => {
   const duelLockStr = [p1, p2].sort().join("_");
   
   await withLock(duelLockStr, async () => {
-      let player1 = await getPlayerData(p1);
-      let player2 = await getPlayerData(p2);
+    let player1 = await getPlayerData(p1); let player2 = await getPlayerData(p2);
+    if (player1.M < MIGU_CONFIG.duel_wager) return res.send(`Duel Cancelled: Challenger doesn't have ${MIGU_CONFIG.duel_wager} F₵.`);
+    if (player2.M < MIGU_CONFIG.duel_wager) return res.send(`Duel Cancelled: Opponent doesn't have ${MIGU_CONFIG.duel_wager} F₵.`);
 
-      if (player1.M < MIGU_CONFIG.duel_wager) return res.send(`Duel Cancelled: Challenger doesn't have ${MIGU_CONFIG.duel_wager} F₵.`);
-      if (player2.M < MIGU_CONFIG.duel_wager) return res.send(`Duel Cancelled: Opponent doesn't have ${MIGU_CONFIG.duel_wager} F₵.`);
+    let p1Migu = player1.MIGUS.find(m => m.name.toLowerCase() === m1.toLowerCase());
+    let p2Migu = player2.MIGUS.find(m => m.name.toLowerCase() === m2.toLowerCase());
+    if (!p1Migu) return res.send(`Duel Cancelled: Challenger Migu [${m1}] not found.`);
+    if (!p2Migu) return res.send(`Duel Cancelled: Opponent Migu [${m2}] not found.`);
 
-      let p1Migu = player1.MIGUS.find(m => m.name.toLowerCase() === m1.toLowerCase());
-      let p2Migu = player2.MIGUS.find(m => m.name.toLowerCase() === m2.toLowerCase());
+    const p1Score = (p1Migu.power * 0.6 + p1Migu.hp * 0.4) * (0.8 + Math.random() * 0.4);
+    const p2Score = (p2Migu.power * 0.6 + p2Migu.hp * 0.4) * (0.8 + Math.random() * 0.4);
 
-      if (!p1Migu) return res.send(`Duel Cancelled: Challenger Migu [${m1}] not found.`);
-      if (!p2Migu) return res.send(`Duel Cancelled: Opponent Migu [${m2}] not found.`);
-
-      const p1Score = (p1Migu.power * 0.6 + p1Migu.hp * 0.4) * (0.8 + Math.random() * 0.4);
-      const p2Score = (p2Migu.power * 0.6 + p2Migu.hp * 0.4) * (0.8 + Math.random() * 0.4);
-
-      if (p1Score > p2Score) {
-          player1.M += MIGU_CONFIG.duel_wager;
-          player2.M -= MIGU_CONFIG.duel_wager;
-          
-          p1Migu.power = Math.min(p1Migu.maxPower, p1Migu.power + 10);
-          p1Migu.hp = Math.min(p1Migu.maxHp, p1Migu.hp + 10);
-          p2Migu.power = Math.min(p2Migu.maxPower, p2Migu.power + 5);
-          p2Migu.hp = Math.min(p2Migu.maxHp, p2Migu.hp + 5);
-
-          await savePlayerData(p1, player1);
-          await savePlayerData(p2, player2);
-          return res.send(`⚔️ CHALLENGER WINS!\n[${p1Migu.name}] (+10 P/HP) defeated [${p2Migu.name}] (+5 P/HP).\nWon ${MIGU_CONFIG.duel_wager} F₵!`);
-      } else {
-          player2.M += MIGU_CONFIG.duel_wager;
-          player1.M -= MIGU_CONFIG.duel_wager;
-          
-          p2Migu.power = Math.min(p2Migu.maxPower, p2Migu.power + 10);
-          p2Migu.hp = Math.min(p2Migu.maxHp, p2Migu.hp + 10);
-          p1Migu.power = Math.min(p1Migu.maxPower, p1Migu.power + 5);
-          p1Migu.hp = Math.min(p1Migu.maxHp, p1Migu.hp + 5);
-
-          await savePlayerData(p1, player1);
-          await savePlayerData(p2, player2);
-          return res.send(`⚔️ DEFENDER WINS!\n[${p2Migu.name}] (+10 P/HP) destroyed [${p1Migu.name}] (+5 P/HP).\nChallenger lost ${MIGU_CONFIG.duel_wager} F₵!`);
-      }
+    if (p1Score > p2Score) {
+      player1.M += MIGU_CONFIG.duel_wager; player2.M -= MIGU_CONFIG.duel_wager;
+      p1Migu.power = Math.min(p1Migu.maxPower, p1Migu.power + 10); p1Migu.hp = Math.min(p1Migu.maxHp, p1Migu.hp + 10);
+      p2Migu.power = Math.min(p2Migu.maxPower, p2Migu.power + 5); p2Migu.hp = Math.min(p2Migu.maxHp, p2Migu.hp + 5);
+      await savePlayerData(p1, player1); await savePlayerData(p2, player2);
+      return res.send(`⚔️ CHALLENGER WINS!\n[${p1Migu.name}] (+10 P/HP) defeated [${p2Migu.name}] (+5 P/HP).\nWon ${MIGU_CONFIG.duel_wager} F₵!`);
+    } else {
+      player2.M += MIGU_CONFIG.duel_wager; player1.M -= MIGU_CONFIG.duel_wager;
+      p2Migu.power = Math.min(p2Migu.maxPower, p2Migu.power + 10); p2Migu.hp = Math.min(p2Migu.maxHp, p2Migu.hp + 10);
+      p1Migu.power = Math.min(p1Migu.maxPower, p1Migu.power + 5); p1Migu.hp = Math.min(p1Migu.maxHp, p1Migu.hp + 5);
+      await savePlayerData(p1, player1); await savePlayerData(p2, player2);
+      return res.send(`⚔️ DEFENDER WINS!\n[${p2Migu.name}] (+10 P/HP) destroyed [${p1Migu.name}] (+5 P/HP).\nChallenger lost ${MIGU_CONFIG.duel_wager} F₵!`);
+    }
   });
 });
 
@@ -1099,9 +1349,7 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
         let mData = await dbGet(srv) || "";
         let mList = mData ? mData.split("ç") : [];
         if (mList.findIndex(item => item.startsWith(uuid + "#")) !== -1) {
-          targetServer = srv;
-          found = true;
-          break; 
+          targetServer = srv; found = true; break; 
         }
       }
       if (!found && action !== "SET_PARCEL") return res.status(404).json({ error: "Parcela não encontrada em nenhum continente ativo." });
@@ -1124,8 +1372,7 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
 
         let idx = mList.findIndex(item => item.startsWith(uuid + "#"));
         if (idx !== -1) {
-          mList.splice(idx, 1);
-          nList.splice(idx, 1);
+          mList.splice(idx, 1); nList.splice(idx, 1);
           await saveServerChunks(srv, mList, nList);
         }
       }
@@ -1136,49 +1383,35 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
       let targetNamesList = tJoined ? tJoined.split("ç") : [];
       while (targetNamesList.length < targetMainList.length) targetNamesList.push("NULL");
 
-      targetMainList.push(newItem);
-      targetNamesList.push(cleanRegion);
+      targetMainList.push(newItem); targetNamesList.push(cleanRegion);
       await saveServerChunks(targetServer, targetMainList, targetNamesList);
     } 
     else if (action === "MOVE_HUB") {
-      let foundItem = null;
-      let foundName = null;
-
+      let foundItem = null; let foundName = null;
       for (let srv of servers) {
-        let mData = await dbGet(srv) || "";
-        let mList = mData ? mData.split("ç") : [];
-        
+        let mData = await dbGet(srv) || ""; let mList = mData ? mData.split("ç") : [];
         let idx = mList.findIndex(item => item.startsWith(uuid + "#"));
         if (idx !== -1) {
           let joined = [await dbGet(`${srv}_NAMES_1`), await dbGet(`${srv}_NAMES_2`), await dbGet(`${srv}_NAMES_3`), await dbGet(`${srv}_NAMES_4`), await dbGet(`${srv}_NAMES_5`)].filter(Boolean).join("ç");
           let nList = joined ? joined.split("ç") : [];
           while (nList.length < mList.length) nList.push("NULL");
-
-          foundItem = mList.splice(idx, 1)[0];
-          foundName = nList.splice(idx, 1)[0];
-
+          foundItem = mList.splice(idx, 1)[0]; foundName = nList.splice(idx, 1)[0];
           await saveServerChunks(srv, mList, nList);
           break;
         }
       }
+      if (!foundItem) return res.status(404).json({ error: "Parcela não encontrada em nenhum continente ativo para mover." });
 
-      if (!foundItem) {
-          return res.status(404).json({ error: "Parcela não encontrada em nenhum continente ativo para mover." });
-      }
-
-      let destMainData = await dbGet(targetServer) || "";
-      let destMainList = destMainData ? destMainData.split("ç") : [];
+      let destMainData = await dbGet(targetServer) || ""; let destMainList = destMainData ? destMainData.split("ç") : [];
       let tJoined = [await dbGet(`${targetServer}_NAMES_1`), await dbGet(`${targetServer}_NAMES_2`), await dbGet(`${targetServer}_NAMES_3`), await dbGet(`${targetServer}_NAMES_4`), await dbGet(`${targetServer}_NAMES_5`)].filter(Boolean).join("ç");
       let destNamesList = tJoined ? tJoined.split("ç") : [];
       while (destNamesList.length < destMainList.length) destNamesList.push("NULL");
 
-      destMainList.push(foundItem);
-      destNamesList.push(foundName);
+      destMainList.push(foundItem); destNamesList.push(foundName);
       await saveServerChunks(targetServer, destMainList, destNamesList);
     }
     else {
-      let mainData = await dbGet(targetServer) || ""; 
-      let mainList = mainData ? mainData.split("ç") : [];
+      let mainData = await dbGet(targetServer) || ""; let mainList = mainData ? mainData.split("ç") : [];
       let joined = [await dbGet(`${targetServer}_NAMES_1`), await dbGet(`${targetServer}_NAMES_2`), await dbGet(`${targetServer}_NAMES_3`), await dbGet(`${targetServer}_NAMES_4`), await dbGet(`${targetServer}_NAMES_5`)].filter(Boolean).join("ç");
       let namesList = joined ? joined.split("ç") : [];
       while (namesList.length < mainList.length) namesList.push("NULL");
@@ -1194,10 +1427,8 @@ app.post('/admin/parcel', requireToken, async (req, res) => {
         const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
         if (idx !== -1) {
           let targetPos = newPos < 0 ? 0 : (newPos > mainList.length ? mainList.length : newPos);
-          const item = mainList.splice(idx, 1)[0];
-          const name = namesList.splice(idx, 1)[0];
-          mainList.splice(targetPos, 0, item);
-          namesList.splice(targetPos, 0, name);
+          const item = mainList.splice(idx, 1)[0]; const name = namesList.splice(idx, 1)[0];
+          mainList.splice(targetPos, 0, item); namesList.splice(targetPos, 0, name);
         }
       }
       else if (action === "UPDATE_REGION") {
@@ -1218,8 +1449,7 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
       let serversData = await dbGet("SERVERS");
       let servers = serversData ? serversData.split("ç").filter(Boolean) : [];
       for (let srv of servers) {
-        let mainData = await dbGet(srv) || "";
-        let mainList = mainData ? mainData.split("ç").filter(Boolean) : [];
+        let mainData = await dbGet(srv) || ""; let mainList = mainData ? mainData.split("ç").filter(Boolean) : [];
         if (mainList.length === 0) continue;
 
         let originalNames = [await dbGet(`${srv}_NAMES_1`), await dbGet(`${srv}_NAMES_2`), await dbGet(`${srv}_NAMES_3`), await dbGet(`${srv}_NAMES_4`), await dbGet(`${srv}_NAMES_5`)].filter(Boolean).join("ç");
@@ -1269,60 +1499,16 @@ app.post('/admin/sync-regions', requireToken, async (req, res) => {
   })();
 });
 
-async function isHubImmune(parcelUuid) {
-  if (!parcelUuid) return false;
-  let target = parcelUuid.toLowerCase().replace(/[^0-9a-f\-]/g, ""); 
-  if (target.length !== 36) return false;
-
-  try {
-      const qSatori = await db.query("SELECT value FROM kvstore WHERE id ILIKE 'satori'");
-      for (let row of qSatori.rows) {
-          if (row.value) {
-              let list = row.value.split("ç").filter(Boolean);
-              if (list.length > 0) {
-                  let mainUuid = list[0].split("#")[0].toLowerCase().replace(/[^0-9a-f\-]/g, "");
-                  if (target === mainUuid) return true; 
-              }
-          }
-      }
-
-      let targetRegionName = "";
-      const qContinents = await db.query("SELECT value FROM kvstore WHERE id IN ('Satori', 'Corsica', 'Nautilus', 'Heterocera', 'Jeogeot', 'Gaeta5', 'Zindra', 'Bellisseria', 'Blake_Sea', 'SATORI')");
-      for (let row of qContinents.rows) {
-          if (row.value) {
-              let list = row.value.split("ç").filter(Boolean);
-              for (let item of list) {
-                  let parts = item.split("#");
-                  if (parts[0].toLowerCase().replace(/[^0-9a-f\-]/g, "") === target) {
-                      if (parts.length > 1) {
-                          targetRegionName = parts[1].toLowerCase().trim();
-                          break;
-                      }
-                  }
-              }
-          }
-          if (targetRegionName) break;
-      }
-
-      const qBoosted = await db.query(`SELECT id, value FROM kvstore WHERE id ILIKE '%boost%' OR id ILIKE '%event%' OR id ILIKE '%hub%'`);
-      for (let row of qBoosted.rows) {
-          if (row.value && typeof row.value === 'string') {
-              let valStr = row.value.toLowerCase();
-              if (valStr.includes(target)) return true;
-              if (targetRegionName && targetRegionName.length > 2 && valStr.includes(targetRegionName)) return true; 
-          }
-      }
-  } catch(e) { console.error("Erro imunidade:", e); }
-  return false; 
-}
-
+// ========================================================
+// CORE CARGO AND PARCEL DEMAND HELPERS
+// ========================================================
 async function processParcelDemand(parcelUuid, user) {
   if (!parcelUuid || parcelUuid.length < 36) return 1.0;
   let cleanUuid = parcelUuid.toLowerCase().replace(/[^0-9a-f\-]/g, "");
   if (cleanUuid.length !== 36) return 1.0;
   
   const key = `PARCEL_${cleanUuid}`;
-  let isImmune = await isHubImmune(cleanUuid);
+  let isImmune = await isValidGfnHub(cleanUuid); 
 
   try {
       let dataStr = await dbGet(key);
@@ -1331,9 +1517,7 @@ async function processParcelDemand(parcelUuid, user) {
       let now = getUnixTime();
 
       if (isImmune) {
-          parcel.mult = 1.0;
-          parcel.history = [];
-          parcel.last_delivery = now;
+          parcel.mult = 1.0; parcel.history = []; parcel.last_delivery = now;
           await dbSet(key, JSON.stringify(parcel));
           return 1.0;
       }
@@ -1363,7 +1547,7 @@ async function getParcelDemandOnly(parcelUuid) {
   if (!parcelUuid || parcelUuid.length < 36) return { mult: 1.0, last_delivery: 0 };
   let cleanUuid = parcelUuid.toLowerCase().replace(/[^0-9a-f\-]/g, "");
   if (cleanUuid.length !== 36) return { mult: 1.0, last_delivery: 0 };
-  if (await isHubImmune(cleanUuid)) return { mult: 1.0, last_delivery: 0 };
+  if (await isValidGfnHub(cleanUuid)) return { mult: 1.0, last_delivery: 0 };
   
   const key = `PARCEL_${cleanUuid}`;
   try {
@@ -1381,6 +1565,9 @@ async function getParcelDemandOnly(parcelUuid) {
   } catch (err) { return { mult: 1.0, last_delivery: 0 }; }
 }
 
+// ========================================================
+// CARGO ACTION ROUTE
+// ========================================================
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime, action } = req.body;
   let safeTopic = (topic || action || "").toLowerCase().trim();
@@ -1408,35 +1595,23 @@ app.post("/action", requireToken, async (req, res) => {
         while (wParts.length < 10) wParts.push(0);
 
         const prices = [
-          DREDGE_CONFIG.sandPrice,
-          DREDGE_CONFIG.gravelPrice,
-          DREDGE_CONFIG.clayPrice,
-          DREDGE_CONFIG.ironPrice,
-          DREDGE_CONFIG.copperPrice,
-          DREDGE_CONFIG.titaniumPrice,
-          DREDGE_CONFIG.silverPrice,
-          DREDGE_CONFIG.goldPrice,
-          DREDGE_CONFIG.platinumPrice,
+          DREDGE_CONFIG.sandPrice, DREDGE_CONFIG.gravelPrice, DREDGE_CONFIG.clayPrice,
+          DREDGE_CONFIG.ironPrice, DREDGE_CONFIG.copperPrice, DREDGE_CONFIG.titaniumPrice,
+          DREDGE_CONFIG.silverPrice, DREDGE_CONFIG.goldPrice, DREDGE_CONFIG.platinumPrice,
           DREDGE_CONFIG.diamondPrice
         ];
 
-        let rawTotal = 0;
-        let totalKg = 0;
+        let rawTotal = 0; let totalKg = 0;
         for (let i = 0; i < 10; i++) {
           rawTotal += wParts[i] * prices[i];
           totalKg += wParts[i];
         }
 
         let price = Math.round(rawTotal);
-        if (price <= 0) {
-          responsePayload = { status: "empty" };
-          return res.json(responsePayload);
-        }
+        if (price <= 0) return res.json({ status: "empty" });
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
 
-        let recebido = 0;
-        let boost_m = 1.0;
-        let currentWeek = getCurrentWeek();
+        let recebido = 0; let boost_m = 1.0; let currentWeek = getCurrentWeek();
 
         if (player.P_W !== currentWeek) { player.P = 0; player.P_W = currentWeek; }
 
@@ -1444,8 +1619,7 @@ app.post("/action", requireToken, async (req, res) => {
           boost_m = parseFloat(player.B_M) || 1.0;
           if (boost_m > 1.0) price = Math.round(price * boost_m);
         } else if (player.B_T > 0) {
-          player.B_M = 1.0;
-          player.B_T = 0;
+          player.B_M = 1.0; player.B_T = 0;
         }
 
         const ptsMult = DREDGE_CONFIG.pointsPct || 0.10;
@@ -1462,8 +1636,7 @@ app.post("/action", requireToken, async (req, res) => {
             premiumBonus = Math.floor(price * 0.2);
             await addPlayerMessage(user, "You won 20% more for being PREMIUM.");
           }
-          player.M += (price + premiumBonus);
-          recebido = price + premiumBonus;
+          player.M += (price + premiumBonus); recebido = price + premiumBonus;
           await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         } else if (plan === "TEST_CARGO") {
           if (player.TC_W !== currentWeek) { player.TC_V = 0; player.TC_W = currentWeek; }
@@ -1471,9 +1644,7 @@ app.post("/action", requireToken, async (req, res) => {
             await addPlayerMessage(user, `You have reached the limit of ${MAX_TC} F₵ in your test plan this week.`);
           } else {
             let grant = (player.TC_V + price >= MAX_TC) ? (MAX_TC - player.TC_V) : price;
-            player.TC_V += grant;
-            player.M += grant;
-            recebido = grant;
+            player.TC_V += grant; player.M += grant; recebido = grant;
             await addPlayerMessage(user, `⚓ Sold dredged minerals for ${grant} F₵.`);
           }
           player.P += Math.round((recebido * 0.8) * ptsMult);
@@ -1484,9 +1655,7 @@ app.post("/action", requireToken, async (req, res) => {
             await addPlayerMessage(user, `You have reached the limit of ${MAX_EV} F₵ in your event plan this week.`);
           } else {
             let grant = (player.EV_V + price >= MAX_EV) ? (MAX_EV - player.EV_V) : price;
-            player.EV_V += grant;
-            player.M += grant;
-            recebido = grant;
+            player.EV_V += grant; player.M += grant; recebido = grant;
             await addPlayerMessage(user, `⚓ Sold dredged minerals for ${grant} F₵.`);
           }
           player.P += Math.round((recebido * 0.5) * ptsMult);
@@ -1496,9 +1665,7 @@ app.post("/action", requireToken, async (req, res) => {
             await addPlayerMessage(user, `You have reached the limit of ${MAX_F} F₵ in your free plan.`);
           } else {
             let grant = (player.RE + price >= MAX_F) ? (MAX_F - player.RE) : price;
-            player.RE += grant;
-            player.M += grant;
-            recebido = grant;
+            player.RE += grant; player.M += grant; recebido = grant;
             await addPlayerMessage(user, `⚓ Sold dredged minerals for ${grant} F₵.`);
           }
           await addPlayerMessage(user, `You have now ${player.M} F₵.`);
@@ -1511,8 +1678,7 @@ app.post("/action", requireToken, async (req, res) => {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
 
-        let demandMult = 1.0;
-        let targetParcel = null;
+        let demandMult = 1.0; let targetParcel = null;
 
         for (let i = 0; i < 8; i++) {
             if (player.ACTIVE_PARCEL && (now - player.PARCEL_TIME) < 1800) { 
@@ -1551,12 +1717,12 @@ app.post("/action", requireToken, async (req, res) => {
           if (player.AT !== "A") { player.AT = "A"; responsePayload.newBuyer = true; }
 
           try {
-            const buyersRes = await db.query("SELECT value FROM kvstore WHERE id=$1", ["GFN_BUYERS"]);
+            const buyersRes = await dbGet("GFN_BUYERS");
             let buyersList = [];
-            if (buyersRes.rowCount > 0 && buyersRes.rows[0].value) buyersList = buyersRes.rows[0].value.split(",").filter(Boolean);
+            if (buyersRes) buyersList = buyersRes.split(",").filter(Boolean);
             if (!buyersList.includes(user)) {
               buyersList.push(user);
-              await db.query(`INSERT INTO kvstore (id, value) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET value = EXCLUDED.value`, ["GFN_BUYERS", buyersList.join(",")]);
+              await dbSet("GFN_BUYERS", buyersList.join(","));
             }
           } catch (e) {}
 
