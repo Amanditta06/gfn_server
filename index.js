@@ -1233,7 +1233,7 @@ app.post('/admin/migu/add', requireToken, async (req, res) => {
 
   let idx = MIGU_LIST.findIndex(m => m.name.toLowerCase() === name.toLowerCase());
   if (idx !== -1) MIGU_LIST[idx] = { name, mClass, subClass, image };
-  else MIGU_LIST.push({ name, mClass, subClass, image };
+  else MIGU_LIST.push({ name, mClass, subClass, image });
   
   await dbSet("MIGU_LIST", JSON.stringify(MIGU_LIST));
   res.json({ success: true, message: `Migu [${name}] added to the Database.` });
