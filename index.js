@@ -12,6 +12,7 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || "changeme";
 const DATABASE_URL = process.env.DATABASE_URL;
+const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
 
 if (!DATABASE_URL) {
   console.warn("WARNING: DATABASE_URL not set. DB calls will fail until it's configured.");
@@ -2137,6 +2138,54 @@ app.post("/set", requireToken, async (req, res) => {
 
     res.json({ status: "ok", id, value });
   } catch (e) { res.status(500).json({ error: "db error" }); }
+});
+
+// ========================================================
+// AI CHATBOT ROUTE (GROQ)
+// ========================================================
+app.post("/ai/chat", requireToken, async (req, res) => {
+  const { user, message } = req.body;
+  if (!user || !message) {
+    return res.status(400).json({ error: "missing user or message" });
+  }
+
+  try {
+    let playerData = await getPlayerData(user);
+    let currentWeek = getCurrentWeek();
+    let weeklyPoints = (playerData.P_W === currentWeek) ? (playerData.P || 0) : 0;
+
+    const systemPrompt = `You are the official AI assistant for Grid Freight Net (GFN) in Second Life. 
+    The user currently speaking to you has a balance of ${playerData.M || 0} F₵, ${weeklyPoints} weekly points, and ${playerData.COOKIE_STOCK || 0} Taming Cookies. 
+    Reply in the same language the user speaks to you (Portuguese, English, etc.). 
+    Be helpful, friendly, and concise (maximum 2 to 3 short sentences so it fits cleanly in Second Life chat).`;
+
+    const aiResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${GROQ_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: "llama-3.3-70b-versatile",
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: String(message) }
+        ],
+        max_tokens: 180,
+        temperature: 0.7
+      })
+    });
+
+    const aiData = await aiResponse.json();
+    if (!aiResponse.ok) {
+      return res.status(500).json({ error: "Groq API error", details: aiData });
+    }
+
+    const reply = aiData.choices?.[0]?.message?.content || "Sem resposta da IA.";
+    res.json({ status: "success", reply });
+  } catch (err) {
+    res.status(500).json({ error: "Internal server error during AI processing" });
+  }
 });
 
 app.get("/", (req, res) => res.json({ status: "ok" }));
