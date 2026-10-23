@@ -2141,7 +2141,7 @@ app.post("/set", requireToken, async (req, res) => {
 });
 
 // ========================================================
-// AI CHATBOT ROUTE (GROQ)
+// AI CHATBOT ROUTE (GROQ) - COM LOGS DE DEBUG
 // ========================================================
 app.post("/ai/chat", requireToken, async (req, res) => {
   const { user, message } = req.body;
@@ -2150,14 +2150,18 @@ app.post("/ai/chat", requireToken, async (req, res) => {
   }
 
   try {
+    console.log(`[AI CHAT] Mensagem recebida do UUID ${user}: ${message}`);
+    
     let playerData = await getPlayerData(user);
     let currentWeek = getCurrentWeek();
     let weeklyPoints = (playerData.P_W === currentWeek) ? (playerData.P || 0) : 0;
 
     const systemPrompt = `You are the official AI assistant for Grid Freight Net (GFN) in Second Life. 
     The user currently speaking to you has a balance of ${playerData.M || 0} F₵, ${weeklyPoints} weekly points, and ${playerData.COOKIE_STOCK || 0} Taming Cookies. 
-    Reply in the same language the user speaks to you (Portuguese, English, etc.). 
+    Reply in the same language the user speaks to you. 
     Be helpful, friendly, and concise (maximum 2 to 3 short sentences so it fits cleanly in Second Life chat).`;
+
+    console.log("[AI CHAT] Chamando a API da Groq...");
 
     const aiResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
@@ -2177,14 +2181,19 @@ app.post("/ai/chat", requireToken, async (req, res) => {
     });
 
     const aiData = await aiResponse.json();
+    
     if (!aiResponse.ok) {
+      console.error("[AI CHAT] A Groq recusou a chamada. Detalhes:", aiData);
       return res.status(500).json({ error: "Groq API error", details: aiData });
     }
 
     const reply = aiData.choices?.[0]?.message?.content || "Sem resposta da IA.";
+    console.log("[AI CHAT] Resposta gerada com sucesso!");
+    
     res.json({ status: "success", reply });
   } catch (err) {
-    res.status(500).json({ error: "Internal server error during AI processing" });
+    console.error("[AI CHAT] O servidor CRASHOU. Erro fatal:", err);
+    res.status(500).json({ error: "Internal server error during AI processing", details: err.message });
   }
 });
 
