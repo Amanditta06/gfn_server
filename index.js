@@ -33,10 +33,10 @@ let MAX_TRANSACTION = 1000000;
 // ========================================================
 let MIGU_CONFIG = { version: "1.0", duel_wager: 50, cookie_cost: 10, catch_chance: 0.55 };
 let MIGU_LIST = []; 
-let GFN_KB = []; // Cache da Base de Conhecimento da IA
+let GFN_KB = []; 
 
 // ========================================================
-// DREDGE BRUSH & UUID RETURN QUEUE CONSTANTS (8m DIAMETER)
+// DREDGE BRUSH & UUID RETURN QUEUE CONSTANTS
 // ========================================================
 const DREDGE_RADIUS = 4.0; 
 const DREDGE_RADIUS_SQ = DREDGE_RADIUS * DREDGE_RADIUS; 
@@ -621,10 +621,7 @@ setInterval(async () => {
         await processHallOfFame(oldRank);
       }
       await dbSet("weeklyTopFive", "Waiting for new deliveries...");
-      
-      // Reseta os mares de petróleo
       await resetWeeklyOilSeabed();
-
       activeServerWeek = currentNowWeek;
     } catch (e) {}
   }
@@ -1078,7 +1075,6 @@ app.post("/oil/transfer-to-refinery", requireToken, async (req, res) => {
       return res.json({ status: "EMPTY_OR_UNVERIFIED", transferredOil: 0, remainingTankOil: 0, paidFc: 0 });
     }
 
-    // Sincroniza o ledger caso o servidor tenha reiniciado ou dessincronizado
     let tankRecord = OIL_TANK_LEDGER.get(effTank);
     if (!tankRecord || tankRecord.oil < reqLiters) {
       tankRecord = {
@@ -1092,50 +1088,17 @@ app.post("/oil/transfer-to-refinery", requireToken, async (req, res) => {
     let deliverableOil = Math.round(Math.min(reqLiters, tankRecord.oil) * 10) / 10;
     const unitPrice = OIL_CONFIG.oilPricePerLiter || 2.5;
 
-    // ====================================================
-    // MODO 1: CHECK (Valida fundos e calcula limite antes de bombear)
-    // ====================================================
+    // Mantido modo CHECK apenas para compatibilidade, sem limites de fundos.
     if (effMode === "CHECK") {
-      if (sOwner === rOwner) {
-        return res.json({
-          status: "CHECK_OK",
-          sameOwner: true,
-          maxTransferOil: deliverableOil,
-          unitPrice
-        });
-      }
-
-      let buyerData = await getPlayerData(rOwner);
-      const buyerBalance = parseInt(buyerData.M, 10) || 0;
-
-      if (buyerBalance <= 0) {
-        return res.json({ status: "NO_FUNDS", maxTransferOil: 0, buyerBalance: 0 });
-      }
-
-      const fullCost = Math.ceil(deliverableOil * unitPrice);
-      let maxAllowedOil = deliverableOil;
-      let checkStatus = "CHECK_OK";
-
-      if (buyerBalance < fullCost) {
-        maxAllowedOil = Math.floor((buyerBalance / unitPrice) * 10) / 10;
-        if (maxAllowedOil <= 0.05) {
-          return res.json({ status: "NO_FUNDS", maxTransferOil: 0, buyerBalance });
-        }
-        checkStatus = "CHECK_PARTIAL";
-      }
-
       return res.json({
-        status: checkStatus,
-        sameOwner: false,
-        maxTransferOil: maxAllowedOil,
-        unitPrice,
-        buyerBalance
+        status: "CHECK_OK",
+        sameOwner: sOwner === rOwner,
+        maxTransferOil: deliverableOil,
+        unitPrice
       });
     }
 
-    // ====================================================
-    // MODO 2: PAY (Liquida e paga o valor exato transferido ao finalizar ou dar STOP)
-    // ====================================================
+    // MODO PAY - Integrado com Boosts, Saturation e Affinity. O saldo negativo do comprador é permitido!
     if (sOwner === rOwner) {
       tankRecord.oil = Math.round(Math.max(0, tankRecord.oil - deliverableOil) * 10) / 10;
       tankRecord.updatedAt = now;
@@ -1151,66 +1114,144 @@ app.post("/oil/transfer-to-refinery", requireToken, async (req, res) => {
 
     let buyerData = await getPlayerData(rOwner);
     let sellerData = await getPlayerData(sOwner);
-    const buyerBalance = parseInt(buyerData.M, 10) || 0;
 
-    if (buyerBalance <= 0) {
-      return res.json({
-        status: "NO_FUNDS",
-        transferredOil: 0,
-        remainingTankOil: tankRecord.oil,
-        paidFc: 0,
-        buyerBalance: 0
-      });
+    let fullCost = Math.ceil(deliverableOil * unitPrice);
+    let price = fullCost; 
+    let basePrice = fullCost; // O que o comprador vai pagar (antes das mágicas do servidor)
+    
+    // 1. AVALIAÇÃO DE DEMANDA E SATURAÇÃO DE PARCELA PARA A VENDA DE PETRÓLEO
+    let demandMult = 1.0; let targetParcel = null;
+    for (let i = 0; i < 8; i++) {
+        if (sellerData.ACTIVE_PARCEL && (now - sellerData.PARCEL_TIME) < 1800) { 
+            targetParcel = sellerData.ACTIVE_PARCEL.toLowerCase(); 
+            break;
+        }
+        await new Promise(resolve => setTimeout(resolve, 500));
+        sellerData = await getPlayerData(sOwner);
     }
 
-    const fullCost = Math.ceil(deliverableOil * unitPrice);
-    let finalOilTransferred = deliverableOil;
-    let finalCostFc = fullCost;
-    let transferStatus = "OK_PAID_FULL";
+    if (targetParcel && targetParcel.length >= 36) demandMult = await processParcelDemand(targetParcel, sOwner);
+    let savedParcelForAffinity = targetParcel; 
+    sellerData.ACTIVE_PARCEL = ""; sellerData.PARCEL_TIME = 0;
 
-    if (buyerBalance < fullCost) {
-      finalOilTransferred = Math.floor((buyerBalance / unitPrice) * 10) / 10;
-      if (finalOilTransferred <= 0.05) {
-        return res.json({
-          status: "NO_FUNDS",
-          transferredOil: 0,
-          remainingTankOil: tankRecord.oil,
-          paidFc: 0,
-          buyerBalance
-        });
-      }
-      finalCostFc = Math.min(buyerBalance, Math.ceil(finalOilTransferred * unitPrice));
-      transferStatus = "OK_PAID_PARTIAL";
+    if (demandMult < 1.0 && plan !== "EVENT") {
+        price = Math.round(price * demandMult);
+        let lostPercent = Math.round((1.0 - demandMult) * 100);
+        await addPlayerMessage(sOwner, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +15% every 10 minutes without deliveries.`);
     }
 
-    buyerData.M -= finalCostFc;
-    sellerData.M += finalCostFc;
+    // 2. AVALIAÇÃO DE BOOSTS
+    let boost_m = 1.0;
+    if (sellerData.B_T > now) {
+        boost_m = parseFloat(sellerData.B_M) || 1.0;
+        if (boost_m > 1.0) price = Math.round(price * boost_m);
+    } else if (sellerData.B_T > 0) { sellerData.B_M = 1.0; sellerData.B_T = 0; }
 
-    const currentWeek = getCurrentWeek();
-    if (sellerData.P_W !== currentWeek) {
-      sellerData.P = 0;
-      sellerData.P_W = currentWeek;
+    if (boost_m > 1.0) await addPlayerMessage(sOwner, `Oil Cargo value boosted by ${boost_m}X!`);
+
+    // =======================================================
+    // COBRANÇA DO COMPRADOR - PERMITINDO SALDO NEGATIVO
+    // =======================================================
+    buyerData.M -= basePrice; 
+
+    // =======================================================
+    // PAGAMENTO DO VENDEDOR (PLANOS)
+    // =======================================================
+    let recebido = 0; 
+    let currentWeek = getCurrentWeek();
+
+    if (sellerData.P_W !== currentWeek) { sellerData.P = 0; sellerData.P_W = currentWeek; }
+
+    if (plan !== "FREE" && plan !== "EVENT" && plan !== "TEST_CARGO") {
+        let premiumBonus = 0;
+        if (plan === "PREMIUM") {
+            premiumBonus = Math.floor(price * 0.2);
+            await addPlayerMessage(sOwner, "You won 20% more for being premium.");
+        }
+        sellerData.M += (price + premiumBonus); recebido = price + premiumBonus;
+        sellerData.P += Math.round(recebido * (OIL_CONFIG.pointsPct || 0.10));
     }
-    sellerData.P += Math.round(finalCostFc * (OIL_CONFIG.pointsPct || 0.10));
+    else if (plan === "TEST_CARGO") {
+        if (sellerData.TC_W !== currentWeek) { sellerData.TC_V = 0; sellerData.TC_W = currentWeek; }
+        if (sellerData.TC_V + price >= MAX_TC) {
+            let resto = MAX_TC - sellerData.TC_V;
+            sellerData.TC_V = MAX_TC; sellerData.M += resto; recebido = resto;
+        } else {
+            sellerData.TC_V += price; sellerData.M += price; recebido = price;
+        }
+        sellerData.P += Math.round((recebido * 0.8) * (OIL_CONFIG.pointsPct || 0.10));
+    }
+    else if (plan === "EVENT") {
+        if (sellerData.EV_W !== currentWeek) { sellerData.EV_V = 0; sellerData.EV_W = currentWeek; }
+        if (sellerData.EV_V + price >= MAX_EV) {
+            let resto = MAX_EV - sellerData.EV_V;
+            sellerData.EV_V = MAX_EV; sellerData.M += resto; recebido = resto;
+        } else {
+            sellerData.EV_V += price; sellerData.M += price; recebido = price;
+        }
+        sellerData.P += Math.round((recebido * 0.5) * (OIL_CONFIG.pointsPct || 0.10));
+    }
+    else if (plan === "FREE") {
+        if (sellerData.RE + price >= MAX_F) {
+            let resto = MAX_F - sellerData.RE;
+            sellerData.RE = MAX_F; sellerData.M += resto; recebido = resto;
+        } else {
+            sellerData.RE += price; sellerData.M += price; recebido = price;
+        }
+    }
 
+    // =======================================================
+    // AVALIAÇÃO DE AFINIDADE (AFFINITY) DO VENDEDOR
+    // =======================================================
+    if (savedParcelForAffinity && savedParcelForAffinity.length >= 36) {
+        sellerData.AFFINITY_TIME[savedParcelForAffinity] = now;
+        let currentAffinity = parseFloat(sellerData.AFFINITY[savedParcelForAffinity]) || 0.0;
+        let distance = sellerData.LAST_DIST || 0;
+        let addedAffinity = 0;
+
+        if (distance > 1000) {
+            if (currentAffinity < 0.5) {
+                addedAffinity = 0.01;
+                currentAffinity = Math.min(0.5, currentAffinity + 0.01);
+                currentAffinity = Math.round(currentAffinity * 100) / 100;
+                sellerData.AFFINITY[savedParcelForAffinity] = currentAffinity;
+                await addPlayerMessage(sOwner, `Your affinity with this HUB has increased by +${addedAffinity}. You now have ${currentAffinity} total affinity with this HUB.`);
+            }
+        }
+
+        if (currentAffinity > 0 && price > 0) {
+            let affinityBonus = Math.round(price * currentAffinity);
+            if (affinityBonus > 0) {
+                sellerData.M += affinityBonus; recebido += affinityBonus;
+                await addPlayerMessage(sOwner, `You received an extra payout of ${affinityBonus} F₵ due to the affinity bonus (${currentAffinity}x / ${(currentAffinity * 100).toFixed(0)}%) with this HUB.`);
+            }
+        }
+    }
+    sellerData.LAST_DIST = 0; 
+
+    // Finalizar ledger do tanque
+    tankRecord.oil = Math.round(Math.max(0, tankRecord.oil - deliverableOil) * 10) / 10;
+    tankRecord.updatedAt = now;
+    OIL_TANK_LEDGER.set(effTank, tankRecord);
+    
+    await dbSet("OIL_TANKS", serializeOilTanks());
     await savePlayerData(rOwner, buyerData);
     await savePlayerData(sOwner, sellerData);
 
-    tankRecord.oil = Math.round(Math.max(0, tankRecord.oil - finalOilTransferred) * 10) / 10;
-    tankRecord.updatedAt = now;
-    OIL_TANK_LEDGER.set(effTank, tankRecord);
-    await dbSet("OIL_TANKS", serializeOilTanks());
+    let msgSeller = `✅ 🛢️ Sold ${deliverableOil} L of Crude Oil to secondlife:///app/agent/${rOwner}/inspect's Refinery for ${recebido} F₵. Balance: ${sellerData.M} F₵`;
+    let msgBuyer = `✅ 🛢️ Your Refinery purchased ${deliverableOil} L of Crude Oil from secondlife:///app/agent/${sOwner}/inspect for ${basePrice} F₵. Balance: ${buyerData.M} F₵`;
 
-    await addPlayerMessage(sOwner, `🛢️ Sold ${finalOilTransferred} L of Crude Oil to secondlife:///app/agent/${rOwner}/inspect's Refinery for ${finalCostFc} F₵. Balance: ${sellerData.M} F₵`);
-    await addPlayerMessage(rOwner, `🛢️ Your Refinery purchased ${finalOilTransferred} L of Crude Oil from secondlife:///app/agent/${sOwner}/inspect for ${finalCostFc} F₵. Balance: ${buyerData.M} F₵`);
+    await addPlayerMessage(sOwner, msgSeller);
+    await addPlayerMessage(rOwner, msgBuyer);
 
     return res.json({
-      status: transferStatus,
-      transferredOil: finalOilTransferred,
+      status: "OK_PAID_FULL",
+      transferredOil: deliverableOil,
       remainingTankOil: tankRecord.oil,
-      paidFc: finalCostFc,
+      paidFc: recebido,
       sellerBalance: sellerData.M,
-      buyerBalance: buyerData.M
+      buyerBalance: buyerData.M,
+      msg: msgSeller
     });
   });
 });
@@ -1678,6 +1719,9 @@ app.post("/action", requireToken, async (req, res) => {
       let player = await getPlayerData(user);
       let now = getUnixTime();
 
+      // ====================================================
+      // DREDGE SELL - AGORA INCLUI DEMANDA, BOOSTS E AFINIDADE
+      // ====================================================
       if (safeTopic === "dredge sell") {
         const isHub = await isValidGfnHub(target);
         if (!isHub) {
@@ -1705,10 +1749,32 @@ app.post("/action", requireToken, async (req, res) => {
         if (price <= 0) return res.json({ status: "empty" });
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
 
+        // VERIFICAR DEMANDA E SATURAÇÃO
+        let demandMult = 1.0; let targetParcel = null;
+        for (let i = 0; i < 8; i++) {
+            if (player.ACTIVE_PARCEL && (now - player.PARCEL_TIME) < 1800) { 
+                targetParcel = player.ACTIVE_PARCEL.toLowerCase(); 
+                break;
+            }
+            await new Promise(resolve => setTimeout(resolve, 500));
+            player = await getPlayerData(user);
+        }
+
+        if (targetParcel && targetParcel.length >= 36) demandMult = await processParcelDemand(targetParcel, user);
+        let savedParcelForAffinity = targetParcel; 
+        player.ACTIVE_PARCEL = ""; player.PARCEL_TIME = 0;
+
+        if (demandMult < 1.0 && plan !== "EVENT") {
+            price = Math.round(price * demandMult);
+            let lostPercent = Math.round((1.0 - demandMult) * 100);
+            await addPlayerMessage(user, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +15% every 10 minutes without deliveries.`);
+        }
+
         let recebido = 0; let boost_m = 1.0; let currentWeek = getCurrentWeek();
 
         if (player.P_W !== currentWeek) { player.P = 0; player.P_W = currentWeek; }
 
+        // VERIFICAR BOOSTS
         if (player.B_T > now) {
           boost_m = parseFloat(player.B_M) || 1.0;
           if (boost_m > 1.0) price = Math.round(price * boost_m);
@@ -1718,6 +1784,7 @@ app.post("/action", requireToken, async (req, res) => {
 
         const ptsMult = DREDGE_CONFIG.pointsPct || 0.10;
 
+        // Payout baseado nos planos (Premium, Test, Event, Free)
         if (plan !== "FREE" && plan !== "EVENT" && plan !== "TEST_CARGO") {
           if (boost_m > 1.0) await addPlayerMessage(user, `⚓ Dredge payout boosted by ${boost_m}X!`);
           await addPlayerMessage(user, `⚓ Sold ${Math.round(totalKg * 10) / 10} kg of dredged minerals for ${price} F₵.`);
@@ -1731,7 +1798,6 @@ app.post("/action", requireToken, async (req, res) => {
             await addPlayerMessage(user, "You won 20% more for being PREMIUM.");
           }
           player.M += (price + premiumBonus); recebido = price + premiumBonus;
-          await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         } else if (plan === "TEST_CARGO") {
           if (player.TC_W !== currentWeek) { player.TC_V = 0; player.TC_W = currentWeek; }
           if (player.TC_V >= MAX_TC) {
@@ -1742,7 +1808,6 @@ app.post("/action", requireToken, async (req, res) => {
             await addPlayerMessage(user, `⚓ Sold dredged minerals for ${grant} F₵.`);
           }
           player.P += Math.round((recebido * 0.8) * ptsMult);
-          await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         } else if (plan === "EVENT") {
           if (player.EV_W !== currentWeek) { player.EV_V = 0; player.EV_W = currentWeek; }
           if (player.EV_V >= MAX_EV) {
@@ -1753,7 +1818,6 @@ app.post("/action", requireToken, async (req, res) => {
             await addPlayerMessage(user, `⚓ Sold dredged minerals for ${grant} F₵.`);
           }
           player.P += Math.round((recebido * 0.5) * ptsMult);
-          await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         } else if (plan === "FREE") {
           if (player.RE >= MAX_F) {
             await addPlayerMessage(user, `You have reached the limit of ${MAX_F} F₵ in your free plan.`);
@@ -1762,12 +1826,53 @@ app.post("/action", requireToken, async (req, res) => {
             player.RE += grant; player.M += grant; recebido = grant;
             await addPlayerMessage(user, `⚓ Sold dredged minerals for ${grant} F₵.`);
           }
-          await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         }
 
+        // VERIFICAR AFINIDADE PARA DREDGE
+        if (!player.AFFINITY) player.AFFINITY = {};
+        if (!player.AFFINITY_TIME) player.AFFINITY_TIME = {};
+
+        for (let hubUuid in player.AFFINITY) {
+            let lastTime = player.AFFINITY_TIME[hubUuid] || 0;
+            if (lastTime === 0) player.AFFINITY_TIME[hubUuid] = now;
+            else if ((now - lastTime) > 604800) { delete player.AFFINITY[hubUuid]; delete player.AFFINITY_TIME[hubUuid]; }
+        }
+
+        if (savedParcelForAffinity && savedParcelForAffinity.length >= 36) {
+            player.AFFINITY_TIME[savedParcelForAffinity] = now;
+            let currentAffinity = parseFloat(player.AFFINITY[savedParcelForAffinity]) || 0.0;
+            let distance = player.LAST_DIST || 0;
+            let addedAffinity = 0;
+
+            if (distance > 1000) {
+                if (currentAffinity < 0.5) {
+                    addedAffinity = 0.01;
+                    currentAffinity = Math.min(0.5, currentAffinity + 0.01);
+                    currentAffinity = Math.round(currentAffinity * 100) / 100;
+                    player.AFFINITY[savedParcelForAffinity] = currentAffinity;
+                    await addPlayerMessage(user, `Your affinity with this HUB has increased by +${addedAffinity}. You now have ${currentAffinity} total affinity with this HUB.`);
+                }
+            }
+
+            if (currentAffinity > 0 && price > 0) {
+                let affinityBonus = Math.round(price * currentAffinity);
+                if (affinityBonus > 0) {
+                    player.M += affinityBonus; recebido += affinityBonus;
+                    await addPlayerMessage(user, `You received an extra payout of ${affinityBonus} F₵ due to the affinity bonus (${currentAffinity}x / ${(currentAffinity * 100).toFixed(0)}%) with this HUB.`);
+                }
+            }
+        }
+        
+        await addPlayerMessage(user, `You have now ${player.M} F₵.`);
+        player.LAST_DIST = 0; 
         await savePlayerData(user, player);
         responsePayload.recebido = recebido;
+        responsePayload.msg = `⚓ Sold Dredge for ${recebido} F₵. Balance: ${player.M} F₵`;
       }
+      
+      // ====================================================
+      // CARGO SELL
+      // ====================================================
       else if (safeTopic === "cargo sell") {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
@@ -1827,7 +1932,6 @@ app.post("/action", requireToken, async (req, res) => {
             await addPlayerMessage(user, "You won 20% more for being premium.");
           }
           player.M += (price + premiumBonus); recebido = price + premiumBonus;
-          await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         } 
         else if (plan === "TEST_CARGO") {
           if (player.TC_W !== currentWeek) { player.TC_V = 0; player.TC_W = currentWeek; }
@@ -1843,7 +1947,6 @@ app.post("/action", requireToken, async (req, res) => {
             }
           }
           player.P += Math.round((recebido * 0.8) * 0.1);
-          await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         } 
         else if (plan === "EVENT") {
           if (player.EV_W !== currentWeek) { player.EV_V = 0; player.EV_W = currentWeek; }
@@ -1859,7 +1962,6 @@ app.post("/action", requireToken, async (req, res) => {
             }
           }
           player.P += Math.round((recebido * 0.5) * 0.1);
-          await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         } 
         else if (plan === "FREE") {
           if (player.RE >= MAX_F) await addPlayerMessage(user, `You have reached the limit of ${MAX_F} F₵ in your free plan.`);
@@ -1873,7 +1975,6 @@ app.post("/action", requireToken, async (req, res) => {
               await addPlayerMessage(user, `You won ${price} F₵.`);
             }
           }
-          await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         }
 
         if (!player.AFFINITY) player.AFFINITY = {};
@@ -1906,14 +2007,19 @@ app.post("/action", requireToken, async (req, res) => {
                 if (affinityBonus > 0) {
                     player.M += affinityBonus; recebido += affinityBonus;
                     await addPlayerMessage(user, `You received an extra payout of ${affinityBonus} F₵ due to the affinity bonus (${currentAffinity}x / ${(currentAffinity * 100).toFixed(0)}%) with this HUB.`);
-                    await addPlayerMessage(user, `You have now ${player.M} F₵.`);
                 }
             }
         }
+        
+        await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         player.LAST_DIST = 0; 
         await savePlayerData(user, player);
         responsePayload.recebido = recebido;
+        responsePayload.msg = `Sold cargo for ${recebido} F₵. Balance: ${player.M} F₵`;
       } 
+      // ====================================================
+      // OTHER ACTIONS
+      // ====================================================
       else if (safeTopic === "addboost") {
         let add_mult = parseFloat(content) || 1.0;
         let add_time = parseInt(target) || 0;
@@ -2158,7 +2264,7 @@ app.post("/ai/kb/add", requireToken, async (req, res) => {
   const { q, a } = req.body;
   if (!q || !a) return res.status(400).json({ error: "missing q or a" });
   
-  const newId = Date.now().toString().slice(-6); // Cria um ID curto de 6 digitos
+  const newId = Date.now().toString().slice(-6);
   GFN_KB.push({ id: newId, q, a });
   
   await dbSet("GFN_KNOWLEDGE_BASE", JSON.stringify(GFN_KB));
@@ -2195,7 +2301,6 @@ app.post("/ai/chat", requireToken, async (req, res) => {
     let currentWeek = getCurrentWeek();
     let weeklyPoints = (playerData.P_W === currentWeek) ? (playerData.P || 0) : 0;
 
-    // Se houver perguntas e respostas cadastradas, joga para o contexto da IA
     let kbContext = "";
     if (GFN_KB && GFN_KB.length > 0) {
       kbContext = "Here is the official GFN Product Knowledge Base. Use this exact information if the user asks something related, but rephrase it naturally in your persona style (do not sound like a robot reading a manual):\n";
