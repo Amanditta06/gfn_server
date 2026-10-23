@@ -29,10 +29,11 @@ let MAX_F = 2000;
 let MAX_TRANSACTION = 1000000;
 
 // ========================================================
-// MIGUS GLOBAL CACHE
+// MIGUS GLOBAL CACHE & AI KNOWLEDGE BASE
 // ========================================================
 let MIGU_CONFIG = { version: "1.0", duel_wager: 50, cookie_cost: 10, catch_chance: 0.55 };
 let MIGU_LIST = []; 
+let GFN_KB = []; // Cache da Base de Conhecimento da IA
 
 // ========================================================
 // DREDGE BRUSH & UUID RETURN QUEUE CONSTANTS (8m DIAMETER)
@@ -494,6 +495,11 @@ async function loadGlobalSettings() {
 
     const dZonesRes = await dbGet("DREDGE_ZONES");
     if (dZonesRes) deserializeDredgeCells(dZonesRes);
+
+    const kbRes = await dbGet("GFN_KNOWLEDGE_BASE");
+    if (kbRes) {
+      try { GFN_KB = JSON.parse(kbRes); } catch(e) { GFN_KB = []; }
+    }
 
   } catch (e) {}
 }
@@ -2140,8 +2146,43 @@ app.post("/set", requireToken, async (req, res) => {
   } catch (e) { res.status(500).json({ error: "db error" }); }
 });
 
+
 // ========================================================
-// AI CHATBOT ROUTE (GROQ) - COM LOGS DE DEBUG
+// KNOWLEDGE BASE (Q&A) ROUTES PARA O PAINEL DE ADMIN DO SL
+// ========================================================
+app.get("/ai/kb", async (req, res) => {
+  res.json({ status: "OK", kb: GFN_KB });
+});
+
+app.post("/ai/kb/add", requireToken, async (req, res) => {
+  const { q, a } = req.body;
+  if (!q || !a) return res.status(400).json({ error: "missing q or a" });
+  
+  const newId = Date.now().toString().slice(-6); // Cria um ID curto de 6 digitos
+  GFN_KB.push({ id: newId, q, a });
+  
+  await dbSet("GFN_KNOWLEDGE_BASE", JSON.stringify(GFN_KB));
+  res.json({ status: "success", id: newId });
+});
+
+app.post("/ai/kb/delete", requireToken, async (req, res) => {
+  const { id } = req.body;
+  if (!id) return res.status(400).json({ error: "missing id" });
+  
+  const originalLength = GFN_KB.length;
+  GFN_KB = GFN_KB.filter(item => item.id !== String(id));
+  
+  if (GFN_KB.length < originalLength) {
+    await dbSet("GFN_KNOWLEDGE_BASE", JSON.stringify(GFN_KB));
+    res.json({ status: "success" });
+  } else {
+    res.json({ status: "not_found" });
+  }
+});
+
+
+// ========================================================
+// AI CHATBOT ROUTE (GROQ) - CAPITÃO BARA A CAPIVARA
 // ========================================================
 app.post("/ai/chat", requireToken, async (req, res) => {
   const { user, message } = req.body;
@@ -2150,18 +2191,26 @@ app.post("/ai/chat", requireToken, async (req, res) => {
   }
 
   try {
-    console.log(`[AI CHAT] Mensagem recebida do UUID ${user}: ${message}`);
-    
     let playerData = await getPlayerData(user);
     let currentWeek = getCurrentWeek();
     let weeklyPoints = (playerData.P_W === currentWeek) ? (playerData.P || 0) : 0;
 
-    const systemPrompt = `You are the official AI assistant for Grid Freight Net (GFN) in Second Life. 
-    The user currently speaking to you has a balance of ${playerData.M || 0} F₵, ${weeklyPoints} weekly points, and ${playerData.COOKIE_STOCK || 0} Taming Cookies. 
-    Reply in the same language the user speaks to you. 
-    Be helpful, friendly, and concise (maximum 2 to 3 short sentences so it fits cleanly in Second Life chat).`;
+    // Se houver perguntas e respostas cadastradas, joga para o contexto da IA
+    let kbContext = "";
+    if (GFN_KB && GFN_KB.length > 0) {
+      kbContext = "Here is the official GFN Product Knowledge Base. Use this exact information if the user asks something related, but rephrase it naturally in your persona style (do not sound like a robot reading a manual):\n";
+      GFN_KB.forEach(item => {
+        kbContext += `Q: ${item.q} | A: ${item.a}\n`;
+      });
+    }
 
-    console.log("[AI CHAT] Chamando a API da Groq...");
+    const systemPrompt = `You are Bara, a Capybara who is a Sea Captain, and the official AI mascot and assistant for Grid Freight Net (GFN) in Second Life. 
+    The user speaking to you has a balance of ${playerData.M || 0} F₵, ${weeklyPoints} weekly points, and ${playerData.COOKIE_STOCK || 0} Taming Cookies. 
+    ${kbContext}
+    IMPORTANT RULES:
+    1. ALWAYS reply in the exact language the user used to talk to you. Translate any knowledge base answers to their language.
+    2. Always embody your persona (Capybara Captain Bara). You can be slightly playful or use nautical/capybara references, but prioritize helping the user.
+    3. Be extremely concise (maximum 2 to 3 short sentences so it fits cleanly in Second Life chat). Never write long paragraphs.`;
 
     const aiResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
@@ -2183,16 +2232,13 @@ app.post("/ai/chat", requireToken, async (req, res) => {
     const aiData = await aiResponse.json();
     
     if (!aiResponse.ok) {
-      console.error("[AI CHAT] A Groq recusou a chamada. Detalhes:", aiData);
       return res.status(500).json({ error: "Groq API error", details: aiData });
     }
 
     const reply = aiData.choices?.[0]?.message?.content || "Sem resposta da IA.";
-    console.log("[AI CHAT] Resposta gerada com sucesso!");
-    
     res.json({ status: "success", reply });
   } catch (err) {
-    console.error("[AI CHAT] O servidor CRASHOU. Erro fatal:", err);
+    console.error("[AI CHAT] Erro fatal:", err);
     res.status(500).json({ error: "Internal server error during AI processing", details: err.message });
   }
 });
