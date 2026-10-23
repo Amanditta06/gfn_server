@@ -1117,7 +1117,7 @@ app.post("/oil/transfer-to-refinery", requireToken, async (req, res) => {
 
     let fullCost = Math.ceil(deliverableOil * unitPrice);
     let price = fullCost; 
-    let basePrice = fullCost; // O que o comprador vai pagar (antes das mágicas do servidor)
+    let basePrice = fullCost; 
     
     // 1. AVALIAÇÃO DE DEMANDA E SATURAÇÃO DE PARCELA PARA A VENDA DE PETRÓLEO
     let demandMult = 1.0; let targetParcel = null;
@@ -1261,6 +1261,105 @@ app.post("/admin/oil/clear-zones", requireToken, async (req, res) => {
   res.json({ status: "ok", message: "All oil wells and scanned 30m sectors have been cleared." });
 });
 
+// ========================================================
+// NOVO SISTEMA UNIVERSAL DE FLUIDOS (COMPRA / VENDA)
+// ========================================================
+app.post("/oil/fluid-transaction", requireToken, async (req, res) => {
+  const { mode, tankUuid, tankOwner, targetOwner, amount, fluid, plan } = req.body;
+  const effMode = String(mode || "SELL").toUpperCase().trim();
+  const sOwner = String(tankOwner || "").trim();
+  const tOwner = String(targetOwner || "").trim();
+  const fType = String(fluid || "OIL").toUpperCase().trim();
+  let reqLiters = Math.round((parseFloat(amount) || 0.0) * 10) / 10;
+
+  if (reqLiters <= 0.05 || !sOwner || !tOwner) return res.json({ status: "ERROR" });
+
+  // Preços simulando a vida real (1.0 = base de referência)
+  const FLUID_PRICES = {
+    "OIL": 1.0, 
+    "REGULAR": 2.5, 
+    "DIESEL": 2.6, 
+    "NATGAS": 1.5,
+    "JETFUEL": 2.8, 
+    "AVGAS": 3.5, 
+    "PARAFFIN": 2.0
+  };
+  let basePrice = FLUID_PRICES[fType] || 1.0;
+
+  const lockKey = [sOwner, tOwner].sort().join("_");
+  await withLock(lockKey, async () => {
+     let tankPlayer = await getPlayerData(sOwner);
+     let targetPlayer = await getPlayerData(tOwner);
+     let now = getUnixTime();
+
+     // Se for o mesmo dono, a transferência é gratuita
+     if (sOwner === tOwner) {
+        return res.json({ status: "OK_SAME_OWNER", amount: reqLiters, paidFc: 0 });
+     }
+
+     if (effMode === "BUY") {
+        // TANK ESTÁ COMPRANDO DA BOMBA (Atacado: 70% do preço)
+        let unitPrice = basePrice * 0.7; 
+        let fullCost = Math.ceil(reqLiters * unitPrice);
+
+        tankPlayer.M -= fullCost; // Permite saldo negativo se não tiver dinheiro
+        targetPlayer.M += fullCost;
+
+        await savePlayerData(sOwner, tankPlayer);
+        await savePlayerData(tOwner, targetPlayer);
+
+        let msgTank = `✅ ⛽ You BOUGHT ${reqLiters} L of ${fType} for ${fullCost} F₵. Balance: ${tankPlayer.M} F₵`;
+        let msgTarget = `✅ ⛽ You SOLD ${reqLiters} L of ${fType} for ${fullCost} F₵. Balance: ${targetPlayer.M} F₵`;
+
+        await addPlayerMessage(sOwner, msgTank);
+        await addPlayerMessage(tOwner, msgTarget);
+
+        return res.json({ status: "OK_BOUGHT", amount: reqLiters, paidFc: fullCost });
+     }
+     else if (effMode === "SELL") {
+        // TANK ESTÁ VENDENDO PARA A REFINARIA (Varejo: 100% do preço)
+        let unitPrice = basePrice * 1.0; 
+        let fullCost = Math.ceil(reqLiters * unitPrice);
+
+        // Aplica o Boost Global do vendedor
+        let boost_m = 1.0;
+        if (tankPlayer.B_T > now) {
+            boost_m = parseFloat(tankPlayer.B_M) || 1.0;
+            if (boost_m > 1.0) fullCost = Math.ceil(fullCost * boost_m);
+        }
+
+        // Aplica Bônus de Afinidade da parcela
+        let affinityBonus = 0;
+        if (tankPlayer.ACTIVE_PARCEL && tankPlayer.AFFINITY) {
+           let parcel = tankPlayer.ACTIVE_PARCEL.toLowerCase();
+           let currentAffinity = parseFloat(tankPlayer.AFFINITY[parcel]) || 0.0;
+           if (currentAffinity > 0) affinityBonus = Math.round(fullCost * currentAffinity);
+        }
+
+        // Aplica Bônus de Plano Premium
+        if (plan === "PREMIUM") {
+           fullCost += Math.floor(fullCost * 0.2);
+        }
+
+        // O comprador (Target) VAI ficar negativo se não tiver dinheiro
+        targetPlayer.M -= fullCost;
+        
+        tankPlayer.M += (fullCost + affinityBonus);
+        tankPlayer.P += Math.round((fullCost + affinityBonus) * 0.10);
+
+        await savePlayerData(sOwner, tankPlayer);
+        await savePlayerData(tOwner, targetPlayer);
+
+        let msgSeller = `✅ ⛽ Sold ${reqLiters} L of ${fType} to secondlife:///app/agent/${tOwner}/inspect for ${fullCost} F₵. Balance: ${tankPlayer.M} F₵`;
+        let msgBuyer = `✅ ⛽ Purchased ${reqLiters} L of ${fType} from secondlife:///app/agent/${sOwner}/inspect for ${fullCost} F₵. Balance: ${targetPlayer.M} F₵`;
+
+        await addPlayerMessage(sOwner, msgSeller);
+        await addPlayerMessage(tOwner, msgBuyer);
+
+        return res.json({ status: "OK_SOLD", amount: reqLiters, paidFc: fullCost });
+     }
+  });
+});
 
 // ========================================================
 // MIGUS ADMIN ROUTES
