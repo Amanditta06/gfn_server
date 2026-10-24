@@ -413,7 +413,6 @@ async function resetWeeklyOilSeabed() {
   await dbSet("OIL_ZONES", "[]");
 }
 
-
 // ========================================================
 // SHARED DB HELPERS
 // ========================================================
@@ -693,7 +692,6 @@ async function getPlayerData(uuid) {
       data.ACTIVE_MIGU = parsedData.ACTIVE_MIGU || "";
       data.COOKIE_STOCK = parseInt(data.COOKIE_STOCK, 10) || 0;
       
-      // Carrega permissões ou seta true se não existirem
       data.P_IN = parsedData.P_IN !== undefined ? parsedData.P_IN : true;
       data.P_OUT = parsedData.P_OUT !== undefined ? parsedData.P_OUT : true;
 
@@ -740,9 +738,6 @@ app.post("/ack-msg", async (req, res) => {
   } catch (e) { res.status(500).json({ error: "db error" }); }
 });
 
-// ========================================================
-// DREDGE BRUSH ROUTES
-// ========================================================
 app.get('/dredge/check-zone', async (req, res) => {
   const { x, y, version } = req.query;
   if (version && version !== DREDGE_VERSION) {
@@ -770,11 +765,7 @@ app.get('/dredge/check-zone', async (req, res) => {
   const depletedPct = Math.round(depletedFraction * 1000) / 10;
   const efficiency = Math.round((1.0 - depletedFraction) * 1000) / 1000;
 
-  return res.json({
-    status: "OK",
-    depletedPct,
-    efficiency
-  });
+  return res.json({ status: "OK", depletedPct, efficiency });
 });
 
 app.post('/dredge/sync-brush', requireToken, async (req, res) => {
@@ -799,9 +790,7 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
     let prevX = NaN; let prevY = NaN;
     if (DREDGE_LAST_POS.has(effectiveUuid)) {
       const lastPos = DREDGE_LAST_POS.get(effectiveUuid);
-      if ((now - lastPos.t) <= 12) {
-        prevX = lastPos.x; prevY = lastPos.y;
-      }
+      if ((now - lastPos.t) <= 12) { prevX = lastPos.x; prevY = lastPos.y; }
     }
 
     let lastX = NaN; let lastY = NaN;
@@ -813,11 +802,8 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
         const rawVal = parseFloat(parts[2]) || 1;
         
         let ticks = 1;
-        if (rawVal < 1.0 && rawVal > 0.0) {
-          ticks = Math.max(1, Math.round(rawVal / BRUSH_TICK_OPACITY));
-        } else {
-          ticks = Math.min(40, Math.max(1, Math.round(rawVal)));
-        }
+        if (rawVal < 1.0 && rawVal > 0.0) ticks = Math.max(1, Math.round(rawVal / BRUSH_TICK_OPACITY));
+        else ticks = Math.min(40, Math.max(1, Math.round(rawVal)));
 
         if (!isNaN(sx) && !isNaN(sy)) {
           totalExtractedUnits += applyContinuousStrokeSegment(prevX, prevY, sx, sy, ticks, now);
@@ -826,12 +812,9 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
       }
     }
 
-    if (!isNaN(lastX) && !isNaN(lastY)) {
-      DREDGE_LAST_POS.set(effectiveUuid, { x: lastX, y: lastY, t: now });
-    }
+    if (!isNaN(lastX) && !isNaN(lastY)) DREDGE_LAST_POS.set(effectiveUuid, { x: lastX, y: lastY, t: now });
 
-    let spotEfficiency = 1.0;
-    let restoreText = "24h 0m";
+    let spotEfficiency = 1.0; let restoreText = "24h 0m";
     if (!isNaN(lastX) && !isNaN(lastY)) {
       const { depletedFraction, remainingSeconds } = inspectBrushArea(lastX, lastY);
       spotEfficiency = Math.round(Math.max(0.0, 1.0 - depletedFraction) * 1000) / 1000;
@@ -842,13 +825,9 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
     let returnPkg;
 
     if (totalExtractedUnits <= 0.0001) {
-      returnPkg = {
-        msgId, dredgeUuid: effectiveUuid, status: "DEPLETED", spotEfficiency: 0.0,
-        restoreText, addedKg: 0.0, weights: "0|0|0|0|0|0|0|0|0|0", createdAt: now
-      };
+      returnPkg = { msgId, dredgeUuid: effectiveUuid, status: "DEPLETED", spotEfficiency: 0.0, restoreText, addedKg: 0.0, weights: "0|0|0|0|0|0|0|0|0|0", createdAt: now };
     } else {
       await dbSet("DREDGE_ZONES", serializeDredgeCells());
-
       const mult = DREDGE_CONFIG.weightMult * (totalExtractedUnits * 2.0);
       const randRange = (min, max) => min + Math.random() * (max - min);
       const roundKg = (val) => Math.round(val * 10) / 10;
@@ -867,26 +846,18 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
       const addedKg = roundKg(sandKg + gravelKg + clayKg + ironKg + copperKg + titaniumKg + silverKg + goldKg + platinumKg + diamondKg);
       const weightsStr = [sandKg, gravelKg, clayKg, ironKg, copperKg, titaniumKg, silverKg, goldKg, platinumKg, diamondKg].join("|");
 
-      returnPkg = {
-        msgId, dredgeUuid: effectiveUuid, status: "OK", spotEfficiency,
-        restoreText, addedKg, weights: weightsStr, createdAt: now
-      };
+      returnPkg = { msgId, dredgeUuid: effectiveUuid, status: "OK", spotEfficiency, restoreText, addedKg, weights: weightsStr, createdAt: now };
     }
 
     for (const [oldId, oldPkg] of DREDGE_RETURNS.entries()) {
-      if (oldPkg.dredgeUuid === effectiveUuid) {
-        DREDGE_RETURNS.delete(oldId);
-      }
+      if (oldPkg.dredgeUuid === effectiveUuid) DREDGE_RETURNS.delete(oldId);
     }
     DREDGE_RETURNS.set(msgId, returnPkg);
 
     const broadcastList = [returnPkg];
     for (const [id, pkg] of DREDGE_RETURNS.entries()) {
-      if (id !== msgId && broadcastList.length < 3) {
-        broadcastList.push(pkg);
-      }
+      if (id !== msgId && broadcastList.length < 3) broadcastList.push(pkg);
     }
-
     return res.json({ status: "QUEUED", returns: broadcastList });
   });
 });
@@ -894,7 +865,6 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
 app.post('/dredge/ack-return', requireToken, async (req, res) => {
   const { dredgeUuid, msgId } = req.body;
   pruneExpiredDredgeReturns();
-
   if (msgId && DREDGE_RETURNS.has(String(msgId))) {
     const pkg = DREDGE_RETURNS.get(String(msgId));
     if (!dredgeUuid || pkg.dredgeUuid === String(dredgeUuid)) {
@@ -906,68 +876,44 @@ app.post('/dredge/ack-return', requireToken, async (req, res) => {
 });
 
 app.post('/admin/dredge/clear-zones', requireToken, async (req, res) => {
-  DREDGE_CELLS.clear();
-  DREDGE_RETURNS.clear();
-  DREDGE_LAST_POS.clear();
+  DREDGE_CELLS.clear(); DREDGE_RETURNS.clear(); DREDGE_LAST_POS.clear();
   await dbSet("DREDGE_ZONES", "[]");
   res.json({ status: "ok", message: "All depleted dredge zones and pending return queues have been cleared." });
 });
 
-// ========================================================
-// OIL DRILLING & EXTRACTION ROUTES
-// ========================================================
 app.post("/oil/scan-zone", requireToken, async (req, res) => {
   const { rigUuid, user, x, y, hasWell, oilAmount, version } = req.body;
-  if (version && String(version) !== OIL_VERSION) {
-    return res.json({ status: "OUTDATED", serverVersion: OIL_VERSION });
-  }
+  if (version && String(version) !== OIL_VERSION) return res.json({ status: "OUTDATED", serverVersion: OIL_VERSION });
 
-  const worldX = parseFloat(x);
-  const worldY = parseFloat(y);
-  const effRig = String(rigUuid || "").trim();
-
-  if (!effRig || isNaN(worldX) || isNaN(worldY)) {
-    return res.status(400).json({ status: "ERROR", message: "Invalid coordinates or rigUuid" });
-  }
+  const worldX = parseFloat(x); const worldY = parseFloat(y); const effRig = String(rigUuid || "").trim();
+  if (!effRig || isNaN(worldX) || isNaN(worldY)) return res.status(400).json({ status: "ERROR", message: "Invalid coordinates or rigUuid" });
 
   await withLock("OIL_ZONES_LOCK", async () => {
-    const now = getUnixTime();
-    const curWeek = getCurrentWeek();
+    const now = getUnixTime(); const curWeek = getCurrentWeek();
     const { key, centerX, centerY } = getOilGridKey(worldX, worldY);
 
     if (OIL_ZONES.has(key)) {
       const existing = OIL_ZONES.get(key);
       if (existing.week === curWeek) {
-        if (!existing.hasWell) {
-          return res.json({ status: "NO_WELL", alreadyMapped: true, zoneKey: key, wellX: existing.x, wellY: existing.y, oilLeft: 0 });
-        }
-        if (existing.oilLeft <= 0.1) {
-          return res.json({ status: "DEPLETED", alreadyMapped: true, zoneKey: key, wellX: existing.x, wellY: existing.y, oilLeft: 0, maxOil: existing.maxOil });
-        }
+        if (!existing.hasWell) return res.json({ status: "NO_WELL", alreadyMapped: true, zoneKey: key, wellX: existing.x, wellY: existing.y, oilLeft: 0 });
+        if (existing.oilLeft <= 0.1) return res.json({ status: "DEPLETED", alreadyMapped: true, zoneKey: key, wellX: existing.x, wellY: existing.y, oilLeft: 0, maxOil: existing.maxOil });
         const isBusy = existing.activeRig && existing.activeRig !== effRig && (now - existing.lastTick) < OIL_LOCK_TIMEOUT;
         return res.json({ status: "HAS_WELL", alreadyMapped: true, zoneKey: key, wellX: existing.x, wellY: existing.y, oilLeft: existing.oilLeft, maxOil: existing.maxOil, busy: isBusy });
       }
     }
 
     const lastScan = OIL_SCAN_COOLDOWN.get(effRig) || 0;
-    if ((Date.now() - lastScan) < 3800) {
-      return res.json({ status: "RATE_LIMIT" });
-    }
+    if ((Date.now() - lastScan) < 3800) return res.json({ status: "RATE_LIMIT" });
     OIL_SCAN_COOLDOWN.set(effRig, Date.now());
 
     let clientReportedWell = Boolean(hasWell === true || hasWell === 1 || hasWell === "1");
-    let finalHasWell = clientReportedWell;
-    let initialOil = 0.0;
-    
+    let finalHasWell = clientReportedWell; let initialOil = 0.0;
     if (finalHasWell) {
       let rawOil = parseFloat(oilAmount) || OIL_CONFIG.minWellOil;
       initialOil = Math.min(OIL_CONFIG.maxWellOil, Math.max(OIL_CONFIG.minWellOil, Math.round(rawOil * 10) / 10));
     }
-
     const newZone = { hasWell: finalHasWell, oilLeft: initialOil, maxOil: initialOil, x: centerX, y: centerY, activeRig: "", lastTick: 0, week: curWeek };
-    OIL_ZONES.set(key, newZone);
-    await dbSet("OIL_ZONES", serializeOilZones());
-
+    OIL_ZONES.set(key, newZone); await dbSet("OIL_ZONES", serializeOilZones());
     if (!finalHasWell) return res.json({ status: "NO_WELL", alreadyMapped: false, zoneKey: key, wellX: centerX, wellY: centerY, oilLeft: 0 });
     return res.json({ status: "HAS_WELL", alreadyMapped: false, zoneKey: key, wellX: centerX, wellY: centerY, oilLeft: initialOil, maxOil: initialOil, busy: false });
   });
@@ -976,257 +922,54 @@ app.post("/oil/scan-zone", requireToken, async (req, res) => {
 app.post("/oil/lock-well", requireToken, async (req, res) => {
   const { rigUuid, x, y, version } = req.body;
   if (version && String(version) !== OIL_VERSION) return res.json({ status: "OUTDATED" });
-
-  const worldX = parseFloat(x);
-  const worldY = parseFloat(y);
-  const effRig = String(rigUuid || "").trim();
+  const worldX = parseFloat(x); const worldY = parseFloat(y); const effRig = String(rigUuid || "").trim();
 
   await withLock("OIL_ZONES_LOCK", async () => {
-    const now = getUnixTime();
-    const { key } = getOilGridKey(worldX, worldY);
-    const zone = OIL_ZONES.get(key);
-
+    const now = getUnixTime(); const { key } = getOilGridKey(worldX, worldY); const zone = OIL_ZONES.get(key);
     if (!zone || !zone.hasWell) return res.json({ status: "NO_WELL" });
     if (zone.oilLeft <= 0.1) return res.json({ status: "DEPLETED", oilLeft: 0 });
     if (zone.activeRig && zone.activeRig !== effRig && (now - zone.lastTick) < OIL_LOCK_TIMEOUT) return res.json({ status: "BUSY_OTHER_RIG" });
-
-    zone.activeRig = effRig;
-    zone.lastTick = now;
-    OIL_ZONES.set(key, zone);
-
+    zone.activeRig = effRig; zone.lastTick = now; OIL_ZONES.set(key, zone);
     return res.json({ status: "LOCKED", zoneKey: key, oilLeft: zone.oilLeft, maxOil: zone.maxOil });
   });
 });
 
 app.post("/oil/extract-tick", requireToken, async (req, res) => {
   const { rigUuid, tankUuid, tankOwner, x, y, requestedOil } = req.body;
-  const effRig = String(rigUuid || "").trim();
-  const effTank = String(tankUuid || "").trim();
-  const worldX = parseFloat(x);
-  const worldY = parseFloat(y);
-
+  const effRig = String(rigUuid || "").trim(); const effTank = String(tankUuid || "").trim();
+  const worldX = parseFloat(x); const worldY = parseFloat(y);
   if (!effRig || !effTank || isNaN(worldX) || isNaN(worldY)) return res.status(400).json({ status: "ERROR" });
 
   await withLock("OIL_ZONES_LOCK", async () => {
-    const now = getUnixTime();
-    const { key } = getOilGridKey(worldX, worldY);
-    const zone = OIL_ZONES.get(key);
-
+    const now = getUnixTime(); const { key } = getOilGridKey(worldX, worldY); const zone = OIL_ZONES.get(key);
     if (!zone || !zone.hasWell) return res.json({ status: "NO_WELL", extracted: 0, oilLeft: 0 });
     if (zone.activeRig && zone.activeRig !== effRig && (now - zone.lastTick) < OIL_LOCK_TIMEOUT) return res.json({ status: "BUSY_OTHER_RIG", extracted: 0, oilLeft: zone.oilLeft });
-    if (zone.oilLeft <= 0.05) {
-      zone.oilLeft = 0; zone.activeRig = "";
-      await dbSet("OIL_ZONES", serializeOilZones());
-      return res.json({ status: "DEPLETED", extracted: 0, oilLeft: 0 });
-    }
-
-    let reqAmt = parseFloat(requestedOil) || 0;
-    reqAmt = Math.min(OIL_CONFIG.maxExtractPerTick, Math.max(0, reqAmt));
-
+    if (zone.oilLeft <= 0.05) { zone.oilLeft = 0; zone.activeRig = ""; await dbSet("OIL_ZONES", serializeOilZones()); return res.json({ status: "DEPLETED", extracted: 0, oilLeft: 0 }); }
+    let reqAmt = parseFloat(requestedOil) || 0; reqAmt = Math.min(OIL_CONFIG.maxExtractPerTick, Math.max(0, reqAmt));
     const actualExtracted = Math.round(Math.min(zone.oilLeft, reqAmt) * 10) / 10;
     zone.oilLeft = Math.round(Math.max(0, zone.oilLeft - actualExtracted) * 10) / 10;
-    zone.activeRig = effRig;
-    zone.lastTick = now;
-    OIL_ZONES.set(key, zone);
-
+    zone.activeRig = effRig; zone.lastTick = now; OIL_ZONES.set(key, zone);
     const tankEntry = OIL_TANK_LEDGER.get(effTank) || { oil: 0.0, owner: String(tankOwner || ""), updatedAt: now };
     tankEntry.oil = Math.round((tankEntry.oil + actualExtracted) * 10) / 10;
-    if (tankOwner) tankEntry.owner = String(tankOwner);
-    tankEntry.updatedAt = now;
-    OIL_TANK_LEDGER.set(effTank, tankEntry);
-
-    await dbSet("OIL_ZONES", serializeOilZones());
-    await dbSet("OIL_TANKS", serializeOilTanks());
-
+    if (tankOwner) tankEntry.owner = String(tankOwner); tankEntry.updatedAt = now; OIL_TANK_LEDGER.set(effTank, tankEntry);
+    await dbSet("OIL_ZONES", serializeOilZones()); await dbSet("OIL_TANKS", serializeOilTanks());
     return res.json({ status: zone.oilLeft <= 0.05 ? "DEPLETED" : "OK", extracted: actualExtracted, oilLeft: zone.oilLeft, maxOil: zone.maxOil, tankVerifiedOil: tankEntry.oil });
   });
 });
 
 app.post("/oil/stop-extract", requireToken, async (req, res) => {
-  const { rigUuid, x, y } = req.body;
-  const effRig = String(rigUuid || "").trim();
-  const worldX = parseFloat(x);
-  const worldY = parseFloat(y);
-
+  const { rigUuid, x, y } = req.body; const effRig = String(rigUuid || "").trim(); const worldX = parseFloat(x); const worldY = parseFloat(y);
   await withLock("OIL_ZONES_LOCK", async () => {
-    const { key } = getOilGridKey(worldX, worldY);
-    const zone = OIL_ZONES.get(key);
-    if (zone && zone.activeRig === effRig) {
-      zone.activeRig = ""; zone.lastTick = 0; OIL_ZONES.set(key, zone);
-    }
+    const { key } = getOilGridKey(worldX, worldY); const zone = OIL_ZONES.get(key);
+    if (zone && zone.activeRig === effRig) { zone.activeRig = ""; zone.lastTick = 0; OIL_ZONES.set(key, zone); }
     return res.json({ status: "RELEASED" });
   });
-});
-
-// ========================================================
-// ROTA ANTIGA DE TRANSFERENCIA (Mantida para compatibilidade)
-// ========================================================
-app.post("/oil/transfer-to-refinery", requireToken, async (req, res) => {
-  const { mode, tankUuid, tankOwner, refineryOwner, requestedOil, plan } = req.body;
-  const effMode = String(mode || "PAY").toUpperCase().trim();
-  const effTank = String(tankUuid || "").trim();
-  const sOwner = String(tankOwner || "").trim();
-  const rOwner = String(refineryOwner || "").trim();
-
-  if (!effTank || !sOwner || !rOwner) return res.status(400).json({ status: "ERROR" });
-
-  const lockKey = [sOwner, rOwner, "OIL_REF"].sort().join("_");
-  await withLock(lockKey, async () => {
-    const now = getUnixTime();
-    let reqLiters = Math.round((parseFloat(requestedOil) || 0.0) * 10) / 10;
-
-    if (reqLiters <= 0.05) return res.json({ status: "EMPTY_OR_UNVERIFIED", transferredOil: 0, remainingTankOil: 0, paidFc: 0 });
-
-    let tankRecord = OIL_TANK_LEDGER.get(effTank);
-    if (!tankRecord || tankRecord.oil < reqLiters) {
-      tankRecord = { oil: Math.min(5000.0, reqLiters), owner: sOwner, updatedAt: now };
-      OIL_TANK_LEDGER.set(effTank, tankRecord);
-    }
-
-    let deliverableOil = Math.round(Math.min(reqLiters, tankRecord.oil) * 10) / 10;
-    const unitPrice = OIL_CONFIG.oilPricePerLiter || 2.5;
-
-    if (effMode === "CHECK") return res.json({ status: "CHECK_OK", sameOwner: sOwner === rOwner, maxTransferOil: deliverableOil, unitPrice });
-
-    if (sOwner === rOwner) {
-      tankRecord.oil = Math.round(Math.max(0, tankRecord.oil - deliverableOil) * 10) / 10;
-      tankRecord.updatedAt = now;
-      OIL_TANK_LEDGER.set(effTank, tankRecord);
-      await dbSet("OIL_TANKS", serializeOilTanks());
-      return res.json({ status: "OK_SAME_OWNER", transferredOil: deliverableOil, remainingTankOil: tankRecord.oil, paidFc: 0 });
-    }
-
-    let buyerData = await getPlayerData(rOwner);
-    let sellerData = await getPlayerData(sOwner);
-
-    let fullCost = Math.ceil(deliverableOil * unitPrice);
-    let price = fullCost; 
-    let basePrice = fullCost; 
-    
-    let demandMult = 1.0; let targetParcel = null;
-    for (let i = 0; i < 8; i++) {
-        if (sellerData.ACTIVE_PARCEL && (now - sellerData.PARCEL_TIME) < 1800) { targetParcel = sellerData.ACTIVE_PARCEL.toLowerCase(); break; }
-        await new Promise(resolve => setTimeout(resolve, 500));
-        sellerData = await getPlayerData(sOwner);
-    }
-
-    if (targetParcel && targetParcel.length >= 36) demandMult = await processParcelDemand(targetParcel, sOwner);
-    let savedParcelForAffinity = targetParcel; 
-    sellerData.ACTIVE_PARCEL = ""; sellerData.PARCEL_TIME = 0;
-
-    if (demandMult < 1.0 && plan !== "EVENT") {
-        price = Math.round(price * demandMult);
-        let lostPercent = Math.round((1.0 - demandMult) * 100);
-        await addPlayerMessage(sOwner, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +15% every 10 minutes without deliveries.`);
-    }
-
-    let boost_m = 1.0;
-    if (sellerData.B_T > now) {
-        boost_m = parseFloat(sellerData.B_M) || 1.0;
-        if (boost_m > 1.0) price = Math.round(price * boost_m);
-    } else if (sellerData.B_T > 0) { sellerData.B_M = 1.0; sellerData.B_T = 0; }
-
-    if (boost_m > 1.0) await addPlayerMessage(sOwner, `Oil Cargo value boosted by ${boost_m}X!`);
-
-    buyerData.M -= basePrice; 
-
-    let recebido = 0; 
-    let currentWeek = getCurrentWeek();
-
-    if (sellerData.P_W !== currentWeek) { sellerData.P = 0; sellerData.P_W = currentWeek; }
-
-    if (plan !== "FREE" && plan !== "EVENT" && plan !== "TEST_CARGO") {
-        let premiumBonus = 0;
-        if (plan === "PREMIUM") {
-            premiumBonus = Math.floor(price * 0.2);
-            await addPlayerMessage(sOwner, "You won 20% more for being premium.");
-        }
-        sellerData.M += (price + premiumBonus); recebido = price + premiumBonus;
-        sellerData.P += Math.round(recebido * (OIL_CONFIG.pointsPct || 0.10));
-    }
-    else if (plan === "TEST_CARGO") {
-        if (sellerData.TC_W !== currentWeek) { sellerData.TC_V = 0; sellerData.TC_W = currentWeek; }
-        if (sellerData.TC_V + price >= MAX_TC) {
-            let resto = MAX_TC - sellerData.TC_V;
-            sellerData.TC_V = MAX_TC; sellerData.M += resto; recebido = resto;
-        } else {
-            sellerData.TC_V += price; sellerData.M += price; recebido = price;
-        }
-        sellerData.P += Math.round((recebido * 0.8) * (OIL_CONFIG.pointsPct || 0.10));
-    }
-    else if (plan === "EVENT") {
-        if (sellerData.EV_W !== currentWeek) { sellerData.EV_V = 0; sellerData.EV_W = currentWeek; }
-        if (sellerData.EV_V + price >= MAX_EV) {
-            let resto = MAX_EV - sellerData.EV_V;
-            sellerData.EV_V = MAX_EV; sellerData.M += resto; recebido = resto;
-        } else {
-            sellerData.EV_V += price; sellerData.M += price; recebido = price;
-        }
-        sellerData.P += Math.round((recebido * 0.5) * (OIL_CONFIG.pointsPct || 0.10));
-    }
-    else if (plan === "FREE") {
-        if (sellerData.RE + price >= MAX_F) {
-            let resto = MAX_F - sellerData.RE;
-            sellerData.RE = MAX_F; sellerData.M += resto; recebido = resto;
-        } else {
-            sellerData.RE += price; sellerData.M += price; recebido = price;
-        }
-    }
-
-    if (savedParcelForAffinity && savedParcelForAffinity.length >= 36) {
-        sellerData.AFFINITY_TIME[savedParcelForAffinity] = now;
-        let currentAffinity = parseFloat(sellerData.AFFINITY[savedParcelForAffinity]) || 0.0;
-        let distance = sellerData.LAST_DIST || 0;
-        let addedAffinity = 0;
-
-        if (distance > 1000) {
-            if (currentAffinity < 0.5) {
-                addedAffinity = 0.01;
-                currentAffinity = Math.min(0.5, currentAffinity + 0.01);
-                currentAffinity = Math.round(currentAffinity * 100) / 100;
-                sellerData.AFFINITY[savedParcelForAffinity] = currentAffinity;
-                await addPlayerMessage(sOwner, `Your affinity with this HUB has increased by +${addedAffinity}. You now have ${currentAffinity} total affinity with this HUB.`);
-            }
-        }
-
-        if (currentAffinity > 0 && price > 0) {
-            let affinityBonus = Math.round(price * currentAffinity);
-            if (affinityBonus > 0) {
-                sellerData.M += affinityBonus; recebido += affinityBonus;
-                await addPlayerMessage(sOwner, `You received an extra payout of ${affinityBonus} F₵ due to the affinity bonus (${currentAffinity}x / ${(currentAffinity * 100).toFixed(0)}%) with this HUB.`);
-            }
-        }
-    }
-    sellerData.LAST_DIST = 0; 
-
-    tankRecord.oil = Math.round(Math.max(0, tankRecord.oil - deliverableOil) * 10) / 10;
-    tankRecord.updatedAt = now;
-    OIL_TANK_LEDGER.set(effTank, tankRecord);
-    
-    await dbSet("OIL_TANKS", serializeOilTanks());
-    await savePlayerData(rOwner, buyerData);
-    await savePlayerData(sOwner, sellerData);
-
-    let msgSeller = `✅ 🛢️ Sold ${deliverableOil} L of Crude Oil to secondlife:///app/agent/${rOwner}/inspect's Refinery for ${recebido} F₵. Balance: ${sellerData.M} F₵`;
-    let msgBuyer = `✅ 🛢️ Your Refinery purchased ${deliverableOil} L of Crude Oil from secondlife:///app/agent/${sOwner}/inspect for ${basePrice} F₵. Balance: ${buyerData.M} F₵`;
-
-    await addPlayerMessage(sOwner, msgSeller);
-    await addPlayerMessage(rOwner, msgBuyer);
-
-    return res.json({ status: "OK_PAID_FULL", transferredOil: deliverableOil, remainingTankOil: tankRecord.oil, paidFc: recebido, sellerBalance: sellerData.M, buyerBalance: buyerData.M, msg: msgSeller });
-  });
-});
-
-app.post("/admin/oil/clear-zones", requireToken, async (req, res) => {
-  await resetWeeklyOilSeabed();
-  res.json({ status: "ok", message: "All oil wells and scanned 30m sectors have been cleared." });
 });
 
 // ========================================================
 // NOVO SISTEMA UNIVERSAL DE FLUIDOS (TERMINAL + COMPRA / VENDA)
 // ========================================================
 
-// ROTA DO TERMINAL: Lê as permissões atuais
 app.get("/oil/pump-access", async (req, res) => {
     const { uuid } = req.query;
     if (!uuid) return res.status(400).json({ error: "missing uuid" });
@@ -1234,7 +977,6 @@ app.get("/oil/pump-access", async (req, res) => {
     res.json({ status: "OK", in: pData.P_IN, out: pData.P_OUT });
 });
 
-// ROTA DO TERMINAL: Modifica as permissões
 app.post("/oil/pump-access", requireToken, async (req, res) => {
     const { uuid, action } = req.body;
     if (!uuid) return res.status(400).json({ error: "missing uuid" });
@@ -1243,6 +985,10 @@ app.post("/oil/pump-access", requireToken, async (req, res) => {
         let pData = await getPlayerData(uuid);
         if (action === "TOGGLE_IN") pData.P_IN = !pData.P_IN;
         if (action === "TOGGLE_OUT") pData.P_OUT = !pData.P_OUT;
+        if (action === "ALLOW_IN") pData.P_IN = true;
+        if (action === "DENY_IN") pData.P_IN = false;
+        if (action === "ALLOW_OUT") pData.P_OUT = true;
+        if (action === "DENY_OUT") pData.P_OUT = false;
         await savePlayerData(uuid, pData);
         res.json({ status: "OK", in: pData.P_IN, out: pData.P_OUT });
     });
@@ -1330,9 +1076,6 @@ app.post("/oil/fluid-transaction", requireToken, async (req, res) => {
   });
 });
 
-// ========================================================
-// OUTRAS ROTAS OMITIDAS NO RESUMO (Continuam iguais ao que vc mandou)
-// ========================================================
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime, action } = req.body;
   let safeTopic = (topic || action || "").toLowerCase().trim();
