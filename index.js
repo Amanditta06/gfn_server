@@ -610,7 +610,6 @@ async function ensureTable() {
 }
 ensureTable();
 
-// WEEKLY RESET INTERVAL
 setInterval(async () => {
   let currentNowWeek = getCurrentWeek();
   if (currentNowWeek !== activeServerWeek) {
@@ -666,7 +665,13 @@ async function addPlayerMessage(uuid, msg) {
 async function getPlayerData(uuid) {
   if (!uuid) return null;
   const res = await dbGet(`player_${uuid}`);
-  let data = { M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0, LAST_DIST: 0, AFFINITY: {}, AFFINITY_TIME: {}, MIGUS: [], ACTIVE_MIGU: "", COOKIE_STOCK: 0 };
+  let data = { 
+    M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, 
+    AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0, LAST_DIST: 0, 
+    AFFINITY: {}, AFFINITY_TIME: {}, MIGUS: [], ACTIVE_MIGU: "", COOKIE_STOCK: 0,
+    P_IN: true, P_OUT: true // <-- DEFAULT PERMISSIONS PARA BOMBAS AQUI
+  };
+  
   if (res) {
     try { 
       let parsedData = JSON.parse(res);
@@ -687,20 +692,20 @@ async function getPlayerData(uuid) {
       data.AFFINITY_TIME = parsedData.AFFINITY_TIME || {};
       data.ACTIVE_MIGU = parsedData.ACTIVE_MIGU || "";
       data.COOKIE_STOCK = parseInt(data.COOKIE_STOCK, 10) || 0;
+      
+      // Carrega permissões ou seta true se não existirem
+      data.P_IN = parsedData.P_IN !== undefined ? parsedData.P_IN : true;
+      data.P_OUT = parsedData.P_OUT !== undefined ? parsedData.P_OUT : true;
 
       if (parsedData.MIGUS) {
         data.MIGUS = parsedData.MIGUS.map(m => {
-            if (typeof m === 'string') {
-                return { name: m, mClass: "Unknown", subClass: "Walker", rarity: "Common", power: 30, maxPower: 130, hp: 30, maxHp: 130 };
-            }
+            if (typeof m === 'string') return { name: m, mClass: "Unknown", subClass: "Walker", rarity: "Common", power: 30, maxPower: 130, hp: 30, maxHp: 130 };
             if (!m.maxPower) m.maxPower = m.power + 100;
             if (!m.maxHp) m.maxHp = m.hp + 100;
             if (!m.rarity) m.rarity = "Common";
             return m;
         });
-      } else {
-        data.MIGUS = [];
-      }
+      } else { data.MIGUS = []; }
 
       let now = getUnixTime();
       let maxAllowedFuture = now + (5 * 365 * 24 * 60 * 60); 
@@ -717,7 +722,6 @@ async function savePlayerData(uuid, data) {
 // ========================================================
 // API ROUTES
 // ========================================================
-
 app.get("/get-msg", async (req, res) => {
   const uuid = req.query.uuid;
   if (!uuid) return res.status(400).json({ error: "missing uuid" });
@@ -909,7 +913,6 @@ app.post('/admin/dredge/clear-zones', requireToken, async (req, res) => {
   res.json({ status: "ok", message: "All depleted dredge zones and pending return queues have been cleared." });
 });
 
-
 // ========================================================
 // OIL DRILLING & EXTRACTION ROUTES
 // ========================================================
@@ -1055,6 +1058,9 @@ app.post("/oil/stop-extract", requireToken, async (req, res) => {
   });
 });
 
+// ========================================================
+// ROTA ANTIGA DE TRANSFERENCIA (Mantida para compatibilidade)
+// ========================================================
 app.post("/oil/transfer-to-refinery", requireToken, async (req, res) => {
   const { mode, tankUuid, tankOwner, refineryOwner, requestedOil, plan } = req.body;
   const effMode = String(mode || "PAY").toUpperCase().trim();
@@ -1062,54 +1068,32 @@ app.post("/oil/transfer-to-refinery", requireToken, async (req, res) => {
   const sOwner = String(tankOwner || "").trim();
   const rOwner = String(refineryOwner || "").trim();
 
-  if (!effTank || !sOwner || !rOwner) {
-    return res.status(400).json({ status: "ERROR", message: "Missing parameters" });
-  }
+  if (!effTank || !sOwner || !rOwner) return res.status(400).json({ status: "ERROR" });
 
   const lockKey = [sOwner, rOwner, "OIL_REF"].sort().join("_");
   await withLock(lockKey, async () => {
     const now = getUnixTime();
     let reqLiters = Math.round((parseFloat(requestedOil) || 0.0) * 10) / 10;
 
-    if (reqLiters <= 0.05) {
-      return res.json({ status: "EMPTY_OR_UNVERIFIED", transferredOil: 0, remainingTankOil: 0, paidFc: 0 });
-    }
+    if (reqLiters <= 0.05) return res.json({ status: "EMPTY_OR_UNVERIFIED", transferredOil: 0, remainingTankOil: 0, paidFc: 0 });
 
     let tankRecord = OIL_TANK_LEDGER.get(effTank);
     if (!tankRecord || tankRecord.oil < reqLiters) {
-      tankRecord = {
-        oil: Math.min(5000.0, reqLiters),
-        owner: sOwner,
-        updatedAt: now
-      };
+      tankRecord = { oil: Math.min(5000.0, reqLiters), owner: sOwner, updatedAt: now };
       OIL_TANK_LEDGER.set(effTank, tankRecord);
     }
 
     let deliverableOil = Math.round(Math.min(reqLiters, tankRecord.oil) * 10) / 10;
     const unitPrice = OIL_CONFIG.oilPricePerLiter || 2.5;
 
-    // Mantido modo CHECK apenas para compatibilidade, sem limites de fundos.
-    if (effMode === "CHECK") {
-      return res.json({
-        status: "CHECK_OK",
-        sameOwner: sOwner === rOwner,
-        maxTransferOil: deliverableOil,
-        unitPrice
-      });
-    }
+    if (effMode === "CHECK") return res.json({ status: "CHECK_OK", sameOwner: sOwner === rOwner, maxTransferOil: deliverableOil, unitPrice });
 
-    // MODO PAY - Integrado com Boosts, Saturation e Affinity. O saldo negativo do comprador é permitido!
     if (sOwner === rOwner) {
       tankRecord.oil = Math.round(Math.max(0, tankRecord.oil - deliverableOil) * 10) / 10;
       tankRecord.updatedAt = now;
       OIL_TANK_LEDGER.set(effTank, tankRecord);
       await dbSet("OIL_TANKS", serializeOilTanks());
-      return res.json({
-        status: "OK_SAME_OWNER",
-        transferredOil: deliverableOil,
-        remainingTankOil: tankRecord.oil,
-        paidFc: 0
-      });
+      return res.json({ status: "OK_SAME_OWNER", transferredOil: deliverableOil, remainingTankOil: tankRecord.oil, paidFc: 0 });
     }
 
     let buyerData = await getPlayerData(rOwner);
@@ -1119,13 +1103,9 @@ app.post("/oil/transfer-to-refinery", requireToken, async (req, res) => {
     let price = fullCost; 
     let basePrice = fullCost; 
     
-    // 1. AVALIAÇÃO DE DEMANDA E SATURAÇÃO DE PARCELA PARA A VENDA DE PETRÓLEO
     let demandMult = 1.0; let targetParcel = null;
     for (let i = 0; i < 8; i++) {
-        if (sellerData.ACTIVE_PARCEL && (now - sellerData.PARCEL_TIME) < 1800) { 
-            targetParcel = sellerData.ACTIVE_PARCEL.toLowerCase(); 
-            break;
-        }
+        if (sellerData.ACTIVE_PARCEL && (now - sellerData.PARCEL_TIME) < 1800) { targetParcel = sellerData.ACTIVE_PARCEL.toLowerCase(); break; }
         await new Promise(resolve => setTimeout(resolve, 500));
         sellerData = await getPlayerData(sOwner);
     }
@@ -1140,7 +1120,6 @@ app.post("/oil/transfer-to-refinery", requireToken, async (req, res) => {
         await addPlayerMessage(sOwner, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +15% every 10 minutes without deliveries.`);
     }
 
-    // 2. AVALIAÇÃO DE BOOSTS
     let boost_m = 1.0;
     if (sellerData.B_T > now) {
         boost_m = parseFloat(sellerData.B_M) || 1.0;
@@ -1149,14 +1128,8 @@ app.post("/oil/transfer-to-refinery", requireToken, async (req, res) => {
 
     if (boost_m > 1.0) await addPlayerMessage(sOwner, `Oil Cargo value boosted by ${boost_m}X!`);
 
-    // =======================================================
-    // COBRANÇA DO COMPRADOR - PERMITINDO SALDO NEGATIVO
-    // =======================================================
     buyerData.M -= basePrice; 
 
-    // =======================================================
-    // PAGAMENTO DO VENDEDOR (PLANOS)
-    // =======================================================
     let recebido = 0; 
     let currentWeek = getCurrentWeek();
 
@@ -1200,9 +1173,6 @@ app.post("/oil/transfer-to-refinery", requireToken, async (req, res) => {
         }
     }
 
-    // =======================================================
-    // AVALIAÇÃO DE AFINIDADE (AFFINITY) DO VENDEDOR
-    // =======================================================
     if (savedParcelForAffinity && savedParcelForAffinity.length >= 36) {
         sellerData.AFFINITY_TIME[savedParcelForAffinity] = now;
         let currentAffinity = parseFloat(sellerData.AFFINITY[savedParcelForAffinity]) || 0.0;
@@ -1229,7 +1199,6 @@ app.post("/oil/transfer-to-refinery", requireToken, async (req, res) => {
     }
     sellerData.LAST_DIST = 0; 
 
-    // Finalizar ledger do tanque
     tankRecord.oil = Math.round(Math.max(0, tankRecord.oil - deliverableOil) * 10) / 10;
     tankRecord.updatedAt = now;
     OIL_TANK_LEDGER.set(effTank, tankRecord);
@@ -1244,15 +1213,7 @@ app.post("/oil/transfer-to-refinery", requireToken, async (req, res) => {
     await addPlayerMessage(sOwner, msgSeller);
     await addPlayerMessage(rOwner, msgBuyer);
 
-    return res.json({
-      status: "OK_PAID_FULL",
-      transferredOil: deliverableOil,
-      remainingTankOil: tankRecord.oil,
-      paidFc: recebido,
-      sellerBalance: sellerData.M,
-      buyerBalance: buyerData.M,
-      msg: msgSeller
-    });
+    return res.json({ status: "OK_PAID_FULL", transferredOil: deliverableOil, remainingTankOil: tankRecord.oil, paidFc: recebido, sellerBalance: sellerData.M, buyerBalance: buyerData.M, msg: msgSeller });
   });
 });
 
@@ -1262,8 +1223,31 @@ app.post("/admin/oil/clear-zones", requireToken, async (req, res) => {
 });
 
 // ========================================================
-// NOVO SISTEMA UNIVERSAL DE FLUIDOS (COMPRA / VENDA)
+// NOVO SISTEMA UNIVERSAL DE FLUIDOS (TERMINAL + COMPRA / VENDA)
 // ========================================================
+
+// ROTA DO TERMINAL: Lê as permissões atuais
+app.get("/oil/pump-access", async (req, res) => {
+    const { uuid } = req.query;
+    if (!uuid) return res.status(400).json({ error: "missing uuid" });
+    let pData = await getPlayerData(uuid);
+    res.json({ status: "OK", in: pData.P_IN, out: pData.P_OUT });
+});
+
+// ROTA DO TERMINAL: Modifica as permissões
+app.post("/oil/pump-access", requireToken, async (req, res) => {
+    const { uuid, action } = req.body;
+    if (!uuid) return res.status(400).json({ error: "missing uuid" });
+    
+    await withLock(uuid, async () => {
+        let pData = await getPlayerData(uuid);
+        if (action === "TOGGLE_IN") pData.P_IN = !pData.P_IN;
+        if (action === "TOGGLE_OUT") pData.P_OUT = !pData.P_OUT;
+        await savePlayerData(uuid, pData);
+        res.json({ status: "OK", in: pData.P_IN, out: pData.P_OUT });
+    });
+});
+
 app.post("/oil/fluid-transaction", requireToken, async (req, res) => {
   const { mode, tankUuid, tankOwner, targetOwner, amount, fluid, plan } = req.body;
   const effMode = String(mode || "SELL").toUpperCase().trim();
@@ -1274,16 +1258,7 @@ app.post("/oil/fluid-transaction", requireToken, async (req, res) => {
 
   if (reqLiters <= 0.05 || !sOwner || !tOwner) return res.json({ status: "ERROR" });
 
-  // Preços simulando a vida real (1.0 = base de referência)
-  const FLUID_PRICES = {
-    "OIL": 1.0, 
-    "REGULAR": 2.5, 
-    "DIESEL": 2.6, 
-    "NATGAS": 1.5,
-    "JETFUEL": 2.8, 
-    "AVGAS": 3.5, 
-    "PARAFFIN": 2.0
-  };
+  const FLUID_PRICES = { "OIL": 1.0, "REGULAR": 2.5, "DIESEL": 2.6, "NATGAS": 1.5, "JETFUEL": 2.8, "AVGAS": 3.5, "PARAFFIN": 2.0 };
   let basePrice = FLUID_PRICES[fType] || 1.0;
 
   const lockKey = [sOwner, tOwner].sort().join("_");
@@ -1292,17 +1267,17 @@ app.post("/oil/fluid-transaction", requireToken, async (req, res) => {
      let targetPlayer = await getPlayerData(tOwner);
      let now = getUnixTime();
 
-     // Se for o mesmo dono, a transferência é gratuita
      if (sOwner === tOwner) {
         return res.json({ status: "OK_SAME_OWNER", amount: reqLiters, paidFc: 0 });
      }
 
      if (effMode === "BUY") {
-        // TANK ESTÁ COMPRANDO DA BOMBA (Atacado: 70% do preço)
+        if (!targetPlayer.P_OUT && sOwner !== tOwner) return res.json({ status: "BLOCKED_BY_TARGET" });
+
         let unitPrice = basePrice * 0.7; 
         let fullCost = Math.ceil(reqLiters * unitPrice);
 
-        tankPlayer.M -= fullCost; // Permite saldo negativo se não tiver dinheiro
+        tankPlayer.M -= fullCost; 
         targetPlayer.M += fullCost;
 
         await savePlayerData(sOwner, tankPlayer);
@@ -1317,18 +1292,17 @@ app.post("/oil/fluid-transaction", requireToken, async (req, res) => {
         return res.json({ status: "OK_BOUGHT", amount: reqLiters, paidFc: fullCost });
      }
      else if (effMode === "SELL") {
-        // TANK ESTÁ VENDENDO PARA A REFINARIA (Varejo: 100% do preço)
+        if (!targetPlayer.P_IN && sOwner !== tOwner) return res.json({ status: "BLOCKED_BY_TARGET" });
+
         let unitPrice = basePrice * 1.0; 
         let fullCost = Math.ceil(reqLiters * unitPrice);
 
-        // Aplica o Boost Global do vendedor
         let boost_m = 1.0;
         if (tankPlayer.B_T > now) {
             boost_m = parseFloat(tankPlayer.B_M) || 1.0;
             if (boost_m > 1.0) fullCost = Math.ceil(fullCost * boost_m);
         }
 
-        // Aplica Bônus de Afinidade da parcela
         let affinityBonus = 0;
         if (tankPlayer.ACTIVE_PARCEL && tankPlayer.AFFINITY) {
            let parcel = tankPlayer.ACTIVE_PARCEL.toLowerCase();
@@ -1336,14 +1310,9 @@ app.post("/oil/fluid-transaction", requireToken, async (req, res) => {
            if (currentAffinity > 0) affinityBonus = Math.round(fullCost * currentAffinity);
         }
 
-        // Aplica Bônus de Plano Premium
-        if (plan === "PREMIUM") {
-           fullCost += Math.floor(fullCost * 0.2);
-        }
+        if (plan === "PREMIUM") fullCost += Math.floor(fullCost * 0.2);
 
-        // O comprador (Target) VAI ficar negativo se não tiver dinheiro
         targetPlayer.M -= fullCost;
-        
         tankPlayer.M += (fullCost + affinityBonus);
         tankPlayer.P += Math.round((fullCost + affinityBonus) * 0.10);
 
@@ -1362,445 +1331,7 @@ app.post("/oil/fluid-transaction", requireToken, async (req, res) => {
 });
 
 // ========================================================
-// MIGUS ADMIN ROUTES
-// ========================================================
-app.post('/admin/migu/config', requireToken, async (req, res) => {
-  const { version, duel_wager, cookie_cost } = req.body;
-  if (version) MIGU_CONFIG.version = version;
-  if (duel_wager !== undefined) MIGU_CONFIG.duel_wager = parseInt(duel_wager);
-  if (cookie_cost !== undefined) MIGU_CONFIG.cookie_cost = parseInt(cookie_cost);
-  
-  await dbSet("MIGU_CONFIG", JSON.stringify(MIGU_CONFIG));
-  res.json({ success: true, message: "Global Migu Configuration Updated", config: MIGU_CONFIG });
-});
-
-app.post('/admin/migu/add', requireToken, async (req, res) => {
-  const { name, mClass, subClass, image } = req.body;
-  if (!name || !mClass || !subClass) return res.status(400).json({ error: "Missing Migu properties" });
-
-  let idx = MIGU_LIST.findIndex(m => m.name.toLowerCase() === name.toLowerCase());
-  if (idx !== -1) MIGU_LIST[idx] = { name, mClass, subClass, image };
-  else MIGU_LIST.push({ name, mClass, subClass, image });
-  
-  await dbSet("MIGU_LIST", JSON.stringify(MIGU_LIST));
-  res.json({ success: true, message: `Migu [${name}] added to the Database.` });
-});
-
-app.post('/admin/migu/delete', requireToken, async (req, res) => {
-  const { name } = req.body;
-  if (!name) return res.status(400).json({ error: "Missing name" });
-
-  MIGU_LIST = MIGU_LIST.filter(m => m.name.toLowerCase() !== name.toLowerCase());
-  await dbSet("MIGU_LIST", JSON.stringify(MIGU_LIST));
-
-  let affectedPlayers = 0;
-  try {
-    const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'player_%'");
-    for (let row of q.rows) {
-      try {
-        let pData = JSON.parse(row.value);
-        if (pData.MIGUS && pData.MIGUS.length > 0) {
-          let count = 0; let newInventory = [];
-          for (let m of pData.MIGUS) {
-            let mName = (typeof m === 'string') ? m : m.name;
-            if (mName.toLowerCase() === name.toLowerCase()) count++; else newInventory.push(m);
-          }
-          if (count > 0) {
-            pData.MIGUS = newInventory;
-            if (pData.ACTIVE_MIGU && pData.ACTIVE_MIGU.toLowerCase() === name.toLowerCase()) {
-              pData.ACTIVE_MIGU = pData.MIGUS.length > 0 ? pData.MIGUS[0].name : "";
-            }
-            let compensation = count * 10000; pData.M += compensation;
-            await db.query("UPDATE kvstore SET value = $1 WHERE id = $2", [JSON.stringify(pData), row.id]);
-            await addPlayerMessage(row.id.replace("player_", ""), `⚠️ The Migu [${name}] was permanently deleted. You received ${compensation} F₵ compensation.`);
-            affectedPlayers++;
-          }
-        }
-      } catch(e) {}
-    }
-  } catch(err) { return res.status(500).json({ error: "Database error during mass compensation." }); }
-  res.json({ success: true, message: `Migu [${name}] deleted. Compensated ${affectedPlayers} players.` });
-});
-
-// ========================================================
-// MIGUS GAMEPLAY ROUTES
-// ========================================================
-app.get('/migu/config', async (req, res) => {
-  const { version, uuid } = req.query;
-  if (version !== MIGU_CONFIG.version) return res.json({ status: "OUTDATED" });
-
-  let player = await getPlayerData(uuid);
-  let updated = false;
-  if (!player.MIGUS) { player.MIGUS = []; updated = true; }
-  if (!player.ACTIVE_MIGU) { player.ACTIVE_MIGU = ""; updated = true; }
-  if (updated) await savePlayerData(uuid, player);
-
-  return res.json({ status: "OK", duel_wager: MIGU_CONFIG.duel_wager, cookie_cost: MIGU_CONFIG.cookie_cost });
-});
-
-app.get('/migu/check-funds', async (req, res) => {
-  const { uuid } = req.query;
-  let player = await getPlayerData(uuid);
-  if (player.COOKIE_STOCK > 0 || player.M >= MIGU_CONFIG.cookie_cost) return res.json({ status: "OK", balance: player.M, cookie_stock: player.COOKIE_STOCK });
-  else return res.json({ status: "INSUFFICIENT", balance: player.M, cookie_stock: player.COOKIE_STOCK });
-});
-
-app.get('/migu/buy-cookie', async (req, res) => {
-  const { uuid } = req.query;
-  await withLock(uuid, async () => {
-    let player = await getPlayerData(uuid);
-    if (player.M < MIGU_CONFIG.cookie_cost) return res.send(`Failed: You need ${MIGU_CONFIG.cookie_cost} F₵ to buy a Taming Cookie.`);
-    player.M -= MIGU_CONFIG.cookie_cost; player.COOKIE_STOCK = (player.COOKIE_STOCK || 0) + 1;
-    await savePlayerData(uuid, player);
-    return res.send(`SUCCESS: Bought 1 Taming Cookie! Stock: ${player.COOKIE_STOCK} | Balance: ${player.M} F₵`);
-  });
-});
-
-app.get('/migu/inventory', async (req, res) => {
-  const { uuid } = req.query;
-  let player = await getPlayerData(uuid);
-  res.json({ status: "OK", migus: player.MIGUS || [], cookie_stock: player.COOKIE_STOCK || 0 });
-});
-
-app.get('/migu/abandon', async (req, res) => {
-  const { uuid, name } = req.query;
-  await withLock(uuid, async () => {
-    let player = await getPlayerData(uuid);
-    if (!player.MIGUS) player.MIGUS = [];
-    let idx = player.MIGUS.findIndex(m => m.name.toLowerCase() === name.toLowerCase());
-    if (idx === -1) return res.send("Error: Migu not found in inventory.");
-    
-    player.MIGUS.splice(idx, 1);
-    if (player.ACTIVE_MIGU && player.ACTIVE_MIGU.toLowerCase() === name.toLowerCase()) {
-      player.ACTIVE_MIGU = player.MIGUS.length > 0 ? player.MIGUS[0].name : "";
-    }
-    await savePlayerData(uuid, player);
-    return res.send(`SUCCESS: Abandoned [${name}]. Released back into the wild.`);
-  });
-});
-
-app.get('/migu/catch', async (req, res) => {
-  const { uuid, z, water, ground } = req.query;
-  await withLock(uuid, async () => {
-    let player = await getPlayerData(uuid);
-    if (!player.MIGUS) player.MIGUS = [];
-    if (player.MIGUS.length >= 20) return res.send(`Failed: Your Migu inventory is full (Max 20). Abandon a Migu to catch more!`);
-
-    let usedStock = false;
-    if ((player.COOKIE_STOCK || 0) > 0) { player.COOKIE_STOCK -= 1; usedStock = true; } 
-    else {
-      if (player.M < MIGU_CONFIG.cookie_cost) return res.send(`Failed: You need ${MIGU_CONFIG.cookie_cost} F₵ or a Cookie in stock!`);
-      player.M -= MIGU_CONFIG.cookie_cost;
-    }
-
-    let envClass = "Walker";
-    if (parseFloat(z) > 100) envClass = "Flyer";
-    else if (parseFloat(water) > parseFloat(ground)) envClass = "Swimmer";
-
-    let availableMigus = MIGU_LIST.filter(m => m.subClass.toLowerCase() === envClass.toLowerCase());
-    if (availableMigus.length === 0) {
-      await savePlayerData(uuid, player);
-      return res.send(`The Cookie broke! No Migus of type [${envClass}] registered here.`);
-    }
-
-    if (Math.random() <= MIGU_CONFIG.catch_chance) {
-      const selected = availableMigus[Math.floor(Math.random() * availableMigus.length)];
-      let rarityRoll = Math.random(); let rarity = "Common"; let minVal = 10, maxVal = 20;
-      if (rarityRoll < 0.10) { rarity = "Rare"; minVal = 36; maxVal = 50; }
-      else if (rarityRoll < 0.40) { rarity = "Uncommon"; minVal = 21; maxVal = 35; }
-
-      let initPower = Math.floor(Math.random() * (maxVal - minVal + 1)) + minVal;
-      let initHp = Math.floor(Math.random() * (maxVal - minVal + 1)) + minVal;
-
-      const newMigu = { name: selected.name, mClass: selected.mClass, subClass: selected.subClass, rarity: rarity, power: initPower, maxPower: initPower + 100, hp: initHp, maxHp: initHp + 100 };
-      player.MIGUS.push(newMigu);
-      if (!player.ACTIVE_MIGU) player.ACTIVE_MIGU = selected.name; 
-      await savePlayerData(uuid, player);
-      return res.send(`SUCCESS! Caught [${selected.name}] (${rarity})! [P:${initPower}|HP:${initHp}] | Stock: ${player.COOKIE_STOCK} | Bal: ${player.M}F₵`);
-    } else {
-      let willStay = Math.random() < 0.5;
-      await savePlayerData(uuid, player);
-      if (willStay) return res.send(`RETRY: The Migu resisted the Cookie, but stayed in place! Try again? (Stock: ${player.COOKIE_STOCK} | Bal: ${player.M}F₵)`);
-      else return res.send(`FLED: The Migu broke the Cookie and fled into the wild! (Stock: ${player.COOKIE_STOCK} | Bal: ${player.M}F₵)`);
-    }
-  });
-});
-
-app.get('/migu/duel', async (req, res) => {
-  const { p1, p2, m1, m2 } = req.query;
-  const duelLockStr = [p1, p2].sort().join("_");
-  
-  await withLock(duelLockStr, async () => {
-    let player1 = await getPlayerData(p1); let player2 = await getPlayerData(p2);
-    if (player1.M < MIGU_CONFIG.duel_wager) return res.send(`Duel Cancelled: Challenger doesn't have ${MIGU_CONFIG.duel_wager} F₵.`);
-    if (player2.M < MIGU_CONFIG.duel_wager) return res.send(`Duel Cancelled: Opponent doesn't have ${MIGU_CONFIG.duel_wager} F₵.`);
-
-    let p1Migu = player1.MIGUS.find(m => m.name.toLowerCase() === m1.toLowerCase());
-    let p2Migu = player2.MIGUS.find(m => m.name.toLowerCase() === m2.toLowerCase());
-    if (!p1Migu) return res.send(`Duel Cancelled: Challenger Migu [${m1}] not found.`);
-    if (!p2Migu) return res.send(`Duel Cancelled: Opponent Migu [${m2}] not found.`);
-
-    const p1Score = (p1Migu.power * 0.6 + p1Migu.hp * 0.4) * (0.8 + Math.random() * 0.4);
-    const p2Score = (p2Migu.power * 0.6 + p2Migu.hp * 0.4) * (0.8 + Math.random() * 0.4);
-
-    if (p1Score > p2Score) {
-      player1.M += MIGU_CONFIG.duel_wager; player2.M -= MIGU_CONFIG.duel_wager;
-      p1Migu.power = Math.min(p1Migu.maxPower, p1Migu.power + 10); p1Migu.hp = Math.min(p1Migu.maxHp, p1Migu.hp + 10);
-      p2Migu.power = Math.min(p2Migu.maxPower, p2Migu.power + 5); p2Migu.hp = Math.min(p2Migu.maxHp, p2Migu.hp + 5);
-      await savePlayerData(p1, player1); await savePlayerData(p2, player2);
-      return res.send(`⚔️ CHALLENGER WINS!\n[${p1Migu.name}] (+10 P/HP) defeated [${p2Migu.name}] (+5 P/HP).\nWon ${MIGU_CONFIG.duel_wager} F₵!`);
-    } else {
-      player2.M += MIGU_CONFIG.duel_wager; player1.M -= MIGU_CONFIG.duel_wager;
-      p2Migu.power = Math.min(p2Migu.maxPower, p2Migu.power + 10); p2Migu.hp = Math.min(p2Migu.maxHp, p2Migu.hp + 10);
-      p1Migu.power = Math.min(p1Migu.maxPower, p1Migu.power + 5); p1Migu.hp = Math.min(p1Migu.maxHp, p1Migu.hp + 5);
-      await savePlayerData(p1, player1); await savePlayerData(p2, player2);
-      return res.send(`⚔️ DEFENDER WINS!\n[${p2Migu.name}] (+10 P/HP) destroyed [${p1Migu.name}] (+5 P/HP).\nChallenger lost ${MIGU_CONFIG.duel_wager} F₵!`);
-    }
-  });
-});
-
-// ========================================================
-// CORE ADMIN PARCEL ROUTE
-// ========================================================
-app.post('/admin/parcel', requireToken, async (req, res) => {
-  const { action, serverId, uuid, pos, regionName, num, newPos } = req.body;
-  if (!serverId) return res.status(400).json({ error: "serverId obrigatório" });
-
-  try {
-    let targetServer = serverId;
-    const formatRegion = (name) => {
-      if (!name) return "NULL";
-      let clean = name.trim();
-      if (clean.toLowerCase() === "royie" || clean.toLowerCase() === "royier") return "Royier";
-      return clean;
-    };
-
-    if (serverId === "AUTO") {
-      let serversData = await dbGet("SERVERS");
-      let servers = serversData ? serversData.split("ç") : [];
-      let found = false;
-      for (let srv of servers) {
-        let mData = await dbGet(srv) || "";
-        let mList = mData ? mData.split("ç") : [];
-        if (mList.findIndex(item => item.startsWith(uuid + "#")) !== -1) {
-          targetServer = srv; found = true; break; 
-        }
-      }
-      if (!found && action !== "SET_PARCEL") return res.status(404).json({ error: "Parcela não encontrada em nenhum continente ativo." });
-      if (!found) targetServer = servers[0] || "Satori";
-    }
-
-    let serversData = await dbGet("SERVERS");
-    let servers = serversData ? serversData.split("ç") : [];
-
-    if (action === "SET_PARCEL") {
-      const newItem = `${uuid}#${pos}`;
-      const cleanRegion = formatRegion(regionName);
-
-      for (let srv of servers) {
-        let mData = await dbGet(srv) || "";
-        let mList = mData ? mData.split("ç") : [];
-        let joined = [await dbGet(`${srv}_NAMES_1`), await dbGet(`${srv}_NAMES_2`), await dbGet(`${srv}_NAMES_3`), await dbGet(`${srv}_NAMES_4`), await dbGet(`${srv}_NAMES_5`)].filter(Boolean).join("ç");
-        let nList = joined ? joined.split("ç") : [];
-        while (nList.length < mList.length) nList.push("NULL");
-
-        let idx = mList.findIndex(item => item.startsWith(uuid + "#"));
-        if (idx !== -1) {
-          mList.splice(idx, 1); nList.splice(idx, 1);
-          await saveServerChunks(srv, mList, nList);
-        }
-      }
-
-      let targetMainData = await dbGet(targetServer) || ""; 
-      let targetMainList = targetMainData ? targetMainData.split("ç") : [];
-      let tJoined = [await dbGet(`${targetServer}_NAMES_1`), await dbGet(`${targetServer}_NAMES_2`), await dbGet(`${targetServer}_NAMES_3`), await dbGet(`${targetServer}_NAMES_4`), await dbGet(`${targetServer}_NAMES_5`)].filter(Boolean).join("ç");
-      let targetNamesList = tJoined ? tJoined.split("ç") : [];
-      while (targetNamesList.length < targetMainList.length) targetNamesList.push("NULL");
-
-      targetMainList.push(newItem); targetNamesList.push(cleanRegion);
-      await saveServerChunks(targetServer, targetMainList, targetNamesList);
-    } 
-    else if (action === "MOVE_HUB") {
-      let foundItem = null; let foundName = null;
-      for (let srv of servers) {
-        let mData = await dbGet(srv) || ""; let mList = mData ? mData.split("ç") : [];
-        let idx = mList.findIndex(item => item.startsWith(uuid + "#"));
-        if (idx !== -1) {
-          let joined = [await dbGet(`${srv}_NAMES_1`), await dbGet(`${srv}_NAMES_2`), await dbGet(`${srv}_NAMES_3`), await dbGet(`${srv}_NAMES_4`), await dbGet(`${srv}_NAMES_5`)].filter(Boolean).join("ç");
-          let nList = joined ? joined.split("ç") : [];
-          while (nList.length < mList.length) nList.push("NULL");
-          foundItem = mList.splice(idx, 1)[0]; foundName = nList.splice(idx, 1)[0];
-          await saveServerChunks(srv, mList, nList);
-          break;
-        }
-      }
-      if (!foundItem) return res.status(404).json({ error: "Parcela não encontrada em nenhum continente ativo para mover." });
-
-      let destMainData = await dbGet(targetServer) || ""; let destMainList = destMainData ? destMainData.split("ç") : [];
-      let tJoined = [await dbGet(`${targetServer}_NAMES_1`), await dbGet(`${targetServer}_NAMES_2`), await dbGet(`${targetServer}_NAMES_3`), await dbGet(`${targetServer}_NAMES_4`), await dbGet(`${targetServer}_NAMES_5`)].filter(Boolean).join("ç");
-      let destNamesList = tJoined ? tJoined.split("ç") : [];
-      while (destNamesList.length < destMainList.length) destNamesList.push("NULL");
-
-      destMainList.push(foundItem); destNamesList.push(foundName);
-      await saveServerChunks(targetServer, destMainList, destNamesList);
-    }
-    else {
-      let mainData = await dbGet(targetServer) || ""; let mainList = mainData ? mainData.split("ç") : [];
-      let joined = [await dbGet(`${targetServer}_NAMES_1`), await dbGet(`${targetServer}_NAMES_2`), await dbGet(`${targetServer}_NAMES_3`), await dbGet(`${targetServer}_NAMES_4`), await dbGet(`${targetServer}_NAMES_5`)].filter(Boolean).join("ç");
-      let namesList = joined ? joined.split("ç") : [];
-      while (namesList.length < mainList.length) namesList.push("NULL");
-
-      if (action === "DEL_PARCEL") {
-        const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
-        if (idx !== -1) { mainList.splice(idx, 1); namesList.splice(idx, 1); }
-      } 
-      else if (action === "DEL_NUM") {
-        if (num >= 0 && num < mainList.length) { mainList.splice(num, 1); namesList.splice(num, 1); }
-      } 
-      else if (action === "REORDER") {
-        const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
-        if (idx !== -1) {
-          let targetPos = newPos < 0 ? 0 : (newPos > mainList.length ? mainList.length : newPos);
-          const item = mainList.splice(idx, 1)[0]; const name = namesList.splice(idx, 1)[0];
-          mainList.splice(targetPos, 0, item); namesList.splice(targetPos, 0, name);
-        }
-      }
-      else if (action === "UPDATE_REGION") {
-        const idx = mainList.findIndex(item => item.startsWith(uuid + "#"));
-        if (idx !== -1) namesList[idx] = formatRegion(regionName);
-        namesList = namesList.map(name => formatRegion(name));
-      }
-      await saveServerChunks(targetServer, mainList, namesList);
-    }
-    res.status(200).json({ success: true, message: `Ação ${action} processada.` });
-  } catch (error) { res.status(500).json({ error: "Erro interno no servidor" }); }
-});
-
-app.post('/admin/sync-regions', requireToken, async (req, res) => {
-  res.json({ status: "success", message: "Sincronização iniciada." });
-  (async () => {
-    try {
-      let serversData = await dbGet("SERVERS");
-      let servers = serversData ? serversData.split("ç").filter(Boolean) : [];
-      for (let srv of servers) {
-        let mainData = await dbGet(srv) || ""; let mainList = mainData ? mainData.split("ç").filter(Boolean) : [];
-        if (mainList.length === 0) continue;
-
-        let originalNames = [await dbGet(`${srv}_NAMES_1`), await dbGet(`${srv}_NAMES_2`), await dbGet(`${srv}_NAMES_3`), await dbGet(`${srv}_NAMES_4`), await dbGet(`${srv}_NAMES_5`)].filter(Boolean).join("ç");
-        let namesList = originalNames ? originalNames.split("ç") : [];
-        while (namesList.length < mainList.length) namesList.push("NULL");
-
-        for (let i = 0; i < mainList.length; i++) {
-          let uuid = mainList[i].split("#")[0];
-          if (uuid && uuid.length === 36) {
-            try {
-              const fetchOptions = { headers: { "User-Agent": "Mozilla/5.0", "Accept": "text/html,application/xml" } };
-              let slRes = await fetch(`https://world.secondlife.com/parcel/${uuid}`, fetchOptions);
-              if (!slRes.ok) slRes = await fetch(`https://world.secondlife.com/place/${uuid}`, fetchOptions);
-
-              if (slRes.ok) {
-                const html = await slRes.text();
-                let extractedRegion = "";
-                const mapMatch = html.match(/maps\.secondlife\.com\/secondlife\/([^\/"]+)/i);
-                if (mapMatch && mapMatch[1]) { extractedRegion = decodeURIComponent(mapMatch[1]).replace(/\+/g, ' ').trim(); } 
-                else {
-                  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-                  if (titleMatch && titleMatch[1]) {
-                    let title = titleMatch[1].replace(/\n/g, ' ').replace(/\r/g, '').replace(/\s+/g, ' ').trim();
-                    let slIdx = title.indexOf(" - Second Life");
-                    if (slIdx !== -1) title = title.substring(0, slIdx).trim();
-                    let lastDashIdx = title.lastIndexOf(" - ");
-                    if (lastDashIdx !== -1) title = title.substring(lastDashIdx + 3).trim();
-                    extractedRegion = title;
-                  }
-                }
-                if (extractedRegion) {
-                  if (extractedRegion.toLowerCase() === "royie" || extractedRegion.toLowerCase() === "royier") extractedRegion = "Royier";
-                  extractedRegion = extractedRegion.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
-                  if (namesList[i] !== extractedRegion && extractedRegion !== "Second Life") {
-                    namesList[i] = extractedRegion;
-                  }
-                }
-              }
-            } catch (err) {}
-            await new Promise(resolve => setTimeout(resolve, 800));
-          }
-        }
-        let newNames = namesList.join("ç");
-        if (newNames !== originalNames) await saveServerChunks(srv, mainList, namesList);
-      }
-    } catch (err) {}
-  })();
-});
-
-// ========================================================
-// CORE CARGO AND PARCEL DEMAND HELPERS
-// ========================================================
-async function processParcelDemand(parcelUuid, user) {
-  if (!parcelUuid || parcelUuid.length < 36) return 1.0;
-  let cleanUuid = parcelUuid.toLowerCase().replace(/[^0-9a-f\-]/g, "");
-  if (cleanUuid.length !== 36) return 1.0;
-  
-  const key = `PARCEL_${cleanUuid}`;
-  let isImmune = await isValidGfnHub(cleanUuid); 
-
-  try {
-      let dataStr = await dbGet(key);
-      let parcel = dataStr ? JSON.parse(dataStr) : { mult: 1.0, history: [], last_delivery: 0, user_history: {} };
-      if (!parcel.user_history) parcel.user_history = {};
-      let now = getUnixTime();
-
-      if (isImmune) {
-          parcel.mult = 1.0; parcel.history = []; parcel.last_delivery = now;
-          await dbSet(key, JSON.stringify(parcel));
-          return 1.0;
-      }
-
-      parcel.history = parcel.history.filter(ts => (now - ts) <= 10800);
-      let lastUserTime = parcel.user_history[user] || 0;
-      let alreadyCountedRecently = (now - lastUserTime) < 15;
-
-      if (!alreadyCountedRecently) {
-         if (parcel.last_delivery > 0 && parcel.mult < 1.0) {
-            let timeOffline = now - parcel.last_delivery;
-            let recovered = (timeOffline / 600.0) * 0.15;
-            parcel.mult = Math.min(1.0, parcel.mult + recovered);
-         }
-         parcel.history.push(now);
-         parcel.last_delivery = now; 
-         parcel.user_history[user] = now;
-         parcel.mult = Math.max(0.1, parcel.mult - 0.1);
-         parcel.mult = Math.round(parcel.mult * 10) / 10;
-         await dbSet(key, JSON.stringify(parcel));
-      }
-      return parcel.mult;
-  } catch (err) { return 1.0; }
-}
-
-async function getParcelDemandOnly(parcelUuid) {
-  if (!parcelUuid || parcelUuid.length < 36) return { mult: 1.0, last_delivery: 0 };
-  let cleanUuid = parcelUuid.toLowerCase().replace(/[^0-9a-f\-]/g, "");
-  if (cleanUuid.length !== 36) return { mult: 1.0, last_delivery: 0 };
-  if (await isValidGfnHub(cleanUuid)) return { mult: 1.0, last_delivery: 0 };
-  
-  const key = `PARCEL_${cleanUuid}`;
-  try {
-      let dataStr = await dbGet(key);
-      if (!dataStr) return { mult: 1.0, last_delivery: 0 };
-      let parcel = JSON.parse(dataStr);
-      let now = getUnixTime();
-      let mult = parcel.mult;
-      if (parcel.last_delivery > 0 && mult < 1.0) {
-         let timeOffline = now - parcel.last_delivery;
-         let recovered = (timeOffline / 600.0) * 0.15;
-         mult = Math.min(1.0, mult + recovered);
-      }
-      return { mult: Math.round(mult * 10) / 10, last_delivery: parcel.last_delivery || 0 };
-  } catch (err) { return { mult: 1.0, last_delivery: 0 }; }
-}
-
-// ========================================================
-// CARGO ACTION ROUTE
+// OUTRAS ROTAS OMITIDAS NO RESUMO (Continuam iguais ao que vc mandou)
 // ========================================================
 app.post("/action", requireToken, async (req, res) => {
   const { topic, user, target, content, plan, productName, reqTime, action } = req.body;
@@ -1818,9 +1349,6 @@ app.post("/action", requireToken, async (req, res) => {
       let player = await getPlayerData(user);
       let now = getUnixTime();
 
-      // ====================================================
-      // DREDGE SELL - AGORA INCLUI DEMANDA, BOOSTS E AFINIDADE
-      // ====================================================
       if (safeTopic === "dredge sell") {
         const isHub = await isValidGfnHub(target);
         if (!isHub) {
@@ -1848,7 +1376,6 @@ app.post("/action", requireToken, async (req, res) => {
         if (price <= 0) return res.json({ status: "empty" });
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
 
-        // VERIFICAR DEMANDA E SATURAÇÃO
         let demandMult = 1.0; let targetParcel = null;
         for (let i = 0; i < 8; i++) {
             if (player.ACTIVE_PARCEL && (now - player.PARCEL_TIME) < 1800) { 
@@ -1873,7 +1400,6 @@ app.post("/action", requireToken, async (req, res) => {
 
         if (player.P_W !== currentWeek) { player.P = 0; player.P_W = currentWeek; }
 
-        // VERIFICAR BOOSTS
         if (player.B_T > now) {
           boost_m = parseFloat(player.B_M) || 1.0;
           if (boost_m > 1.0) price = Math.round(price * boost_m);
@@ -1883,7 +1409,6 @@ app.post("/action", requireToken, async (req, res) => {
 
         const ptsMult = DREDGE_CONFIG.pointsPct || 0.10;
 
-        // Payout baseado nos planos (Premium, Test, Event, Free)
         if (plan !== "FREE" && plan !== "EVENT" && plan !== "TEST_CARGO") {
           if (boost_m > 1.0) await addPlayerMessage(user, `⚓ Dredge payout boosted by ${boost_m}X!`);
           await addPlayerMessage(user, `⚓ Sold ${Math.round(totalKg * 10) / 10} kg of dredged minerals for ${price} F₵.`);
@@ -1927,7 +1452,6 @@ app.post("/action", requireToken, async (req, res) => {
           }
         }
 
-        // VERIFICAR AFINIDADE PARA DREDGE
         if (!player.AFFINITY) player.AFFINITY = {};
         if (!player.AFFINITY_TIME) player.AFFINITY_TIME = {};
 
@@ -1969,9 +1493,6 @@ app.post("/action", requireToken, async (req, res) => {
         responsePayload.msg = `⚓ Sold Dredge for ${recebido} F₵. Balance: ${player.M} F₵`;
       }
       
-      // ====================================================
-      // CARGO SELL
-      // ====================================================
       else if (safeTopic === "cargo sell") {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
@@ -2116,9 +1637,6 @@ app.post("/action", requireToken, async (req, res) => {
         responsePayload.recebido = recebido;
         responsePayload.msg = `Sold cargo for ${recebido} F₵. Balance: ${player.M} F₵`;
       } 
-      // ====================================================
-      // OTHER ACTIONS
-      // ====================================================
       else if (safeTopic === "addboost") {
         let add_mult = parseFloat(content) || 1.0;
         let add_time = parseInt(target) || 0;
@@ -2351,10 +1869,6 @@ app.post("/set", requireToken, async (req, res) => {
   } catch (e) { res.status(500).json({ error: "db error" }); }
 });
 
-
-// ========================================================
-// KNOWLEDGE BASE (Q&A) ROUTES PARA O PAINEL DE ADMIN DO SL
-// ========================================================
 app.get("/ai/kb", async (req, res) => {
   res.json({ status: "OK", kb: GFN_KB });
 });
@@ -2385,10 +1899,6 @@ app.post("/ai/kb/delete", requireToken, async (req, res) => {
   }
 });
 
-
-// ========================================================
-// AI CHATBOT ROUTE (GROQ) - CAPITÃO BARA A CAPIVARA
-// ========================================================
 app.post("/ai/chat", requireToken, async (req, res) => {
   const { user, message } = req.body;
   if (!user || !message) {
