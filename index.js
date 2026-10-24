@@ -73,7 +73,7 @@ const OIL_LOCK_TIMEOUT = 18;
 
 let OIL_VERSION = "1.0";
 let OIL_CONFIG = {
-  oilPricePerLiter: 2.5,      
+  oilPricePerLiter: 2.5,     
   minWellOil: 5000.0,         
   maxWellOil: 15000.0,        
   maxExtractPerTick: 250.0,   
@@ -414,12 +414,49 @@ async function resetWeeklyOilSeabed() {
 }
 
 // ========================================================
-// SHARED DB HELPERS
+// SHARED DB HELPERS & DEMAND LOGIC (RESTAURADA)
 // ========================================================
 function formatDuration(seconds) {
   const hrs = Math.floor(seconds / 3600);
   const mins = Math.floor((seconds % 3600) / 60);
   return `${hrs}h ${mins}m`;
+}
+
+// RESTAURADO: Verifica a demanda atual do HUB (Apenas leitura)
+async function getParcelDemandOnly(parcelUuid) {
+  let data = { mult: 1.0, last_delivery: 0, cap: 50 };
+  try {
+    let res = await dbGet(`PARCEL_${parcelUuid}`);
+    if (res) {
+      let parsed = JSON.parse(res);
+      data.mult = parsed.mult !== undefined ? parsed.mult : 1.0;
+      data.last_delivery = parsed.last_delivery || 0;
+
+      let now = getUnixTime();
+      if (data.last_delivery > 0 && data.mult < 1.0) {
+          let timeOffline = now - data.last_delivery;
+          let recovered = (timeOffline / 600.0) * 0.15;
+          data.mult = Math.min(1.0, data.mult + recovered);
+      }
+    }
+  } catch(e) {}
+  return data;
+}
+
+// RESTAURADO: Processa a entrega da carga e diminui a demanda
+async function processParcelDemand(parcelUuid, userUuid) {
+  return await withLock(`LOCK_PARCEL_${parcelUuid}`, async () => {
+    let now = getUnixTime();
+    let currentData = await getParcelDemandOnly(parcelUuid);
+    let finalMult = currentData.mult;
+    
+    // Cada entrega diminui a demanda em 25%
+    currentData.mult = Math.max(0.1, currentData.mult - 0.25);
+    currentData.last_delivery = now;
+    
+    await dbSet(`PARCEL_${parcelUuid}`, JSON.stringify(currentData));
+    return Math.round(finalMult * 1000) / 1000;
+  });
 }
 
 async function isValidGfnHub(parcelUuid) {
@@ -720,6 +757,87 @@ async function savePlayerData(uuid, data) {
 // ========================================================
 // API ROUTES
 // ========================================================
+
+app.post("/admin/parcel", requireToken, async (req, res) => {
+  const { action, serverId, uuid, pos, regionName, num, newPos } = req.body;
+
+  if (!serverId) return res.status(400).json({ error: "Missing serverId" });
+
+  await withLock(`SERVER_${serverId}`, async () => {
+    try {
+      let mainStr = await dbGet(serverId) || "";
+      let mainList = mainStr ? mainStr.split("ç").filter(Boolean) : [];
+
+      let namesList = [];
+      for (let i = 1; i <= 5; i++) {
+        let chunk = await dbGet(`${serverId}_NAMES_${i}`);
+        if (chunk) {
+            let parsedChunk = chunk.split("ç").filter(Boolean);
+            namesList.push(...parsedChunk);
+        }
+      }
+
+      while (namesList.length < mainList.length) namesList.push("Unknown Region");
+
+      let findIndexByUuid = (u) => mainList.findIndex(item => item.toLowerCase().startsWith(u.toLowerCase() + "#"));
+
+      let effRegion = (regionName || "Unknown").replace(/ç/g, "").replace(/#/g, "");
+      let newItemStr = `${uuid}#${pos}#${effRegion}`;
+
+      if (action === "SET_PARCEL" || action === "MOVE_HUB") {
+        let idx = findIndexByUuid(uuid);
+        if (idx !== -1) {
+          mainList[idx] = newItemStr;
+          namesList[idx] = effRegion;
+        } else {
+          mainList.push(newItemStr);
+          namesList.push(effRegion);
+        }
+      }
+      else if (action === "DEL_PARCEL") {
+        let idx = findIndexByUuid(uuid);
+        if (idx !== -1) {
+          mainList.splice(idx, 1);
+          namesList.splice(idx, 1);
+        }
+      }
+      else if (action === "DEL_NUM") {
+        let idx = parseInt(num); 
+        if (!isNaN(idx) && idx >= 0 && idx < mainList.length) {
+          mainList.splice(idx, 1);
+          namesList.splice(idx, 1);
+        }
+      }
+      else if (action === "REORDER") {
+         let oldIdx = findIndexByUuid(uuid);
+         let nPos = parseInt(newPos);
+         if (oldIdx !== -1 && !isNaN(nPos) && nPos >= 0 && nPos <= mainList.length) {
+            let mItem = mainList.splice(oldIdx, 1)[0];
+            let nItem = namesList.splice(oldIdx, 1)[0];
+            mainList.splice(nPos, 0, mItem);
+            namesList.splice(nPos, 0, nItem);
+         }
+      }
+      else if (action === "UPDATE_REGION") {
+        let idx = findIndexByUuid(uuid);
+        if (idx !== -1) {
+            let oldParts = mainList[idx].split("#");
+            let oldPos = oldParts.length > 1 ? oldParts[1] : "";
+            mainList[idx] = `${uuid}#${oldPos}#${effRegion}`;
+            namesList[idx] = effRegion;
+        }
+      }
+
+      await saveServerChunks(serverId, mainList, namesList);
+      res.json({ status: "success", action });
+
+    } catch (e) {
+      console.error("Erro no /admin/parcel:", e);
+      res.status(500).json({ error: "Internal error" });
+    }
+  });
+});
+
 app.get("/get-msg", async (req, res) => {
   const uuid = req.query.uuid;
   if (!uuid) return res.status(400).json({ error: "missing uuid" });
@@ -941,9 +1059,6 @@ app.post("/oil/stop-extract", requireToken, async (req, res) => {
   });
 });
 
-// ========================================================
-// ROTA DE PERMISSÕES DO TERMINAL (CORRIGIDA)
-// ========================================================
 app.get("/oil/pump-access", async (req, res) => {
     const { uuid } = req.query;
     if (!uuid) return res.status(400).json({ error: "missing uuid" });
@@ -1206,7 +1321,7 @@ app.post("/action", requireToken, async (req, res) => {
         await savePlayerData(user, player);
         responsePayload.recebido = recebido;
         responsePayload.msg = `⚓ Sold Dredge for ${recebido} F₵. Balance: ${player.M} F₵`;
-      }
+      } 
       
       else if (safeTopic === "cargo sell") {
         let price = parseInt(content) || 0;
