@@ -668,7 +668,7 @@ async function getPlayerData(uuid) {
     M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, 
     AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0, LAST_DIST: 0, 
     AFFINITY: {}, AFFINITY_TIME: {}, MIGUS: [], ACTIVE_MIGU: "", COOKIE_STOCK: 0,
-    P_IN: true, P_OUT: true // <-- DEFAULT PERMISSIONS PARA BOMBAS AQUI
+    P_IN: true, P_OUT: true 
   };
   
   if (res) {
@@ -740,31 +740,17 @@ app.post("/ack-msg", async (req, res) => {
 
 app.get('/dredge/check-zone', async (req, res) => {
   const { x, y, version } = req.query;
-  if (version && version !== DREDGE_VERSION) {
-    return res.json({ status: "OUTDATED", serverVersion: DREDGE_VERSION });
-  }
+  if (version && version !== DREDGE_VERSION) return res.json({ status: "OUTDATED", serverVersion: DREDGE_VERSION });
 
-  const worldX = parseFloat(x);
-  const worldY = parseFloat(y);
-  if (isNaN(worldX) || isNaN(worldY)) {
-    return res.status(400).json({ status: "ERROR", message: "Invalid world coordinates." });
-  }
+  const worldX = parseFloat(x); const worldY = parseFloat(y);
+  if (isNaN(worldX) || isNaN(worldY)) return res.status(400).json({ status: "ERROR", message: "Invalid world coordinates." });
 
   pruneExpiredDredgeReturns();
   const { depletedFraction, remainingSeconds } = inspectBrushArea(worldX, worldY);
 
-  if (depletedFraction >= 0.995) {
-    return res.json({
-      status: "DEPLETED",
-      depletedPct: 100,
-      efficiency: 0.0,
-      restoreText: formatDuration(remainingSeconds)
-    });
-  }
-
+  if (depletedFraction >= 0.995) return res.json({ status: "DEPLETED", depletedPct: 100, efficiency: 0.0, restoreText: formatDuration(remainingSeconds) });
   const depletedPct = Math.round(depletedFraction * 1000) / 10;
   const efficiency = Math.round((1.0 - depletedFraction) * 1000) / 1000;
-
   return res.json({ status: "OK", depletedPct, efficiency });
 });
 
@@ -772,21 +758,16 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
   const { dredgeUuid, user, ackMsgId, strokes } = req.body;
   const effectiveUuid = String(dredgeUuid || user || "").trim();
 
-  if (!effectiveUuid || !strokes || typeof strokes !== "string") {
-    return res.status(400).json({ status: "ERROR", message: "Missing dredgeUuid or strokes." });
-  }
+  if (!effectiveUuid || !strokes || typeof strokes !== "string") return res.status(400).json({ status: "ERROR", message: "Missing dredgeUuid or strokes." });
 
   await withLock("DREDGE_ZONES_LOCK", async () => {
     const now = getUnixTime();
     pruneExpiredDredgeReturns();
 
-    if (ackMsgId && DREDGE_RETURNS.has(String(ackMsgId))) {
-      DREDGE_RETURNS.delete(String(ackMsgId));
-    }
+    if (ackMsgId && DREDGE_RETURNS.has(String(ackMsgId))) DREDGE_RETURNS.delete(String(ackMsgId));
 
     const strokeList = strokes.split("|").filter(Boolean);
     let totalExtractedUnits = 0.0;
-
     let prevX = NaN; let prevY = NaN;
     if (DREDGE_LAST_POS.has(effectiveUuid)) {
       const lastPos = DREDGE_LAST_POS.get(effectiveUuid);
@@ -797,14 +778,8 @@ app.post('/dredge/sync-brush', requireToken, async (req, res) => {
     for (const s of strokeList) {
       const parts = s.split(",");
       if (parts.length >= 3) {
-        const sx = parseFloat(parts[0]);
-        const sy = parseFloat(parts[1]);
-        const rawVal = parseFloat(parts[2]) || 1;
-        
-        let ticks = 1;
-        if (rawVal < 1.0 && rawVal > 0.0) ticks = Math.max(1, Math.round(rawVal / BRUSH_TICK_OPACITY));
-        else ticks = Math.min(40, Math.max(1, Math.round(rawVal)));
-
+        const sx = parseFloat(parts[0]); const sy = parseFloat(parts[1]); const rawVal = parseFloat(parts[2]) || 1;
+        let ticks = (rawVal < 1.0 && rawVal > 0.0) ? Math.max(1, Math.round(rawVal / BRUSH_TICK_OPACITY)) : Math.min(40, Math.max(1, Math.round(rawVal)));
         if (!isNaN(sx) && !isNaN(sy)) {
           totalExtractedUnits += applyContinuousStrokeSegment(prevX, prevY, sx, sy, ticks, now);
           prevX = sx; prevY = sy; lastX = sx; lastY = sy;
@@ -967,9 +942,8 @@ app.post("/oil/stop-extract", requireToken, async (req, res) => {
 });
 
 // ========================================================
-// NOVO SISTEMA UNIVERSAL DE FLUIDOS (TERMINAL + COMPRA / VENDA)
+// ROTA DE PERMISSÕES DO TERMINAL (CORRIGIDA)
 // ========================================================
-
 app.get("/oil/pump-access", async (req, res) => {
     const { uuid } = req.query;
     if (!uuid) return res.status(400).json({ error: "missing uuid" });
@@ -983,8 +957,6 @@ app.post("/oil/pump-access", requireToken, async (req, res) => {
     
     await withLock(uuid, async () => {
         let pData = await getPlayerData(uuid);
-        if (action === "TOGGLE_IN") pData.P_IN = !pData.P_IN;
-        if (action === "TOGGLE_OUT") pData.P_OUT = !pData.P_OUT;
         if (action === "ALLOW_IN") pData.P_IN = true;
         if (action === "DENY_IN") pData.P_IN = false;
         if (action === "ALLOW_OUT") pData.P_OUT = true;
