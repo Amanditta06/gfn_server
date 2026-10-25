@@ -414,7 +414,7 @@ async function resetWeeklyOilSeabed() {
 }
 
 // ========================================================
-// SHARED DB HELPERS & DEMAND LOGIC (RESTAURADA)
+// SHARED DB HELPERS & DEMAND LOGIC
 // ========================================================
 function formatDuration(seconds) {
   const hrs = Math.floor(seconds / 3600);
@@ -422,7 +422,6 @@ function formatDuration(seconds) {
   return `${hrs}h ${mins}m`;
 }
 
-// RESTAURADO: Verifica a demanda atual do HUB (Apenas leitura)
 async function getParcelDemandOnly(parcelUuid) {
   let data = { mult: 1.0, last_delivery: 0, cap: 50 };
   try {
@@ -443,14 +442,12 @@ async function getParcelDemandOnly(parcelUuid) {
   return data;
 }
 
-// RESTAURADO: Processa a entrega da carga e diminui a demanda
 async function processParcelDemand(parcelUuid, userUuid) {
   return await withLock(`LOCK_PARCEL_${parcelUuid}`, async () => {
     let now = getUnixTime();
     let currentData = await getParcelDemandOnly(parcelUuid);
     let finalMult = currentData.mult;
     
-    // Cada entrega diminui a demanda em 25%
     currentData.mult = Math.max(0.1, currentData.mult - 0.25);
     currentData.last_delivery = now;
     
@@ -1081,13 +1078,18 @@ app.post("/oil/pump-access", requireToken, async (req, res) => {
     });
 });
 
+// ATUALIZADO: Cálculo misto (Volumes Livres + Volumes Penalizados)
 app.post("/oil/fluid-transaction", requireToken, async (req, res) => {
-  const { mode, tankUuid, tankOwner, targetOwner, amount, fluid, plan } = req.body;
+  const { mode, tankUuid, tankOwner, targetOwner, amount, penaltyAmount, fluid, plan } = req.body;
   const effMode = String(mode || "SELL").toUpperCase().trim();
   const sOwner = String(tankOwner || "").trim();
   const tOwner = String(targetOwner || "").trim();
   const fType = String(fluid || "OIL").toUpperCase().trim();
+  
   let reqLiters = Math.round((parseFloat(amount) || 0.0) * 10) / 10;
+  let reqPenalty = Math.round((parseFloat(penaltyAmount) || 0.0) * 10) / 10;
+  if (reqPenalty > reqLiters) reqPenalty = reqLiters; // Prevenção de bug matemático
+  let normalLiters = Math.max(0, reqLiters - reqPenalty);
 
   if (reqLiters <= 0.05 || !sOwner || !tOwner) return res.json({ status: "ERROR" });
 
@@ -1127,8 +1129,11 @@ app.post("/oil/fluid-transaction", requireToken, async (req, res) => {
      else if (effMode === "SELL") {
         if (!targetPlayer.P_IN && sOwner !== tOwner) return res.json({ status: "BLOCKED_BY_TARGET" });
 
+        // Cálculo da proporção de lucro normal (1.0x) vs penalizado (0.85x = lucro pela metade)
         let unitPrice = basePrice * 1.0; 
-        let fullCost = Math.ceil(reqLiters * unitPrice);
+        let penaltyUnitPrice = basePrice * 0.85; 
+        
+        let fullCost = Math.ceil((normalLiters * unitPrice) + (reqPenalty * penaltyUnitPrice));
 
         let boost_m = 1.0;
         if (tankPlayer.B_T > now) {
