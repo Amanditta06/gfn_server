@@ -36,6 +36,14 @@ let MIGU_LIST = [];
 let GFN_KB = []; 
 
 // ========================================================
+// GACHA SYSTEM LISTS (NEW)
+// ========================================================
+let GACHA_LISTS = {
+  eyes: [], mouths: [], pattern: [], outline: [], color_up: [], color_down: []
+};
+const DEFAULT_TEXTURE = "5748decc-f629-461c-9a36-a35a221fe21f"; // TEXTURE_BLANK do SL
+
+// ========================================================
 // DREDGE BRUSH & UUID RETURN QUEUE CONSTANTS
 // ========================================================
 const DREDGE_RADIUS = 4.0; 
@@ -108,6 +116,42 @@ async function withLock(key, fn) {
 const getUnixTime = () => Math.floor(Date.now() / 1000);
 const getCurrentWeek = () => Math.floor((getUnixTime() + 345600) / 604800);
 let activeServerWeek = getCurrentWeek();
+
+// ========================================================
+// GACHA HELPERS (NEW)
+// ========================================================
+function getLum(r, g, b) {
+  return 0.299 * r + 0.587 * g + 0.114 * b;
+}
+
+// Gera uma cor aleatória em formato LSL. contrastLum = -1 significa ignorar contraste.
+function generateColor(contrastLum = -1) {
+  let r, g, b, l;
+  let attempts = 0;
+  do {
+    r = Math.random(); g = Math.random(); b = Math.random();
+    l = getLum(r, g, b);
+    attempts++;
+    if (contrastLum === -1) break;
+    // Se o fundo é escuro (< 0.5), gerar cor clara (> 0.6)
+    if (contrastLum <= 0.5 && l > 0.6) break;
+    // Se o fundo é claro (> 0.5), gerar cor escura (< 0.4)
+    if (contrastLum > 0.5 && l < 0.4) break;
+  } while (attempts < 50); // Fallback para não travar num loop infinito
+  return { vec: `<${r.toFixed(3)}, ${g.toFixed(3)}, ${b.toFixed(3)}>`, lum: l };
+}
+
+async function initGacha() {
+  if (!DATABASE_URL) return;
+  try {
+    for (const key of Object.keys(GACHA_LISTS)) {
+      let res = await dbGet(`GACHA_${key.toUpperCase()}`);
+      if (res) {
+        try { GACHA_LISTS[key] = JSON.parse(res); } catch(e) { GACHA_LISTS[key] = []; }
+      }
+    }
+  } catch (e) { console.error("Erro no Gacha Init:", e); }
+}
 
 // ========================================================
 // DREDGE FUNCTIONS
@@ -634,6 +678,7 @@ async function ensureTable() {
     await db.query("DELETE FROM kvstore WHERE id LIKE 'PARCEL_%'");
     await cleanupStaleAffinities();
     await initOilSystemOnBoot();
+    await initGacha(); // LOAD GACHA ON BOOT
     
     const lastRankRes = await dbGet("lastWeekTopFive");
     if (lastRankRes) {
@@ -757,7 +802,6 @@ async function savePlayerData(uuid, data) {
 
 app.post("/admin/parcel", requireToken, async (req, res) => {
   const { action, serverId, uuid, pos, regionName, num, newPos } = req.body;
-
   if (!serverId) return res.status(400).json({ error: "Missing serverId" });
 
   await withLock(`SERVER_${serverId}`, async () => {
@@ -777,7 +821,6 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
       while (namesList.length < mainList.length) namesList.push("Unknown Region");
 
       let findIndexByUuid = (u) => mainList.findIndex(item => item.toLowerCase().startsWith(u.toLowerCase() + "#"));
-
       let effRegion = (regionName || "Unknown").replace(/ç/g, "").replace(/#/g, "");
       let newItemStr = `${uuid}#${pos}#${effRegion}`;
 
@@ -1078,7 +1121,6 @@ app.post("/oil/pump-access", requireToken, async (req, res) => {
     });
 });
 
-// ATUALIZADO: Cálculo misto (Volumes Livres + Volumes Penalizados)
 app.post("/oil/fluid-transaction", requireToken, async (req, res) => {
   const { mode, tankUuid, tankOwner, targetOwner, amount, penaltyAmount, fluid, plan } = req.body;
   const effMode = String(mode || "SELL").toUpperCase().trim();
@@ -1129,7 +1171,6 @@ app.post("/oil/fluid-transaction", requireToken, async (req, res) => {
      else if (effMode === "SELL") {
         if (!targetPlayer.P_IN && sOwner !== tOwner) return res.json({ status: "BLOCKED_BY_TARGET" });
 
-        // Cálculo da proporção de lucro normal (1.0x) vs penalizado (0.85x = lucro pela metade)
         let unitPrice = basePrice * 1.0; 
         let penaltyUnitPrice = basePrice * 0.85; 
         
@@ -1228,7 +1269,7 @@ app.post("/action", requireToken, async (req, res) => {
         if (demandMult < 1.0 && plan !== "EVENT") {
             price = Math.round(price * demandMult);
             let lostPercent = Math.round((1.0 - demandMult) * 100);
-            await addPlayerMessage(user, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +15% every 10 minutes without deliveries.`);
+            await addPlayerMessage(user, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +15% every 10 minutes sem deliveries.`);
         }
 
         let recebido = 0; let boost_m = 1.0; let currentWeek = getCurrentWeek();
@@ -1790,6 +1831,85 @@ app.post("/ai/chat", requireToken, async (req, res) => {
     console.error("[AI CHAT] Erro fatal:", err);
     res.status(500).json({ error: "Internal server error during AI processing", details: err.message });
   }
+});
+
+
+// ========================================================
+// GACHA ENDPOINTS (NEW)
+// ========================================================
+
+// ADMIN: Adicionar textura nas listas do gacha
+app.post("/gacha/add-texture", requireToken, async (req, res) => {
+  const { part, uuid } = req.body;
+  if (!part || !uuid) return res.status(400).json({ error: "missing part or uuid" });
+  
+  const validParts = Object.keys(GACHA_LISTS);
+  if (!validParts.includes(part)) return res.status(400).json({ error: "invalid part name" });
+
+  await withLock("GACHA_LIST_LOCK", async () => {
+    if (!GACHA_LISTS[part].includes(uuid)) {
+      GACHA_LISTS[part].push(uuid);
+      await dbSet(`GACHA_${part.toUpperCase()}`, JSON.stringify(GACHA_LISTS[part]));
+    }
+    res.json({ status: "success", message: `Texture added to ${part}` });
+  });
+});
+
+// GACHA: Gerar build aleatória na primeira vez que for rezzado
+app.post("/gacha/build", requireToken, async (req, res) => {
+  const { object_uuid } = req.body;
+  if (!object_uuid) return res.status(400).json({ error: "missing object_uuid" });
+
+  // Proteção do lado do server contra requests duplos
+  const hasBuilt = await dbGet(`GACHA_BUILT_${object_uuid}`);
+  if (hasBuilt) {
+    return res.json({ status: "already_built" });
+  }
+
+  // Pegar uma textura aleatória da lista (ou textura em branco se lista vazia)
+  const getTex = (part) => {
+    const list = GACHA_LISTS[part];
+    if (!list || list.length === 0) return DEFAULT_TEXTURE;
+    return list[Math.floor(Math.random() * list.length)];
+  };
+
+  // 1. Gerar cor de base (sem restrição de contraste)
+  const baseColor = generateColor(-1);
+  
+  // 2. Gerar color_up e color_down (sem restrição, podem ser qualquer cor)
+  const colUp = generateColor(-1);
+  const colDown = generateColor(-1);
+
+  // 3. Olhos dependem do color_up, Boca depende do color_down
+  const eyesColor = generateColor(colUp.lum);
+  const mouthColor = generateColor(colDown.lum);
+
+  // 4. Pattern e Outline precisam contrastar com ambos. Tiramos a média de luminância.
+  const avgLum = (colUp.lum + colDown.lum) / 2.0;
+  const patternColor = generateColor(avgLum);
+  const outlineColor = generateColor(avgLum);
+
+  const config = {
+    // 0 = Pattern
+    tex_0: getTex("pattern"), col_0: patternColor.vec,
+    // 1 = Base (Sem textura via render)
+    tex_1: "NULL", col_1: baseColor.vec,
+    // 2 = Color Down
+    tex_2: getTex("color_down"), col_2: colDown.vec,
+    // 3 = Color Up
+    tex_3: getTex("color_up"), col_3: colUp.vec,
+    // 4 = Eyes
+    tex_4: getTex("eyes"), col_4: eyesColor.vec,
+    // 5 = Mouth
+    tex_5: getTex("mouths"), col_5: mouthColor.vec,
+    // 6 = Outline
+    tex_6: getTex("outline"), col_6: outlineColor.vec
+  };
+
+  // Salvar no banco que este uuid já foi gerado
+  await dbSet(`GACHA_BUILT_${object_uuid}`, "1");
+  
+  res.json({ status: "success", config });
 });
 
 app.get("/", (req, res) => res.json({ status: "ok" }));
