@@ -1855,28 +1855,22 @@ app.post("/gacha/add-texture", requireToken, async (req, res) => {
   });
 });
 
-// GACHA: Gerar build aleatória na primeira vez que for rezzado
+// GACHA: Gerar build aleatória sem travar UUID no DB
 app.post("/gacha/build", requireToken, async (req, res) => {
   const { object_uuid } = req.body;
+
   if (!object_uuid) return res.status(400).json({ error: "missing object_uuid" });
 
-  // Proteção do lado do server contra requests duplos
-  const hasBuilt = await dbGet(`GACHA_BUILT_${object_uuid}`);
-  if (hasBuilt) {
-    return res.json({ status: "already_built" });
-  }
-
-  // Pegar uma textura aleatória da lista (ou textura em branco se lista vazia)
   const getTex = (part) => {
     const list = GACHA_LISTS[part];
     if (!list || list.length === 0) return DEFAULT_TEXTURE;
     return list[Math.floor(Math.random() * list.length)];
   };
 
-  // 1. Gerar cor de base (sem restrição de contraste)
+  // 1. Gerar cor de base
   const baseColor = generateColor(-1);
   
-  // 2. Gerar color_up e color_down (sem restrição, podem ser qualquer cor)
+  // 2. Gerar color_up e color_down
   const colUp = generateColor(-1);
   const colDown = generateColor(-1);
 
@@ -1884,32 +1878,23 @@ app.post("/gacha/build", requireToken, async (req, res) => {
   const eyesColor = generateColor(colUp.lum);
   const mouthColor = generateColor(colDown.lum);
 
-  // 4. Pattern e Outline precisam contrastar com ambos. Tiramos a média de luminância.
+  // 4. Pattern e Outline contrastam com ambos
   const avgLum = (colUp.lum + colDown.lum) / 2.0;
   const patternColor = generateColor(avgLum);
   const outlineColor = generateColor(avgLum);
 
   const config = {
-    // 0 = Pattern
     tex_0: getTex("pattern"), col_0: patternColor.vec,
-    // 1 = Base (Sem textura via render)
     tex_1: "NULL", col_1: baseColor.vec,
-    // 2 = Color Down
     tex_2: getTex("color_down"), col_2: colDown.vec,
-    // 3 = Color Up
     tex_3: getTex("color_up"), col_3: colUp.vec,
-    // 4 = Eyes
     tex_4: getTex("eyes"), col_4: eyesColor.vec,
-    // 5 = Mouth
     tex_5: getTex("mouths"), col_5: mouthColor.vec,
-    // 6 = Outline
     tex_6: getTex("outline"), col_6: outlineColor.vec
   };
-
-  // Salvar no banco que este uuid já foi gerado
-  await dbSet(`GACHA_BUILT_${object_uuid}`, "1");
   
-  res.json({ status: "success", config });
+  // Ecoamos o UUID de volta para confirmar de quem é a config
+  res.json({ status: "success", object_uuid, config });
 });
 
 app.get("/", (req, res) => res.json({ status: "ok" }));
