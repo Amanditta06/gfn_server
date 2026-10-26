@@ -1893,7 +1893,9 @@ app.post("/gacha/build", requireToken, async (req, res) => {
   const getTex = (part) => {
     const list = GACHA_LISTS[part];
     if (!list || list.length === 0) return DEFAULT_TEXTURE;
-    return list[Math.floor(Math.random() * list.length)];
+    const item = list[Math.floor(Math.random() * list.length)];
+    // Se for string (antigo), devolve string. Se for o objeto novo, devolve o uuid.
+    return typeof item === "string" ? item : item.uuid; 
   };
 
   // 1. Gerar cor de base
