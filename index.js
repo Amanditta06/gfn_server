@@ -1838,20 +1838,49 @@ app.post("/ai/chat", requireToken, async (req, res) => {
 // GACHA ENDPOINTS (NEW)
 // ========================================================
 
-// ADMIN: Adicionar textura nas listas do gacha
+// ADMIN: Adicionar textura com NOME nas listas do gacha
 app.post("/gacha/add-texture", requireToken, async (req, res) => {
-  const { part, uuid } = req.body;
-  if (!part || !uuid) return res.status(400).json({ error: "missing part or uuid" });
+  const { part, uuid, name } = req.body;
+  if (!part || !uuid || !name) return res.status(400).json({ error: "missing part, uuid, or name" });
   
   const validParts = Object.keys(GACHA_LISTS);
   if (!validParts.includes(part)) return res.status(400).json({ error: "invalid part name" });
 
   await withLock("GACHA_LIST_LOCK", async () => {
-    if (!GACHA_LISTS[part].includes(uuid)) {
-      GACHA_LISTS[part].push(uuid);
+    const safeName = name.toLowerCase();
+    
+    // Remove se já existir um com o mesmo nome (para sobrescrever)
+    GACHA_LISTS[part] = GACHA_LISTS[part].filter(item => typeof item === 'object' ? item.name !== safeName : item !== uuid);
+
+    // Salva como um objeto { name, uuid }
+    GACHA_LISTS[part].push({ name: safeName, uuid });
+    await dbSet(`GACHA_${part.toUpperCase()}`, JSON.stringify(GACHA_LISTS[part]));
+    
+    res.json({ status: "success", message: `Texture '${safeName}' added to ${part}` });
+  });
+});
+
+// ADMIN: Remover textura pelo NOME
+app.post("/gacha/remove-texture", requireToken, async (req, res) => {
+  const { part, name } = req.body;
+  if (!part || !name) return res.status(400).json({ error: "missing part or name" });
+
+  const validParts = Object.keys(GACHA_LISTS);
+  if (!validParts.includes(part)) return res.status(400).json({ error: "invalid part name" });
+
+  await withLock("GACHA_LIST_LOCK", async () => {
+    const safeName = name.toLowerCase();
+    const initialLength = GACHA_LISTS[part].length;
+    
+    // Filtra removendo quem tem o nome
+    GACHA_LISTS[part] = GACHA_LISTS[part].filter(item => typeof item === 'object' && item.name !== safeName);
+
+    if (GACHA_LISTS[part].length < initialLength) {
       await dbSet(`GACHA_${part.toUpperCase()}`, JSON.stringify(GACHA_LISTS[part]));
+      res.json({ status: "success", message: `Texture '${safeName}' removed from ${part}` });
+    } else {
+      res.json({ status: "error", message: `Texture '${safeName}' not found in ${part}` });
     }
-    res.json({ status: "success", message: `Texture added to ${part}` });
   });
 });
 
