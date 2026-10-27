@@ -36,11 +36,13 @@ let MIGU_LIST = [];
 let GFN_KB = []; 
 
 // ========================================================
-// GACHA SYSTEM LISTS (NEW)
+// GACHA SYSTEM LISTS & PRICES (NEW)
 // ========================================================
 let GACHA_LISTS = {
   eyes: [], mouths: [], pattern: [], outline: [], color_up: [], color_down: []
 };
+let GACHA_PRICES = { pattern: 10, base: 10, color_down: 10, color_up: 10, eyes: 10, mouths: 10, outline: 10 };
+
 const DEFAULT_TEXTURE = "5748decc-f629-461c-9a36-a35a221fe21f"; // TEXTURE_BLANK do SL
 
 // ========================================================
@@ -118,13 +120,12 @@ const getCurrentWeek = () => Math.floor((getUnixTime() + 345600) / 604800);
 let activeServerWeek = getCurrentWeek();
 
 // ========================================================
-// GACHA HELPERS (NEW)
+// GACHA HELPERS
 // ========================================================
 function getLum(r, g, b) {
   return 0.299 * r + 0.587 * g + 0.114 * b;
 }
 
-// Gera uma cor aleatória em formato LSL. contrastLum = -1 significa ignorar contraste.
 function generateColor(contrastLum = -1) {
   let r, g, b, l;
   let attempts = 0;
@@ -133,13 +134,18 @@ function generateColor(contrastLum = -1) {
     l = getLum(r, g, b);
     attempts++;
     if (contrastLum === -1) break;
-    // Se o fundo é escuro (< 0.5), gerar cor clara (> 0.6)
     if (contrastLum <= 0.5 && l > 0.6) break;
-    // Se o fundo é claro (> 0.5), gerar cor escura (< 0.4)
     if (contrastLum > 0.5 && l < 0.4) break;
-  } while (attempts < 50); // Fallback para não travar num loop infinito
+  } while (attempts < 50); 
   return { vec: `<${r.toFixed(3)}, ${g.toFixed(3)}, ${b.toFixed(3)}>`, lum: l };
 }
+
+const parseVecToLum = (vecStr) => {
+  try {
+    let parts = vecStr.replace(/[<>]/g, "").split(",");
+    return getLum(parseFloat(parts[0]), parseFloat(parts[1]), parseFloat(parts[2]));
+  } catch(e) { return 0.5; }
+};
 
 async function initGacha() {
   if (!DATABASE_URL) return;
@@ -149,6 +155,10 @@ async function initGacha() {
       if (res) {
         try { GACHA_LISTS[key] = JSON.parse(res); } catch(e) { GACHA_LISTS[key] = []; }
       }
+    }
+    const pRes = await dbGet("GACHA_PRICES");
+    if (pRes) {
+      try { GACHA_PRICES = { ...GACHA_PRICES, ...JSON.parse(pRes) }; } catch(e) {}
     }
   } catch (e) { console.error("Erro no Gacha Init:", e); }
 }
@@ -747,7 +757,7 @@ async function getPlayerData(uuid) {
     M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, 
     AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0, LAST_DIST: 0, 
     AFFINITY: {}, AFFINITY_TIME: {}, MIGUS: [], ACTIVE_MIGU: "", COOKIE_STOCK: 0,
-    P_IN: true, P_OUT: true 
+    P_IN: true, P_OUT: true, JELLY: 0
   };
   
   if (res) {
@@ -770,6 +780,7 @@ async function getPlayerData(uuid) {
       data.AFFINITY_TIME = parsedData.AFFINITY_TIME || {};
       data.ACTIVE_MIGU = parsedData.ACTIVE_MIGU || "";
       data.COOKIE_STOCK = parseInt(data.COOKIE_STOCK, 10) || 0;
+      data.JELLY = parseInt(data.JELLY, 10) || 0;
       
       data.P_IN = parsedData.P_IN !== undefined ? parsedData.P_IN : true;
       data.P_OUT = parsedData.P_OUT !== undefined ? parsedData.P_OUT : true;
@@ -1833,12 +1844,37 @@ app.post("/ai/chat", requireToken, async (req, res) => {
   }
 });
 
-
 // ========================================================
-// GACHA ENDPOINTS (NEW)
+// GACHA ENDPOINTS (UPDATED WITH JELLY SYSTEM)
 // ========================================================
 
-// ADMIN: Adicionar textura com NOME nas listas do gacha
+app.post("/gacha/set-price", requireToken, async (req, res) => {
+  const { part, price } = req.body;
+  let val = parseInt(price);
+  if (!part || isNaN(val) || val < 0) return res.status(400).json({error: "invalid"});
+  GACHA_PRICES[part] = val;
+  await dbSet("GACHA_PRICES", JSON.stringify(GACHA_PRICES));
+  res.json({status: "success", message: `Price for ${part} set to ${val} Jelly.`});
+});
+
+app.get("/gacha/prices", async (req, res) => {
+  const { uuid } = req.query;
+  let player = await getPlayerData(uuid);
+  res.json({ status: "success", jelly: player.JELLY, prices: GACHA_PRICES });
+});
+
+app.post("/gacha/buy-jelly", requireToken, async (req, res) => {
+  const { user_uuid, amount } = req.body;
+  let added = parseInt(amount) || 0;
+  if (!user_uuid || added <= 0) return res.status(400).json({error: "invalid"});
+  await withLock(user_uuid, async () => {
+    let player = await getPlayerData(user_uuid);
+    player.JELLY += added;
+    await savePlayerData(user_uuid, player);
+    res.json({status: "success", balance: player.JELLY, added});
+  });
+});
+
 app.post("/gacha/add-texture", requireToken, async (req, res) => {
   const { part, uuid, name } = req.body;
   if (!part || !uuid || !name) return res.status(400).json({ error: "missing part, uuid, or name" });
@@ -1849,10 +1885,8 @@ app.post("/gacha/add-texture", requireToken, async (req, res) => {
   await withLock("GACHA_LIST_LOCK", async () => {
     const safeName = name.toLowerCase();
     
-    // Remove se já existir um com o mesmo nome (para sobrescrever)
     GACHA_LISTS[part] = GACHA_LISTS[part].filter(item => typeof item === 'object' ? item.name !== safeName : item !== uuid);
 
-    // Salva como um objeto { name, uuid }
     GACHA_LISTS[part].push({ name: safeName, uuid });
     await dbSet(`GACHA_${part.toUpperCase()}`, JSON.stringify(GACHA_LISTS[part]));
     
@@ -1860,7 +1894,6 @@ app.post("/gacha/add-texture", requireToken, async (req, res) => {
   });
 });
 
-// ADMIN: Remover textura pelo NOME
 app.post("/gacha/remove-texture", requireToken, async (req, res) => {
   const { part, name } = req.body;
   if (!part || !name) return res.status(400).json({ error: "missing part or name" });
@@ -1872,7 +1905,6 @@ app.post("/gacha/remove-texture", requireToken, async (req, res) => {
     const safeName = name.toLowerCase();
     const initialLength = GACHA_LISTS[part].length;
     
-    // Filtra removendo quem tem o nome
     GACHA_LISTS[part] = GACHA_LISTS[part].filter(item => typeof item === 'object' && item.name !== safeName);
 
     if (GACHA_LISTS[part].length < initialLength) {
@@ -1884,32 +1916,70 @@ app.post("/gacha/remove-texture", requireToken, async (req, res) => {
   });
 });
 
-// GACHA: Gerar build aleatória sem travar UUID no DB
+app.post("/gacha/reroll", requireToken, async (req, res) => {
+  const { object_uuid, user_uuid, part, col_up, col_down } = req.body;
+  if (!object_uuid || !user_uuid || part === undefined) return res.status(400).json({error: "missing data"});
+
+  const partNames = ["pattern", "base", "color_down", "color_up", "eyes", "mouths", "outline"];
+  const partIdx = parseInt(part);
+  const partName = partNames[partIdx];
+  if (!partName) return res.status(400).json({error: "invalid part"});
+
+  await withLock(user_uuid, async () => {
+    let player = await getPlayerData(user_uuid);
+    let price = GACHA_PRICES[partName] !== undefined ? GACHA_PRICES[partName] : 10;
+    
+    if (player.JELLY < price) {
+      return res.json({ status: "insufficient", message: "Not enough Jelly to reroll this part.", price, balance: player.JELLY });
+    }
+
+    player.JELLY -= price;
+    await savePlayerData(user_uuid, player);
+
+    let upLum = parseVecToLum(col_up || "<0.5, 0.5, 0.5>");
+    let downLum = parseVecToLum(col_down || "<0.5, 0.5, 0.5>");
+    let avgLum = (upLum + downLum) / 2.0;
+
+    const getTex = (p) => {
+      const list = GACHA_LISTS[p];
+      if (!list || list.length === 0) return DEFAULT_TEXTURE;
+      const item = list[Math.floor(Math.random() * list.length)];
+      return typeof item === "string" ? item : item.uuid;
+    };
+
+    let newCol, newTex;
+    if (partIdx === 0) { newCol = generateColor(avgLum); newTex = getTex("pattern"); }
+    else if (partIdx === 1) { newCol = generateColor(-1); newTex = "NULL"; }
+    else if (partIdx === 2) { newCol = generateColor(-1); newTex = getTex("color_down"); }
+    else if (partIdx === 3) { newCol = generateColor(-1); newTex = getTex("color_up"); }
+    else if (partIdx === 4) { newCol = generateColor(upLum); newTex = getTex("eyes"); }
+    else if (partIdx === 5) { newCol = generateColor(downLum); newTex = getTex("mouths"); }
+    else if (partIdx === 6) { newCol = generateColor(avgLum); newTex = getTex("outline"); }
+
+    res.json({
+      status: "success", object_uuid, part: partIdx, tex: newTex, col: newCol.vec, balance: player.JELLY
+    });
+  });
+});
+
 app.post("/gacha/build", requireToken, async (req, res) => {
   const { object_uuid } = req.body;
-
   if (!object_uuid) return res.status(400).json({ error: "missing object_uuid" });
 
   const getTex = (part) => {
     const list = GACHA_LISTS[part];
     if (!list || list.length === 0) return DEFAULT_TEXTURE;
     const item = list[Math.floor(Math.random() * list.length)];
-    // Se for string (antigo), devolve string. Se for o objeto novo, devolve o uuid.
     return typeof item === "string" ? item : item.uuid; 
   };
 
-  // 1. Gerar cor de base
   const baseColor = generateColor(-1);
-  
-  // 2. Gerar color_up e color_down
   const colUp = generateColor(-1);
   const colDown = generateColor(-1);
 
-  // 3. Olhos dependem do color_up, Boca depende do color_down
   const eyesColor = generateColor(colUp.lum);
   const mouthColor = generateColor(colDown.lum);
 
-  // 4. Pattern e Outline contrastam com ambos
   const avgLum = (colUp.lum + colDown.lum) / 2.0;
   const patternColor = generateColor(avgLum);
   const outlineColor = generateColor(avgLum);
@@ -1924,7 +1994,6 @@ app.post("/gacha/build", requireToken, async (req, res) => {
     tex_6: getTex("outline"), col_6: outlineColor.vec
   };
   
-  // Ecoamos o UUID de volta para confirmar de quem é a config
   res.json({ status: "success", object_uuid, config });
 });
 
