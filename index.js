@@ -12,7 +12,6 @@ app.use(cors());
 const PORT = process.env.PORT || 3000;
 const API_TOKEN = process.env.API_TOKEN || "changeme";
 const DATABASE_URL = process.env.DATABASE_URL;
-const GROQ_API_KEY = process.env.GROQ_API_KEY || "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";
 
 if (!DATABASE_URL) {
   console.warn("WARNING: DATABASE_URL not set. DB calls will fail until it's configured.");
@@ -29,21 +28,22 @@ let MAX_F = 2000;
 let MAX_TRANSACTION = 1000000;
 
 // ========================================================
-// MIGUS GLOBAL CACHE & AI KNOWLEDGE BASE
+// MIGUS GLOBAL CACHE & KNOWLEDGE BASE
 // ========================================================
 let MIGU_CONFIG = { version: "1.0", duel_wager: 50, cookie_cost: 10, catch_chance: 0.55 };
 let MIGU_LIST = []; 
 let GFN_KB = []; 
 
 // ========================================================
-// GACHA SYSTEM LISTS & PRICES (NEW)
+// GACHA SYSTEM LISTS & PRICES (UPDATED WITH POTIONS)
 // ========================================================
 let GACHA_LISTS = {
   eyes: [], mouths: [], pattern: [], outline: [], color_up: [], color_down: []
 };
-let GACHA_PRICES = { pattern: 10, base: 10, color_down: 10, color_up: 10, eyes: 10, mouths: 10, outline: 10 };
+// ADICIONADO HEAL E CRIT NA LISTA DE PREÇOS DO BANCO DE DADOS
+let GACHA_PRICES = { pattern: 10, base: 10, color_down: 10, color_up: 10, eyes: 10, mouths: 10, outline: 10, heal: 5, crit: 5 };
 
-const DEFAULT_TEXTURE = "5748decc-f629-461c-9a36-a35a221fe21f"; // TEXTURE_BLANK do SL
+const DEFAULT_TEXTURE = "5748decc-f629-461c-9a36-a35a221fe21f"; 
 
 // ========================================================
 // DREDGE BRUSH & UUID RETURN QUEUE CONSTANTS
@@ -1141,7 +1141,7 @@ app.post("/oil/fluid-transaction", requireToken, async (req, res) => {
   
   let reqLiters = Math.round((parseFloat(amount) || 0.0) * 10) / 10;
   let reqPenalty = Math.round((parseFloat(penaltyAmount) || 0.0) * 10) / 10;
-  if (reqPenalty > reqLiters) reqPenalty = reqLiters; // Prevenção de bug matemático
+  if (reqPenalty > reqLiters) reqPenalty = reqLiters; 
   let normalLiters = Math.max(0, reqLiters - reqPenalty);
 
   if (reqLiters <= 0.05 || !sOwner || !tOwner) return res.json({ status: "ERROR" });
@@ -1786,64 +1786,6 @@ app.post("/ai/kb/delete", requireToken, async (req, res) => {
   }
 });
 
-app.post("/ai/chat", requireToken, async (req, res) => {
-  const { user, message } = req.body;
-  if (!user || !message) {
-    return res.status(400).json({ error: "missing user or message" });
-  }
-
-  try {
-    let playerData = await getPlayerData(user);
-    let currentWeek = getCurrentWeek();
-    let weeklyPoints = (playerData.P_W === currentWeek) ? (playerData.P || 0) : 0;
-
-    let kbContext = "";
-    if (GFN_KB && GFN_KB.length > 0) {
-      kbContext = "Here is the official GFN Product Knowledge Base. Use this exact information if the user asks something related, but rephrase it naturally in your persona style (do not sound like a robot reading a manual):\n";
-      GFN_KB.forEach(item => {
-        kbContext += `Q: ${item.q} | A: ${item.a}\n`;
-      });
-    }
-
-    const systemPrompt = `You are Bara, a Capybara who is a Sea Captain, and the official AI mascot and assistant for Grid Freight Net (GFN) in Second Life. 
-    The user speaking to you has a balance of ${playerData.M || 0} F₵, ${weeklyPoints} weekly points, and ${playerData.COOKIE_STOCK || 0} Taming Cookies. 
-    ${kbContext}
-    IMPORTANT RULES:
-    1. ALWAYS reply in the exact language the user used to talk to you. Translate any knowledge base answers to their language.
-    2. Always embody your persona (Capybara Captain Bara). You can be slightly playful or use nautical/capybara references, but prioritize helping the user.
-    3. Be extremely concise (maximum 2 to 3 short sentences so it fits cleanly in Second Life chat). Never write long paragraphs.`;
-
-    const aiResponse = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${GROQ_API_KEY}`
-      },
-      body: JSON.stringify({
-        model: "openai/gpt-oss-120b",
-        messages: [
-          { role: "system", content: systemPrompt },
-          { role: "user", content: String(message) }
-        ],
-        max_tokens: 180,
-        temperature: 0.7
-      })
-    });
-
-    const aiData = await aiResponse.json();
-    
-    if (!aiResponse.ok) {
-      return res.status(500).json({ error: "Groq API error", details: aiData });
-    }
-
-    const reply = aiData.choices?.[0]?.message?.content || "Sem resposta da IA.";
-    res.json({ status: "success", reply });
-  } catch (err) {
-    console.error("[AI CHAT] Erro fatal:", err);
-    res.status(500).json({ error: "Internal server error during AI processing", details: err.message });
-  }
-});
-
 // ========================================================
 // GACHA ENDPOINTS (UPDATED WITH JELLY SYSTEM)
 // ========================================================
@@ -1872,6 +1814,26 @@ app.post("/gacha/buy-jelly", requireToken, async (req, res) => {
     player.JELLY += added;
     await savePlayerData(user_uuid, player);
     res.json({status: "success", balance: player.JELLY, added});
+  });
+});
+
+// NOVA ROTA PARA COMPRA DE POÇÕES! 
+app.post("/gacha/buy-potion", requireToken, async (req, res) => {
+  const { user_uuid, item } = req.body;
+  if (!user_uuid || !item) return res.status(400).json({error: "missing data"});
+
+  await withLock(user_uuid, async () => {
+    let player = await getPlayerData(user_uuid);
+    let price = GACHA_PRICES[item] !== undefined ? GACHA_PRICES[item] : 5;
+
+    if (player.JELLY < price) {
+      return res.json({ status: "insufficient", message: `Not enough Jelly. You need ${price} Jelly.` });
+    }
+
+    player.JELLY -= price;
+    await savePlayerData(user_uuid, player);
+
+    res.json({ status: "success", item, balance: player.JELLY });
   });
 });
 
