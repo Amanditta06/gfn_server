@@ -631,6 +631,45 @@ setInterval(cleanupStaleAffinities, 24 * 60 * 60 * 1000);
 setInterval(pruneExpiredDredgeZones, 15 * 60 * 1000);
 setInterval(pruneExpiredDredgeReturns, 30 * 1000);
 
+// ========================================================
+// MINING VEIN SYSTEM (RESET DAILY LOGIC)
+// ========================================================
+async function doDailyVeinReset() {
+  console.log("Running Global Vein Reset...");
+  try {
+    const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'veins_%'");
+    for (let row of q.rows) {
+      let pVeins = [];
+      try { pVeins = JSON.parse(row.value); } catch(e){}
+      let keepVeins = [];
+      let modified = false;
+
+      for (let v of pVeins) {
+        if (v.cur <= (v.max / 2)) {
+          try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 3000);
+            const res = await fetch(v.url + "/reset", { method: "POST", signal: controller.signal });
+            clearTimeout(timeoutId);
+            if (res.status === 200) {
+              keepVeins.push(v);
+            } else {
+              modified = true; 
+            }
+          } catch(e) {
+            modified = true; 
+          }
+        } else {
+          keepVeins.push(v);
+        }
+      }
+      if (modified) {
+        await dbSet(row.id, JSON.stringify(keepVeins));
+      }
+    }
+  } catch (e) { console.error("Vein reset error:", e); }
+}
+
 async function processHallOfFame(rankString) {
   if (!rankString || rankString.length <= 5 || rankString.includes("Waiting")) return;
   try {
@@ -688,7 +727,7 @@ async function ensureTable() {
     await db.query("DELETE FROM kvstore WHERE id LIKE 'PARCEL_%'");
     await cleanupStaleAffinities();
     await initOilSystemOnBoot();
-    await initGacha(); // LOAD GACHA ON BOOT
+    await initGacha();
     
     const lastRankRes = await dbGet("lastWeekTopFive");
     if (lastRankRes) {
@@ -698,6 +737,7 @@ async function ensureTable() {
 }
 ensureTable();
 
+// 60-Second Loop (Weeklies + Daily Veins)
 setInterval(async () => {
   let currentNowWeek = getCurrentWeek();
   if (currentNowWeek !== activeServerWeek) {
@@ -712,6 +752,16 @@ setInterval(async () => {
       activeServerWeek = currentNowWeek;
     } catch (e) {}
   }
+  
+  // Daily check for Mining Veins
+  try {
+      const dailyVeinCheck = await dbGet("last_daily_vein_reset");
+      const currentDay = Math.floor(getUnixTime() / 86400);
+      if (!dailyVeinCheck || parseInt(dailyVeinCheck) !== currentDay) {
+          await doDailyVeinReset();
+          await dbSet("last_daily_vein_reset", currentDay.toString());
+      }
+  } catch(e){}
 }, 60000);
 
 function requireToken(req, res, next) {
@@ -873,7 +923,7 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
         let idx = findIndexByUuid(uuid);
         if (idx !== -1) {
             let oldParts = mainList[idx].split("#");
-            let oldPos = oldParts.length > 1 ? oldParts[1] : "";
+            let oldPos = oldParts.length > 1 ? oldPos : "";
             mainList[idx] = `${uuid}#${oldPos}#${effRegion}`;
             namesList[idx] = effRegion;
         }
@@ -1787,9 +1837,8 @@ app.post("/ai/kb/delete", requireToken, async (req, res) => {
 });
 
 // ========================================================
-// GACHA ENDPOINTS (UPDATED WITH JELLY SYSTEM)
+// GACHA ENDPOINTS
 // ========================================================
-
 app.post("/gacha/set-price", requireToken, async (req, res) => {
   const { part, price } = req.body;
   let val = parseInt(price);
@@ -1817,7 +1866,6 @@ app.post("/gacha/buy-jelly", requireToken, async (req, res) => {
   });
 });
 
-// NOVA ROTA PARA COMPRA DE POÇÕES! 
 app.post("/gacha/buy-potion", requireToken, async (req, res) => {
   const { user_uuid, item } = req.body;
   if (!user_uuid || !item) return res.status(400).json({error: "missing data"});
@@ -1848,7 +1896,6 @@ app.post("/gacha/add-texture", requireToken, async (req, res) => {
     const safeName = name.toLowerCase();
     
     GACHA_LISTS[part] = GACHA_LISTS[part].filter(item => typeof item === 'object' ? item.name !== safeName : item !== uuid);
-
     GACHA_LISTS[part].push({ name: safeName, uuid });
     await dbSet(`GACHA_${part.toUpperCase()}`, JSON.stringify(GACHA_LISTS[part]));
     
@@ -1957,6 +2004,85 @@ app.post("/gacha/build", requireToken, async (req, res) => {
   };
   
   res.json({ status: "success", object_uuid, config });
+});
+
+
+// ========================================================
+// MINING VEIN ENDPOINTS (NEW)
+// ========================================================
+
+app.post("/mining/register", requireToken, async (req, res) => {
+    const { user_uuid, vein_uuid, url, max_kg, current_kg } = req.body;
+    if (!user_uuid || !vein_uuid || !url) return res.status(400).json({error: "missing data"});
+
+    await withLock(`VEIN_${user_uuid}`, async () => {
+        let pVeins = [];
+        let row = await dbGet(`veins_${user_uuid}`);
+        if (row) { try { pVeins = JSON.parse(row); } catch(e){} }
+
+        // Remove a própria vinha caso ela esteja se re-registrando (re-rez)
+        pVeins = pVeins.filter(v => v.uuid !== vein_uuid);
+
+        if (pVeins.length >= 3) {
+            // Faz um Ping em todas para ver quais realmente estão vivas (Timeout de 2 segundos!)
+            let aliveVeins = [];
+            for (let v of pVeins) {
+                try {
+                    const controller = new AbortController();
+                    const timeoutId = setTimeout(() => controller.abort(), 2000); // 2 segundos!
+                    const pingRes = await fetch(v.url + "/ping", { method: "GET", signal: controller.signal });
+                    clearTimeout(timeoutId);
+                    
+                    if (pingRes.status === 200) {
+                        aliveVeins.push(v);
+                    } else {
+                        // Se respondeu mas com erro, manda ela morrer por garantia
+                        fetch(v.url + "/die", { method: "POST" }).catch(()=>null);
+                    }
+                } catch(e) {
+                    // Timeout ou falha, manda ela morrer por garantia
+                    fetch(v.url + "/die", { method: "POST" }).catch(()=>null);
+                }
+            }
+            pVeins = aliveVeins; // Atualiza a lista apenas com as vivas
+        }
+
+        if (pVeins.length >= 3) {
+            return res.json({ status: "DENIED", message: "Max 3 veins allowed." });
+        } else {
+            pVeins.push({ uuid: vein_uuid, url, max: parseFloat(max_kg), cur: parseFloat(current_kg) });
+            await dbSet(`veins_${user_uuid}`, JSON.stringify(pVeins));
+            return res.json({ status: "OK" });
+        }
+    });
+});
+
+app.post("/mining/update", requireToken, async (req, res) => {
+    const { user_uuid, vein_uuid, current_kg, max_kg } = req.body;
+    if (!user_uuid || !vein_uuid) return res.status(400).json({error: "missing data"});
+
+    await withLock(`VEIN_${user_uuid}`, async () => {
+        let pVeins = [];
+        let row = await dbGet(`veins_${user_uuid}`);
+        if (row) { try { pVeins = JSON.parse(row); } catch(e){} }
+
+        let found = false;
+        for (let v of pVeins) {
+            if (v.uuid === vein_uuid) {
+                if (current_kg !== undefined) v.cur = parseFloat(current_kg);
+                if (max_kg !== undefined) v.max = parseFloat(max_kg);
+                found = true;
+                break;
+            }
+        }
+        if (found) await dbSet(`veins_${user_uuid}`, JSON.stringify(pVeins));
+        res.json({ status: "OK" });
+    });
+});
+
+app.post("/mining/admin_reset", requireToken, async (req, res) => {
+    await doDailyVeinReset();
+    res.json({ status: "OK", message: "Manual global reset of depleted veins triggered." });
 });
 
 app.get("/", (req, res) => res.json({ status: "ok" }));
