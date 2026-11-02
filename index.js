@@ -649,7 +649,7 @@ async function doDailyVeinReset() {
             if (res.status === 200) {
               keepVeins.push(v);
             } else {
-              modified = true; // Exclui a veia morta para liberar slot no reset diário
+              modified = true; 
             }
           } catch(e) {
             modified = true; 
@@ -732,7 +732,6 @@ async function ensureTable() {
 }
 ensureTable();
 
-// 60-Second Loop (Weeklies + Daily Veins)
 setInterval(async () => {
   let currentNowWeek = getCurrentWeek();
   if (currentNowWeek !== activeServerWeek) {
@@ -748,7 +747,6 @@ setInterval(async () => {
     } catch (e) {}
   }
   
-  // Daily check for Mining Veins
   try {
       const dailyVeinCheck = await dbGet("last_daily_vein_reset");
       const currentDay = Math.floor(getUnixTime() / 86400);
@@ -2017,10 +2015,13 @@ app.post("/mining/register", requireToken, async (req, res) => {
 
         let aliveVeins = [];
         let deadVeins = [];
+        let exactMatch = null;
 
-        // Ping existing veins to find out which are dead
         for (let v of pVeins) {
-            if (v.uuid === vein_uuid) continue; // Skip self if re-registering
+            if (v.uuid === vein_uuid) {
+                exactMatch = v; 
+                continue; 
+            }
             try {
                 const controller = new AbortController();
                 const timeoutId = setTimeout(() => controller.abort(), 2000);
@@ -2039,32 +2040,40 @@ app.post("/mining/register", requireToken, async (req, res) => {
             }
         }
 
-        if (aliveVeins.length >= 3) {
+        if (aliveVeins.length >= 3 && !exactMatch) {
             return res.json({ status: "DENIED", message: "Max 3 veins allowed." });
         }
 
-        // Se o player tinha uma pedra velha/morta salva, e agora rezzou uma nova, essa nova "herda" a alma e os kgs da velha!
-        if (deadVeins.length > 0) {
-            let restoredVein = deadVeins.shift(); // Pega a primeira pedra morta da fila
-            
+        if (exactMatch) {
+            let restoredVein = exactMatch;
             let newVeinObj = {
                 uuid: vein_uuid,
                 url: url,
                 max: restoredVein.max,
                 cur: restoredVein.cur,
-                inventory: restoredVein.inventory // Mantém os KGs antigos!
+                inventory: restoredVein.inventory 
             };
-            
             aliveVeins.push(newVeinObj);
-            
-            // Reagrupa com as outras mortas (se existirem) para não perder o save
             let finalVeins = aliveVeins.concat(deadVeins);
             await dbSet(`veins_${user_uuid}`, JSON.stringify(finalVeins));
             
-            // Manda a Picareta/Pedra puxar o RESTORE
+            return res.json({ status: "RESTORE", inventory: restoredVein.inventory, max_kg: restoredVein.max, current_kg: restoredVein.cur });
+        }
+        else if (deadVeins.length > 0) {
+            let restoredVein = deadVeins.shift(); 
+            let newVeinObj = {
+                uuid: vein_uuid,
+                url: url,
+                max: restoredVein.max,
+                cur: restoredVein.cur,
+                inventory: restoredVein.inventory
+            };
+            aliveVeins.push(newVeinObj);
+            let finalVeins = aliveVeins.concat(deadVeins);
+            await dbSet(`veins_${user_uuid}`, JSON.stringify(finalVeins));
+            
             return res.json({ status: "RESTORE", inventory: restoredVein.inventory, max_kg: restoredVein.max, current_kg: restoredVein.cur });
         } else {
-            // Não há pedras mortas. É um slot de pedra 100% nova.
             let newVeinObj = {
                 uuid: vein_uuid,
                 url: url,
