@@ -35,12 +35,11 @@ let MIGU_LIST = [];
 let GFN_KB = []; 
 
 // ========================================================
-// GACHA SYSTEM LISTS & PRICES (UPDATED WITH POTIONS)
+// GACHA SYSTEM LISTS & PRICES
 // ========================================================
 let GACHA_LISTS = {
   eyes: [], mouths: [], pattern: [], outline: [], color_up: [], color_down: []
 };
-// ADICIONADO HEAL E CRIT NA LISTA DE PREÇOS DO BANCO DE DADOS
 let GACHA_PRICES = { pattern: 10, base: 10, color_down: 10, color_up: 10, eyes: 10, mouths: 10, outline: 10, heal: 5, crit: 5 };
 
 const DEFAULT_TEXTURE = "5748decc-f629-461c-9a36-a35a221fe21f"; 
@@ -122,9 +121,7 @@ let activeServerWeek = getCurrentWeek();
 // ========================================================
 // GACHA HELPERS
 // ========================================================
-function getLum(r, g, b) {
-  return 0.299 * r + 0.587 * g + 0.114 * b;
-}
+function getLum(r, g, b) { return 0.299 * r + 0.587 * g + 0.114 * b; }
 
 function generateColor(contrastLum = -1) {
   let r, g, b, l;
@@ -240,9 +237,7 @@ async function pruneExpiredDredgeZones() {
     }
   }
   if (removed > 0 && DATABASE_URL) {
-    try {
-      await dbSet("DREDGE_ZONES", serializeDredgeCells());
-    } catch (e) {}
+    try { await dbSet("DREDGE_ZONES", serializeDredgeCells()); } catch (e) {}
   }
 }
 
@@ -654,7 +649,7 @@ async function doDailyVeinReset() {
             if (res.status === 200) {
               keepVeins.push(v);
             } else {
-              modified = true; 
+              modified = true; // Exclui a veia morta para liberar slot no reset diário
             }
           } catch(e) {
             modified = true; 
@@ -923,7 +918,7 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
         let idx = findIndexByUuid(uuid);
         if (idx !== -1) {
             let oldParts = mainList[idx].split("#");
-            let oldPos = oldParts.length > 1 ? oldPos : "";
+            let oldPos = oldParts.length > 1 ? oldParts[1] : "";
             mainList[idx] = `${uuid}#${oldPos}#${effRegion}`;
             namesList[idx] = effRegion;
         }
@@ -2012,7 +2007,7 @@ app.post("/gacha/build", requireToken, async (req, res) => {
 // ========================================================
 
 app.post("/mining/register", requireToken, async (req, res) => {
-    const { user_uuid, vein_uuid, url, max_kg, current_kg } = req.body;
+    const { user_uuid, vein_uuid, url, max_kg, current_kg, inventory } = req.body;
     if (!user_uuid || !vein_uuid || !url) return res.status(400).json({error: "missing data"});
 
     await withLock(`VEIN_${user_uuid}`, async () => {
@@ -2020,45 +2015,73 @@ app.post("/mining/register", requireToken, async (req, res) => {
         let row = await dbGet(`veins_${user_uuid}`);
         if (row) { try { pVeins = JSON.parse(row); } catch(e){} }
 
-        // Remove a própria vinha caso ela esteja se re-registrando (re-rez)
-        pVeins = pVeins.filter(v => v.uuid !== vein_uuid);
+        let aliveVeins = [];
+        let deadVeins = [];
 
-        if (pVeins.length >= 3) {
-            // Faz um Ping em todas para ver quais realmente estão vivas (Timeout de 2 segundos!)
-            let aliveVeins = [];
-            for (let v of pVeins) {
-                try {
-                    const controller = new AbortController();
-                    const timeoutId = setTimeout(() => controller.abort(), 2000); // 2 segundos!
-                    const pingRes = await fetch(v.url + "/ping", { method: "GET", signal: controller.signal });
-                    clearTimeout(timeoutId);
-                    
-                    if (pingRes.status === 200) {
-                        aliveVeins.push(v);
-                    } else {
-                        // Se respondeu mas com erro, manda ela morrer por garantia
-                        fetch(v.url + "/die", { method: "POST" }).catch(()=>null);
-                    }
-                } catch(e) {
-                    // Timeout ou falha, manda ela morrer por garantia
+        // Ping existing veins to find out which are dead
+        for (let v of pVeins) {
+            if (v.uuid === vein_uuid) continue; // Skip self if re-registering
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 2000);
+                const pingRes = await fetch(v.url + "/ping", { method: "GET", signal: controller.signal });
+                clearTimeout(timeoutId);
+                
+                if (pingRes.status === 200) {
+                    aliveVeins.push(v);
+                } else {
+                    deadVeins.push(v);
                     fetch(v.url + "/die", { method: "POST" }).catch(()=>null);
                 }
+            } catch(e) {
+                deadVeins.push(v);
+                fetch(v.url + "/die", { method: "POST" }).catch(()=>null);
             }
-            pVeins = aliveVeins; // Atualiza a lista apenas com as vivas
         }
 
-        if (pVeins.length >= 3) {
+        if (aliveVeins.length >= 3) {
             return res.json({ status: "DENIED", message: "Max 3 veins allowed." });
+        }
+
+        // Se o player tinha uma pedra velha/morta salva, e agora rezzou uma nova, essa nova "herda" a alma e os kgs da velha!
+        if (deadVeins.length > 0) {
+            let restoredVein = deadVeins.shift(); // Pega a primeira pedra morta da fila
+            
+            let newVeinObj = {
+                uuid: vein_uuid,
+                url: url,
+                max: restoredVein.max,
+                cur: restoredVein.cur,
+                inventory: restoredVein.inventory // Mantém os KGs antigos!
+            };
+            
+            aliveVeins.push(newVeinObj);
+            
+            // Reagrupa com as outras mortas (se existirem) para não perder o save
+            let finalVeins = aliveVeins.concat(deadVeins);
+            await dbSet(`veins_${user_uuid}`, JSON.stringify(finalVeins));
+            
+            // Manda a Picareta/Pedra puxar o RESTORE
+            return res.json({ status: "RESTORE", inventory: restoredVein.inventory, max_kg: restoredVein.max, current_kg: restoredVein.cur });
         } else {
-            pVeins.push({ uuid: vein_uuid, url, max: parseFloat(max_kg), cur: parseFloat(current_kg) });
-            await dbSet(`veins_${user_uuid}`, JSON.stringify(pVeins));
-            return res.json({ status: "OK" });
+            // Não há pedras mortas. É um slot de pedra 100% nova.
+            let newVeinObj = {
+                uuid: vein_uuid,
+                url: url,
+                max: parseFloat(max_kg),
+                cur: parseFloat(current_kg),
+                inventory: inventory
+            };
+            aliveVeins.push(newVeinObj);
+            await dbSet(`veins_${user_uuid}`, JSON.stringify(aliveVeins));
+            
+            return res.json({ status: "NEW" });
         }
     });
 });
 
 app.post("/mining/update", requireToken, async (req, res) => {
-    const { user_uuid, vein_uuid, current_kg, max_kg } = req.body;
+    const { user_uuid, vein_uuid, current_kg, max_kg, inventory } = req.body;
     if (!user_uuid || !vein_uuid) return res.status(400).json({error: "missing data"});
 
     await withLock(`VEIN_${user_uuid}`, async () => {
@@ -2071,6 +2094,7 @@ app.post("/mining/update", requireToken, async (req, res) => {
             if (v.uuid === vein_uuid) {
                 if (current_kg !== undefined) v.cur = parseFloat(current_kg);
                 if (max_kg !== undefined) v.max = parseFloat(max_kg);
+                if (inventory !== undefined) v.inventory = inventory; // Salva o array atualizado!
                 found = true;
                 break;
             }
