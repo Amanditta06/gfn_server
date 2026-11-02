@@ -1829,186 +1829,45 @@ app.post("/ai/kb/delete", requireToken, async (req, res) => {
   }
 });
 
+
 // ========================================================
-// GACHA ENDPOINTS
+// MINING VEIN ENDPOINTS
 // ========================================================
-app.post("/gacha/set-price", requireToken, async (req, res) => {
-  const { part, price } = req.body;
-  let val = parseInt(price);
-  if (!part || isNaN(val) || val < 0) return res.status(400).json({error: "invalid"});
-  GACHA_PRICES[part] = val;
-  await dbSet("GACHA_PRICES", JSON.stringify(GACHA_PRICES));
-  res.json({status: "success", message: `Price for ${part} set to ${val} Jelly.`});
-});
 
-app.get("/gacha/prices", async (req, res) => {
-  const { uuid } = req.query;
-  let player = await getPlayerData(uuid);
-  res.json({ status: "success", jelly: player.JELLY, prices: GACHA_PRICES });
-});
+app.post("/mining/admin_set_limit", requireToken, async (req, res) => {
+    const { target_uuid, limit } = req.body;
+    let newLimit = parseInt(limit);
+    if (!target_uuid || isNaN(newLimit) || newLimit < 0) return res.status(400).json({ error: "invalid limit or uuid" });
 
-app.post("/gacha/buy-jelly", requireToken, async (req, res) => {
-  const { user_uuid, amount } = req.body;
-  let added = parseInt(amount) || 0;
-  if (!user_uuid || added <= 0) return res.status(400).json({error: "invalid"});
-  await withLock(user_uuid, async () => {
-    let player = await getPlayerData(user_uuid);
-    player.JELLY += added;
-    await savePlayerData(user_uuid, player);
-    res.json({status: "success", balance: player.JELLY, added});
-  });
-});
-
-app.post("/gacha/buy-potion", requireToken, async (req, res) => {
-  const { user_uuid, item } = req.body;
-  if (!user_uuid || !item) return res.status(400).json({error: "missing data"});
-
-  await withLock(user_uuid, async () => {
-    let player = await getPlayerData(user_uuid);
-    let price = GACHA_PRICES[item] !== undefined ? GACHA_PRICES[item] : 5;
-
-    if (player.JELLY < price) {
-      return res.json({ status: "insufficient", message: `Not enough Jelly. You need ${price} Jelly.` });
+    try {
+        let limitsData = {};
+        let row = await dbGet("VEIN_LIMITS");
+        if (row) { try { limitsData = JSON.parse(row); } catch(e){} }
+        
+        limitsData[target_uuid] = newLimit;
+        await dbSet("VEIN_LIMITS", JSON.stringify(limitsData));
+        
+        res.json({ status: "OK", message: `Limit for ${target_uuid} set to ${newLimit} veins.` });
+    } catch (e) {
+        res.status(500).json({ error: "Database error" });
     }
-
-    player.JELLY -= price;
-    await savePlayerData(user_uuid, player);
-
-    res.json({ status: "success", item, balance: player.JELLY });
-  });
 });
-
-app.post("/gacha/add-texture", requireToken, async (req, res) => {
-  const { part, uuid, name } = req.body;
-  if (!part || !uuid || !name) return res.status(400).json({ error: "missing part, uuid, or name" });
-  
-  const validParts = Object.keys(GACHA_LISTS);
-  if (!validParts.includes(part)) return res.status(400).json({ error: "invalid part name" });
-
-  await withLock("GACHA_LIST_LOCK", async () => {
-    const safeName = name.toLowerCase();
-    
-    GACHA_LISTS[part] = GACHA_LISTS[part].filter(item => typeof item === 'object' ? item.name !== safeName : item !== uuid);
-    GACHA_LISTS[part].push({ name: safeName, uuid });
-    await dbSet(`GACHA_${part.toUpperCase()}`, JSON.stringify(GACHA_LISTS[part]));
-    
-    res.json({ status: "success", message: `Texture '${safeName}' added to ${part}` });
-  });
-});
-
-app.post("/gacha/remove-texture", requireToken, async (req, res) => {
-  const { part, name } = req.body;
-  if (!part || !name) return res.status(400).json({ error: "missing part or name" });
-
-  const validParts = Object.keys(GACHA_LISTS);
-  if (!validParts.includes(part)) return res.status(400).json({ error: "invalid part name" });
-
-  await withLock("GACHA_LIST_LOCK", async () => {
-    const safeName = name.toLowerCase();
-    const initialLength = GACHA_LISTS[part].length;
-    
-    GACHA_LISTS[part] = GACHA_LISTS[part].filter(item => typeof item === 'object' && item.name !== safeName);
-
-    if (GACHA_LISTS[part].length < initialLength) {
-      await dbSet(`GACHA_${part.toUpperCase()}`, JSON.stringify(GACHA_LISTS[part]));
-      res.json({ status: "success", message: `Texture '${safeName}' removed from ${part}` });
-    } else {
-      res.json({ status: "error", message: `Texture '${safeName}' not found in ${part}` });
-    }
-  });
-});
-
-app.post("/gacha/reroll", requireToken, async (req, res) => {
-  const { object_uuid, user_uuid, part, col_up, col_down } = req.body;
-  if (!object_uuid || !user_uuid || part === undefined) return res.status(400).json({error: "missing data"});
-
-  const partNames = ["pattern", "base", "color_down", "color_up", "eyes", "mouths", "outline"];
-  const partIdx = parseInt(part);
-  const partName = partNames[partIdx];
-  if (!partName) return res.status(400).json({error: "invalid part"});
-
-  await withLock(user_uuid, async () => {
-    let player = await getPlayerData(user_uuid);
-    let price = GACHA_PRICES[partName] !== undefined ? GACHA_PRICES[partName] : 10;
-    
-    if (player.JELLY < price) {
-      return res.json({ status: "insufficient", message: "Not enough Jelly to reroll this part.", price, balance: player.JELLY });
-    }
-
-    player.JELLY -= price;
-    await savePlayerData(user_uuid, player);
-
-    let upLum = parseVecToLum(col_up || "<0.5, 0.5, 0.5>");
-    let downLum = parseVecToLum(col_down || "<0.5, 0.5, 0.5>");
-    let avgLum = (upLum + downLum) / 2.0;
-
-    const getTex = (p) => {
-      const list = GACHA_LISTS[p];
-      if (!list || list.length === 0) return DEFAULT_TEXTURE;
-      const item = list[Math.floor(Math.random() * list.length)];
-      return typeof item === "string" ? item : item.uuid;
-    };
-
-    let newCol, newTex;
-    if (partIdx === 0) { newCol = generateColor(avgLum); newTex = getTex("pattern"); }
-    else if (partIdx === 1) { newCol = generateColor(-1); newTex = "NULL"; }
-    else if (partIdx === 2) { newCol = generateColor(-1); newTex = getTex("color_down"); }
-    else if (partIdx === 3) { newCol = generateColor(-1); newTex = getTex("color_up"); }
-    else if (partIdx === 4) { newCol = generateColor(upLum); newTex = getTex("eyes"); }
-    else if (partIdx === 5) { newCol = generateColor(downLum); newTex = getTex("mouths"); }
-    else if (partIdx === 6) { newCol = generateColor(avgLum); newTex = getTex("outline"); }
-
-    res.json({
-      status: "success", object_uuid, part: partIdx, tex: newTex, col: newCol.vec, balance: player.JELLY
-    });
-  });
-});
-
-app.post("/gacha/build", requireToken, async (req, res) => {
-  const { object_uuid } = req.body;
-  if (!object_uuid) return res.status(400).json({ error: "missing object_uuid" });
-
-  const getTex = (part) => {
-    const list = GACHA_LISTS[part];
-    if (!list || list.length === 0) return DEFAULT_TEXTURE;
-    const item = list[Math.floor(Math.random() * list.length)];
-    return typeof item === "string" ? item : item.uuid; 
-  };
-
-  const baseColor = generateColor(-1);
-  const colUp = generateColor(-1);
-  const colDown = generateColor(-1);
-
-  const eyesColor = generateColor(colUp.lum);
-  const mouthColor = generateColor(colDown.lum);
-
-  const avgLum = (colUp.lum + colDown.lum) / 2.0;
-  const patternColor = generateColor(avgLum);
-  const outlineColor = generateColor(avgLum);
-
-  const config = {
-    tex_0: getTex("pattern"), col_0: patternColor.vec,
-    tex_1: "NULL", col_1: baseColor.vec,
-    tex_2: getTex("color_down"), col_2: colDown.vec,
-    tex_3: getTex("color_up"), col_3: colUp.vec,
-    tex_4: getTex("eyes"), col_4: eyesColor.vec,
-    tex_5: getTex("mouths"), col_5: mouthColor.vec,
-    tex_6: getTex("outline"), col_6: outlineColor.vec
-  };
-  
-  res.json({ status: "success", object_uuid, config });
-});
-
-
-// ========================================================
-// MINING VEIN ENDPOINTS (NEW)
-// ========================================================
 
 app.post("/mining/register", requireToken, async (req, res) => {
     const { user_uuid, vein_uuid, url, max_kg, current_kg, inventory } = req.body;
     if (!user_uuid || !vein_uuid || !url) return res.status(400).json({error: "missing data"});
 
     await withLock(`VEIN_${user_uuid}`, async () => {
+        // --- 1. Pega o Limite Personalizado (Padrão 3) ---
+        let playerLimit = 3; 
+        try {
+            let limitsRow = await dbGet("VEIN_LIMITS");
+            if (limitsRow) {
+                let limitsData = JSON.parse(limitsRow);
+                if (limitsData[user_uuid] !== undefined) playerLimit = parseInt(limitsData[user_uuid]);
+            }
+        } catch(e){}
+
         let pVeins = [];
         let row = await dbGet(`veins_${user_uuid}`);
         if (row) { try { pVeins = JSON.parse(row); } catch(e){} }
@@ -2040,8 +1899,9 @@ app.post("/mining/register", requireToken, async (req, res) => {
             }
         }
 
-        if (aliveVeins.length >= 3 && !exactMatch) {
-            return res.json({ status: "DENIED", message: "Max 3 veins allowed." });
+        // Aplica o limite personalizado aqui!
+        if (aliveVeins.length >= playerLimit && !exactMatch) {
+            return res.json({ status: "DENIED", message: `Max ${playerLimit} veins allowed for your account.` });
         }
 
         if (exactMatch) {
@@ -2103,7 +1963,7 @@ app.post("/mining/update", requireToken, async (req, res) => {
             if (v.uuid === vein_uuid) {
                 if (current_kg !== undefined) v.cur = parseFloat(current_kg);
                 if (max_kg !== undefined) v.max = parseFloat(max_kg);
-                if (inventory !== undefined) v.inventory = inventory; // Salva o array atualizado!
+                if (inventory !== undefined) v.inventory = inventory; 
                 found = true;
                 break;
             }
