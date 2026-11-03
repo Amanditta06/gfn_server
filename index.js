@@ -800,7 +800,8 @@ async function getPlayerData(uuid) {
     M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, 
     AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0, LAST_DIST: 0, 
     AFFINITY: {}, AFFINITY_TIME: {}, MIGUS: [], ACTIVE_MIGU: "", COOKIE_STOCK: 0,
-    P_IN: true, P_OUT: true, JELLY: 0, M_XP: 0 // <--- NOVO: TRACK DO XP DE MINERAÇÃO
+    P_IN: true, P_OUT: true, JELLY: 0, M_XP: 0, 
+    BOOST_PCT: 0.0, BOOST_END: 0 // <--- TRACK DO BOOSTER DE ENERGÉTICO
   };
   
   if (res) {
@@ -825,7 +826,9 @@ async function getPlayerData(uuid) {
       data.COOKIE_STOCK = parseInt(data.COOKIE_STOCK, 10) || 0;
       data.JELLY = parseInt(data.JELLY, 10) || 0;
       
-      data.M_XP = parseFloat(data.M_XP) || 0; // Garantindo extração correta
+      data.M_XP = parseFloat(data.M_XP) || 0.0;
+      data.BOOST_PCT = parseFloat(data.BOOST_PCT) || 0.0;
+      data.BOOST_END = parseInt(data.BOOST_END, 10) || 0;
       
       data.P_IN = parsedData.P_IN !== undefined ? parsedData.P_IN : true;
       data.P_OUT = parsedData.P_OUT !== undefined ? parsedData.P_OUT : true;
@@ -1727,18 +1730,18 @@ app.get("/get", async (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: "missing id" });
   try {
-    // === NOVA ROTA INTERNA PARA INICIAR A PICARETA ===
     if (id === "MINING_STATS") {
         let uuid = req.query.uuid;
         let pData = await getPlayerData(uuid);
         let xp = pData ? (pData.M_XP || 0) : 0;
+        let bp = pData ? (pData.BOOST_PCT || 0.0) : 0.0;
+        let be = pData ? (pData.BOOST_END || 0) : 0;
         
-        // Pega a força global (se existir), senão default 50
         let forceVal = "50.0";
         const qForce = await db.query("SELECT value FROM kvstore WHERE id='P_FORCE'");
         if (qForce.rowCount > 0 && qForce.rows[0].value) forceVal = qForce.rows[0].value;
         
-        return res.json({ id, value: `${forceVal}|${xp}` });
+        return res.json({ id, value: `${forceVal}|${xp}|${bp}|${be}` });
     }
 
     const q = await db.query("SELECT value FROM kvstore WHERE id=$1", [id]);
@@ -1869,16 +1872,58 @@ app.post("/mining/admin_set_limit", requireToken, async (req, res) => {
     }
 });
 
-// NOVA ROTA PARA SALVAR XP DE MINERAÇÃO
+// A Rota agora lida tanto com a injeção do Energético quanto com a sincronização de XP a cada 3 segundos
 app.post("/mining/sync_xp", requireToken, async (req, res) => {
     const { user_uuid, added_xp } = req.body;
-    if (!user_uuid || added_xp === undefined) return res.status(400).json({error: "missing data"});
+    if (!user_uuid) return res.status(400).json({error: "missing data"});
 
     await withLock(user_uuid, async () => {
         let pData = await getPlayerData(user_uuid);
-        pData.M_XP = (pData.M_XP || 0) + parseFloat(added_xp);
+        let added = parseFloat(added_xp) || 0;
+        
+        if (added > 0.0) {
+            pData.M_XP = (parseFloat(pData.M_XP) || 0) + added;
+            await savePlayerData(user_uuid, pData);
+        }
+        
+        res.json({ 
+            status: "OK", 
+            xp: pData.M_XP || 0, 
+            boost_pct: pData.BOOST_PCT || 0, 
+            boost_end: pData.BOOST_END || 0 
+        });
+    });
+});
+
+app.post("/mining/drink_booster", requireToken, async (req, res) => {
+    const { user_uuid, boost_pct, boost_duration } = req.body;
+    if (!user_uuid) return res.status(400).json({error: "missing data"});
+
+    await withLock(user_uuid, async () => {
+        let pData = await getPlayerData(user_uuid);
+        let now = getUnixTime();
+        let nPct = parseFloat(boost_pct) || 0.0;
+        let nDur = parseInt(boost_duration) || 0;
+
+        let current_end = parseInt(pData.BOOST_END, 10) || 0;
+        let current_pct = parseFloat(pData.BOOST_PCT) || 0.0;
+
+        if (current_end <= now) {
+            pData.BOOST_PCT = nPct;
+            pData.BOOST_END = now + nDur;
+        } else {
+            if (nPct === current_pct) {
+                pData.BOOST_END = current_end + nDur;
+            } else if (nPct < current_pct) {
+                pData.BOOST_END = current_end + Math.round(nDur * (nPct / current_pct));
+            } else {
+                pData.BOOST_END = current_end + nDur;
+                pData.BOOST_PCT = current_pct + ((nPct - current_pct) * 0.30);
+            }
+        }
+
         await savePlayerData(user_uuid, pData);
-        res.json({ status: "OK", xp: pData.M_XP });
+        res.json({ status: "OK" });
     });
 });
 
