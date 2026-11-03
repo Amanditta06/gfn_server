@@ -800,7 +800,7 @@ async function getPlayerData(uuid) {
     M: 0, P: 0, P_W: 0, TC_V: 0, TC_W: 0, EV_V: 0, EV_W: 0, RE: 0, 
     AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0, LAST_DIST: 0, 
     AFFINITY: {}, AFFINITY_TIME: {}, MIGUS: [], ACTIVE_MIGU: "", COOKIE_STOCK: 0,
-    P_IN: true, P_OUT: true, JELLY: 0
+    P_IN: true, P_OUT: true, JELLY: 0, M_XP: 0 // <--- NOVO: TRACK DO XP DE MINERAÇÃO
   };
   
   if (res) {
@@ -824,6 +824,8 @@ async function getPlayerData(uuid) {
       data.ACTIVE_MIGU = parsedData.ACTIVE_MIGU || "";
       data.COOKIE_STOCK = parseInt(data.COOKIE_STOCK, 10) || 0;
       data.JELLY = parseInt(data.JELLY, 10) || 0;
+      
+      data.M_XP = parseFloat(data.M_XP) || 0; // Garantindo extração correta
       
       data.P_IN = parsedData.P_IN !== undefined ? parsedData.P_IN : true;
       data.P_OUT = parsedData.P_OUT !== undefined ? parsedData.P_OUT : true;
@@ -1725,6 +1727,20 @@ app.get("/get", async (req, res) => {
   const id = req.query.id;
   if (!id) return res.status(400).json({ error: "missing id" });
   try {
+    // === NOVA ROTA INTERNA PARA INICIAR A PICARETA ===
+    if (id === "MINING_STATS") {
+        let uuid = req.query.uuid;
+        let pData = await getPlayerData(uuid);
+        let xp = pData ? (pData.M_XP || 0) : 0;
+        
+        // Pega a força global (se existir), senão default 50
+        let forceVal = "50.0";
+        const qForce = await db.query("SELECT value FROM kvstore WHERE id='P_FORCE'");
+        if (qForce.rowCount > 0 && qForce.rows[0].value) forceVal = qForce.rows[0].value;
+        
+        return res.json({ id, value: `${forceVal}|${xp}` });
+    }
+
     const q = await db.query("SELECT value FROM kvstore WHERE id=$1", [id]);
     let val = q.rowCount === 0 ? null : q.rows[0].value;
     
@@ -1853,12 +1869,24 @@ app.post("/mining/admin_set_limit", requireToken, async (req, res) => {
     }
 });
 
+// NOVA ROTA PARA SALVAR XP DE MINERAÇÃO
+app.post("/mining/sync_xp", requireToken, async (req, res) => {
+    const { user_uuid, added_xp } = req.body;
+    if (!user_uuid || added_xp === undefined) return res.status(400).json({error: "missing data"});
+
+    await withLock(user_uuid, async () => {
+        let pData = await getPlayerData(user_uuid);
+        pData.M_XP = (pData.M_XP || 0) + parseFloat(added_xp);
+        await savePlayerData(user_uuid, pData);
+        res.json({ status: "OK", xp: pData.M_XP });
+    });
+});
+
 app.post("/mining/register", requireToken, async (req, res) => {
     const { user_uuid, vein_uuid, url, max_kg, current_kg, inventory } = req.body;
     if (!user_uuid || !vein_uuid || !url) return res.status(400).json({error: "missing data"});
 
     await withLock(`VEIN_${user_uuid}`, async () => {
-        // --- 1. Pega o Limite Personalizado (Padrão 3) ---
         let playerLimit = 3; 
         try {
             let limitsRow = await dbGet("VEIN_LIMITS");
@@ -1899,7 +1927,6 @@ app.post("/mining/register", requireToken, async (req, res) => {
             }
         }
 
-        // Aplica o limite personalizado aqui!
         if (aliveVeins.length >= playerLimit && !exactMatch) {
             return res.json({ status: "DENIED", message: `Max ${playerLimit} veins allowed for your account.` });
         }
