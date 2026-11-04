@@ -2049,6 +2049,21 @@ app.post("/mining/admin_reset", requireToken, async (req, res) => {
     await doDailyVeinReset();
     res.json({ status: "OK", message: "Manual global reset of depleted veins triggered." });
 });
+// ========================================================
+// GACHA & JELLY ENDPOINTS
+// ========================================================
 
+app.post("/gacha/buy-jelly", requireToken, async (req, res) => {
+  const { user_uuid, amount } = req.body;
+  let added = parseInt(amount) || 0;
+  if (!user_uuid || added <= 0) return res.status(400).json({ error: "invalid" });
+  
+  await withLock(user_uuid, async () => {
+    let player = await getPlayerData(user_uuid);
+    player.JELLY += added;
+    await savePlayerData(user_uuid, player);
+    res.json({ status: "success", balance: player.JELLY, added });
+  });
+});
 app.get("/", (req, res) => res.json({ status: "ok" }));
 app.listen(PORT, () => console.log("API running on port", PORT));
