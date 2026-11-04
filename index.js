@@ -496,10 +496,10 @@ async function processParcelDemand(parcelUuid, userUuid) {
     let now = getUnixTime();
     let currentData = await getParcelDemandOnly(parcelUuid);
     let finalMult = currentData.mult;
-    
+
     currentData.mult = Math.max(0.1, currentData.mult - 0.25);
     currentData.last_delivery = now;
-    
+
     await dbSet(`PARCEL_${parcelUuid}`, JSON.stringify(currentData));
     return Math.round(finalMult * 1000) / 1000;
   });
@@ -671,7 +671,7 @@ async function processHallOfFame(rankString) {
     let hofRes = await dbGet("HALL_OF_FAME");
     let hofList = [];
     if (hofRes) { try { hofList = JSON.parse(hofRes); } catch(e){} }
-    
+
     let playerRecords = new Map();
     hofList.forEach(p => {
       if (p && p.name) {
@@ -681,7 +681,7 @@ async function processHallOfFame(rankString) {
         }
       }
     });
-    
+
     const lines = rankString.split(/\\n|\n/);
     lines.forEach(line => {
        let match = line.match(/(?:[\d]+[°\.]\s*:?\s*)?(.+?)\s*(?:\(([\d,\.]+)\)|-\s*([\d,\.]+))/);
@@ -690,7 +690,7 @@ async function processHallOfFame(rankString) {
          let cleanName = playerName.toLowerCase();
          let scoreStr = match[2] || match[3];
          let weeklyScore = parseInt(scoreStr.replace(/\D/g, ''));
-         
+
          if (!isNaN(weeklyScore)) {
            if (playerRecords.has(cleanName)) {
              let existing = playerRecords.get(cleanName);
@@ -704,11 +704,11 @@ async function processHallOfFame(rankString) {
          }
        }
     });
-    
+
     hofList = Array.from(playerRecords.values());
     hofList.sort((a, b) => b.score - a.score);
     hofList = hofList.slice(0, 3);
-    
+
     await dbSet("HALL_OF_FAME", JSON.stringify(hofList));
   } catch(e) {}
 }
@@ -722,8 +722,8 @@ async function ensureTable() {
     await db.query("DELETE FROM kvstore WHERE id LIKE 'PARCEL_%'");
     await cleanupStaleAffinities();
     await initOilSystemOnBoot();
-    await initGacha();
-    
+    await initGacha(); // LOAD GACHA ON BOOT
+
     const lastRankRes = await dbGet("lastWeekTopFive");
     if (lastRankRes) {
        await processHallOfFame(lastRankRes);
@@ -801,9 +801,9 @@ async function getPlayerData(uuid) {
     AT: "", B_M: 1.0, B_T: 0, ACTIVE_PARCEL: "", PARCEL_TIME: 0, LAST_DIST: 0, 
     AFFINITY: {}, AFFINITY_TIME: {}, MIGUS: [], ACTIVE_MIGU: "", COOKIE_STOCK: 0,
     P_IN: true, P_OUT: true, JELLY: 0, M_XP: 0, 
-    BOOST_PCT: 0.0, BOOST_END: 0 // <--- TRACK DO BOOSTER DE ENERGÉTICO
+    BOOST_PCT: 0.0, BOOST_END: 0 
   };
-  
+
   if (res) {
     try { 
       let parsedData = JSON.parse(res);
@@ -825,11 +825,11 @@ async function getPlayerData(uuid) {
       data.ACTIVE_MIGU = parsedData.ACTIVE_MIGU || "";
       data.COOKIE_STOCK = parseInt(data.COOKIE_STOCK, 10) || 0;
       data.JELLY = parseInt(data.JELLY, 10) || 0;
-      
+
       data.M_XP = parseFloat(data.M_XP) || 0.0;
       data.BOOST_PCT = parseFloat(data.BOOST_PCT) || 0.0;
       data.BOOST_END = parseInt(data.BOOST_END, 10) || 0;
-      
+
       data.P_IN = parsedData.P_IN !== undefined ? parsedData.P_IN : true;
       data.P_OUT = parsedData.P_OUT !== undefined ? parsedData.P_OUT : true;
 
@@ -1827,6 +1827,7 @@ app.post("/ai/kb/add", requireToken, async (req, res) => {
   if (!q || !a) return res.status(400).json({ error: "missing q or a" });
   
   const newId = Date.now().toString().slice(-6);
+  Gבן_KB = GFN_KB || [];
   GFN_KB.push({ id: newId, q, a });
   
   await dbSet("GFN_KNOWLEDGE_BASE", JSON.stringify(GFN_KB));
@@ -1872,7 +1873,6 @@ app.post("/mining/admin_set_limit", requireToken, async (req, res) => {
     }
 });
 
-// A Rota agora lida tanto com a injeção do Energético quanto com a sincronização de XP a cada 3 segundos
 app.post("/mining/sync_xp", requireToken, async (req, res) => {
     const { user_uuid, added_xp } = req.body;
     if (!user_uuid) return res.status(400).json({error: "missing data"});
@@ -2049,24 +2049,174 @@ app.post("/mining/admin_reset", requireToken, async (req, res) => {
     await doDailyVeinReset();
     res.json({ status: "OK", message: "Manual global reset of depleted veins triggered." });
 });
+
 // ========================================================
-// ROTA RESTAURADA: COMPRA / ADIÇÃO DE JELLYS (USADA PELO MIGU)
+// GACHA & JELLY ENDPOINTS (RESTAURADOS)
 // ========================================================
+
+app.post("/gacha/set-price", requireToken, async (req, res) => {
+  const { part, price } = req.body;
+  let val = parseInt(price);
+  if (!part || isNaN(val) || val < 0) return res.status(400).json({error: "invalid"});
+  GACHA_PRICES[part] = val;
+  await dbSet("GACHA_PRICES", JSON.stringify(GACHA_PRICES));
+  res.json({status: "success", message: `Price for ${part} set to ${val} Jelly.`});
+});
+
+app.get("/gacha/prices", async (req, res) => {
+  const { uuid } = req.query;
+  let player = await getPlayerData(uuid);
+  res.json({ status: "success", jelly: player.JELLY, prices: GACHA_PRICES });
+});
+
 app.post("/gacha/buy-jelly", requireToken, async (req, res) => {
   const { user_uuid, amount } = req.body;
   let added = parseInt(amount) || 0;
-  
-  if (!user_uuid || added <= 0) {
-    return res.status(400).json({ error: "invalid" });
-  }
+  if (!user_uuid || added <= 0) return res.status(400).json({error: "invalid"});
+  await withLock(user_uuid, async () => {
+    let player = await getPlayerData(user_uuid);
+    player.JELLY += added;
+    await savePlayerData(user_uuid, player);
+    res.json({status: "success", balance: player.JELLY, added});
+  });
+});
+
+app.post("/gacha/buy-potion", requireToken, async (req, res) => {
+  const { user_uuid, item } = req.body;
+  if (!user_uuid || !item) return res.status(400).json({error: "missing data"});
 
   await withLock(user_uuid, async () => {
     let player = await getPlayerData(user_uuid);
-    player.JELLY = (parseInt(player.JELLY, 10) || 0) + added;
+    let price = GACHA_PRICES[item] !== undefined ? GACHA_PRICES[item] : 5;
+
+    if (player.JELLY < price) {
+      return res.json({ status: "insufficient", message: `Not enough Jelly. You need ${price} Jelly.` });
+    }
+
+    player.JELLY -= price;
     await savePlayerData(user_uuid, player);
-    
-    res.json({ status: "success", balance: player.JELLY, added });
+
+    res.json({ status: "success", item, balance: player.JELLY });
   });
 });
+
+app.post("/gacha/add-texture", requireToken, async (req, res) => {
+  const { part, uuid, name } = req.body;
+  if (!part || !uuid || !name) return res.status(400).json({ error: "missing part, uuid, or name" });
+
+  const validParts = Object.keys(GACHA_LISTS);
+  if (!validParts.includes(part)) return res.status(400).json({ error: "invalid part name" });
+
+  await withLock("GACHA_LIST_LOCK", async () => {
+    const safeName = name.toLowerCase();
+    GACHA_LISTS[part] = GACHA_LISTS[part].filter(item => typeof item === 'object' ? item.name !== safeName : item !== uuid);
+    GACHA_LISTS[part].push({ name: safeName, uuid });
+    await dbSet(`GACHA_${part.toUpperCase()}`, JSON.stringify(GACHA_LISTS[part]));
+    res.json({ status: "success", message: `Texture '${safeName}' added to ${part}` });
+  });
+});
+
+app.post("/gacha/remove-texture", requireToken, async (req, res) => {
+  const { part, name } = req.body;
+  if (!part || !name) return res.status(400).json({ error: "missing part or name" });
+
+  const validParts = Object.keys(GACHA_LISTS);
+  if (!validParts.includes(part)) return res.status(400).json({ error: "invalid part name" });
+
+  await withLock("GACHA_LIST_LOCK", async () => {
+    const safeName = name.toLowerCase();
+    const initialLength = GACHA_LISTS[part].length;
+    GACHA_LISTS[part] = GACHA_LISTS[part].filter(item => typeof item === 'object' && item.name !== safeName);
+
+    if (GACHA_LISTS[part].length < initialLength) {
+      await dbSet(`GACHA_${part.toUpperCase()}`, JSON.stringify(GACHA_LISTS[part]));
+      res.json({ status: "success", message: `Texture '${safeName}' removed from ${part}` });
+    } else {
+      res.json({ status: "error", message: `Texture '${safeName}' not found in ${part}` });
+    }
+  });
+});
+
+app.post("/gacha/reroll", requireToken, async (req, res) => {
+  const { object_uuid, user_uuid, part, col_up, col_down } = req.body;
+  if (!object_uuid || !user_uuid || part === undefined) return res.status(400).json({error: "missing data"});
+
+  const partNames = ["pattern", "base", "color_down", "color_up", "eyes", "mouths", "outline"];
+  const partIdx = parseInt(part);
+  const partName = partNames[partIdx];
+  if (!partName) return res.status(400).json({error: "invalid part"});
+
+  await withLock(user_uuid, async () => {
+    let player = await getPlayerData(user_uuid);
+    let price = GACHA_PRICES[partName] !== undefined ? GACHA_PRICES[partName] : 10;
+
+    if (player.JELLY < price) {
+      return res.json({ status: "insufficient", message: "Not enough Jelly to reroll this part.", price, balance: player.JELLY });
+    }
+
+    player.JELLY -= price;
+    await savePlayerData(user_uuid, player);
+
+    let upLum = parseVecToLum(col_up || "<0.5, 0.5, 0.5>");
+    let downLum = parseVecToLum(col_down || "<0.5, 0.5, 0.5>");
+    let avgLum = (upLum + downLum) / 2.0;
+
+    const getTex = (p) => {
+      const list = GACHA_LISTS[p];
+      if (!list || list.length === 0) return DEFAULT_TEXTURE;
+      const item = list[Math.floor(Math.random() * list.length)];
+      return typeof item === "string" ? item : item.uuid;
+    };
+
+    let newCol, newTex;
+    if (partIdx === 0) { newCol = generateColor(avgLum); newTex = getTex("pattern"); }
+    else if (partIdx === 1) { newCol = generateColor(-1); newTex = "NULL"; }
+    else if (partIdx === 2) { newCol = generateColor(-1); newTex = getTex("color_down"); }
+    else if (partIdx === 3) { newCol = generateColor(-1); newTex = getTex("color_up"); }
+    else if (partIdx === 4) { newCol = generateColor(upLum); newTex = getTex("eyes"); }
+    else if (partIdx === 5) { newCol = generateColor(downLum); newTex = getTex("mouths"); }
+    else if (partIdx === 6) { newCol = generateColor(avgLum); newTex = getTex("outline"); }
+
+    res.json({
+      status: "success", object_uuid, part: partIdx, tex: newTex, col: newCol.vec, balance: player.JELLY
+    });
+  });
+});
+
+app.post("/gacha/build", requireToken, async (req, res) => {
+  const { object_uuid } = req.body;
+  if (!object_uuid) return res.status(400).json({ error: "missing object_uuid" });
+
+  const getTex = (part) => {
+    const list = GACHA_LISTS[part];
+    if (!list || list.length === 0) return DEFAULT_TEXTURE;
+    const item = list[Math.floor(Math.random() * list.length)];
+    return typeof item === "string" ? item : item.uuid; 
+  };
+
+  const baseColor = generateColor(-1);
+  const colUp = generateColor(-1);
+  const colDown = generateColor(-1);
+
+  const eyesColor = generateColor(colUp.lum);
+  const mouthColor = generateColor(colDown.lum);
+
+  const avgLum = (colUp.lum + colDown.lum) / 2.0;
+  const patternColor = generateColor(avgLum);
+  const outlineColor = generateColor(avgLum);
+
+  const config = {
+    tex_0: getTex("pattern"), col_0: patternColor.vec,
+    tex_1: "NULL", col_1: baseColor.vec,
+    tex_2: getTex("color_down"), col_2: colDown.vec,
+    tex_3: getTex("color_up"), col_3: colUp.vec,
+    tex_4: getTex("eyes"), col_4: eyesColor.vec,
+    tex_5: getTex("mouths"), col_5: mouthColor.vec,
+    tex_6: getTex("outline"), col_6: outlineColor.vec
+  };
+
+  res.json({ status: "success", object_uuid, config });
+});
+
 app.get("/", (req, res) => res.json({ status: "ok" }));
 app.listen(PORT, () => console.log("API running on port", PORT));
