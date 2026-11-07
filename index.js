@@ -938,7 +938,7 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
 });
 
 // ========================================================
-// FUNÇÃO E ROTA DE VARREDURA DE HUBS (SCAN)
+// FUNÇÃO E ROTA DE VARREDURA DE HUBS (SCAN GLOBAL)
 // ========================================================
 
 // Função auxiliar para buscar o nome da região direto da World API do SL
@@ -960,60 +960,84 @@ async function fetchRegionFromWorldAPI(parcelUuid) {
 }
 
 app.post("/admin/scan-hubs", requireToken, async (req, res) => {
-  const { serverId } = req.body; 
-  if (!serverId) return res.status(400).json({ error: "Missing serverId. Informe o servidor a ser varrido." });
+  // Retorna sucesso imediatamente para o SL para não dar timeout no LSL
+  res.json({ status: "scanning_started", message: "Iniciando varredura GLOBAL em todos os continentes em background..." });
 
-  res.json({ status: "scanning_started", message: `Iniciando varredura no servidor ${serverId}...` });
-
+  // Executa o trabalho pesado em background
   (async () => {
-    await withLock(`SERVER_${serverId}`, async () => {
-      try {
-        let mainStr = await dbGet(serverId) || "";
-        let mainList = mainStr ? mainStr.split("ç").filter(Boolean) : [];
+    try {
+      // 1. Pega a lista de todos os continentes cadastrados na chave SERVERS
+      let serversStr = await dbGet("SERVERS");
+      if (!serversStr) {
+        console.log("[SCAN GLOBAL] Nenhum servidor cadastrado no banco de dados (SERVERS vazia).");
+        return;
+      }
+      
+      // 2. Separa a string "WORLD-WIDEç-PH-" em uma array real do JavaScript
+      let continents = serversStr.split("ç").filter(Boolean);
+      console.log(`[SCAN GLOBAL] Encontrados ${continents.length} continentes para varrer: ${continents.join(", ")}`);
 
-        let namesList = [];
-        for (let i = 1; i <= 5; i++) {
-          let chunk = await dbGet(`${serverId}_NAMES_${i}`);
-          if (chunk) {
-            let parsedChunk = chunk.split("ç").filter(Boolean);
-            namesList.push(...parsedChunk);
-          }
-        }
+      // 3. Faz o laço de repetição passando por TODOS os continentes
+      for (let c = 0; c < continents.length; c++) {
+        let serverId = continents[c];
+        console.log(`[SCAN GLOBAL] Iniciando varredura no continente: ${serverId}...`);
 
-        while (namesList.length < mainList.length) namesList.push("Unknown Region");
+        // Usa o seu sistema de Lock (Mutex) de segurança para não corromper se alguém adicionar um lote na mesma hora
+        await withLock(`SERVER_${serverId}`, async () => {
+          let mainStr = await dbGet(serverId) || "";
+          let mainList = mainStr ? mainStr.split("ç").filter(Boolean) : [];
 
-        let updatedCount = 0;
-
-        for (let i = 0; i < mainList.length; i++) {
-          let parts = mainList[i].split("#");
-          let uuid = parts[0];
-          let pos = parts.length > 1 ? parts[1] : "";
-          let oldRegion = parts.length > 2 ? parts[2] : namesList[i];
-
-          if (uuid && uuid.length === 36) {
-            let newRegion = await fetchRegionFromWorldAPI(uuid);
-
-            if (newRegion && newRegion !== "Unknown" && newRegion !== oldRegion) {
-              console.log(`[SCAN] Hub ${uuid} atualizado: ${oldRegion} -> ${newRegion}`);
-              mainList[i] = `${uuid}#${pos}#${newRegion}`;
-              namesList[i] = newRegion;
-              updatedCount++;
+          let namesList = [];
+          for (let i = 1; i <= 5; i++) {
+            let chunk = await dbGet(`${serverId}_NAMES_${i}`);
+            if (chunk) {
+              let parsedChunk = chunk.split("ç").filter(Boolean);
+              namesList.push(...parsedChunk);
             }
           }
-          await new Promise(resolve => setTimeout(resolve, 500));
-        }
 
-        if (updatedCount > 0) {
-          await saveServerChunks(serverId, mainList, namesList);
-          console.log(`[SCAN] Varredura no ${serverId} concluída! ${updatedCount} regiões consertadas.`);
-        } else {
-          console.log(`[SCAN] Varredura no ${serverId} concluída! Tudo já estava atualizado.`);
-        }
+          while (namesList.length < mainList.length) namesList.push("Unknown Region");
 
-      } catch (e) {
-        console.error("Erro durante o scan-hubs:", e);
+          let updatedCount = 0;
+
+          // Varre cada parcela dentro deste continente
+          for (let i = 0; i < mainList.length; i++) {
+            let parts = mainList[i].split("#");
+            let uuid = parts[0];
+            let pos = parts.length > 1 ? parts[1] : "";
+            let oldRegion = parts.length > 2 ? parts[2] : namesList[i];
+
+            if (uuid && uuid.length === 36) {
+              let newRegion = await fetchRegionFromWorldAPI(uuid);
+
+              if (newRegion && newRegion !== "Unknown" && newRegion !== oldRegion) {
+                console.log(`[SCAN] Hub ${uuid} atualizado: ${oldRegion} -> ${newRegion}`);
+                mainList[i] = `${uuid}#${pos}#${newRegion}`;
+                namesList[i] = newRegion;
+                updatedCount++;
+              }
+            }
+            // Pausa de 500ms entre as leituras para evitar banimento de IP da Linden Lab
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+
+          if (updatedCount > 0) {
+            await saveServerChunks(serverId, mainList, namesList);
+            console.log(`[SCAN GLOBAL] ${serverId} concluído! ${updatedCount} regiões foram consertadas.`);
+          } else {
+            console.log(`[SCAN GLOBAL] ${serverId} concluído! Tudo já estava atualizado.`);
+          }
+        });
+
+        // Pausa de 2 segundos entre um continente e outro por segurança
+        await new Promise(resolve => setTimeout(resolve, 2000));
       }
-    });
+
+      console.log("[SCAN GLOBAL] Varredura global finalizada 100%!");
+
+    } catch (e) {
+      console.error("Erro durante o scan-hubs global:", e);
+    }
   })();
 });
 
