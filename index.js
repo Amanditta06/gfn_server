@@ -937,6 +937,90 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
   });
 });
 
+// ========================================================
+// FUNÇÃO E ROTA DE VARREDURA DE HUBS (SCAN)
+// ========================================================
+
+// Função auxiliar para buscar o nome da região direto da World API do SL
+async function fetchRegionFromWorldAPI(parcelUuid) {
+  try {
+    const url = `https://world.secondlife.com/place/${parcelUuid}`;
+    const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+    if (!response.ok) return null;
+    
+    const html = await response.text();
+    const match = html.match(/<meta\s+name="region"\s+content="([^"]+)"/i);
+    if (match && match[1]) {
+      return match[1]; 
+    }
+  } catch (e) {
+    console.error(`Erro ao fazer scraping da parcela ${parcelUuid}:`, e.message);
+  }
+  return null;
+}
+
+app.post("/admin/scan-hubs", requireToken, async (req, res) => {
+  const { serverId } = req.body; 
+  if (!serverId) return res.status(400).json({ error: "Missing serverId. Informe o servidor a ser varrido." });
+
+  res.json({ status: "scanning_started", message: `Iniciando varredura no servidor ${serverId}...` });
+
+  (async () => {
+    await withLock(`SERVER_${serverId}`, async () => {
+      try {
+        let mainStr = await dbGet(serverId) || "";
+        let mainList = mainStr ? mainStr.split("ç").filter(Boolean) : [];
+
+        let namesList = [];
+        for (let i = 1; i <= 5; i++) {
+          let chunk = await dbGet(`${serverId}_NAMES_${i}`);
+          if (chunk) {
+            let parsedChunk = chunk.split("ç").filter(Boolean);
+            namesList.push(...parsedChunk);
+          }
+        }
+
+        while (namesList.length < mainList.length) namesList.push("Unknown Region");
+
+        let updatedCount = 0;
+
+        for (let i = 0; i < mainList.length; i++) {
+          let parts = mainList[i].split("#");
+          let uuid = parts[0];
+          let pos = parts.length > 1 ? parts[1] : "";
+          let oldRegion = parts.length > 2 ? parts[2] : namesList[i];
+
+          if (uuid && uuid.length === 36) {
+            let newRegion = await fetchRegionFromWorldAPI(uuid);
+
+            if (newRegion && newRegion !== "Unknown" && newRegion !== oldRegion) {
+              console.log(`[SCAN] Hub ${uuid} atualizado: ${oldRegion} -> ${newRegion}`);
+              mainList[i] = `${uuid}#${pos}#${newRegion}`;
+              namesList[i] = newRegion;
+              updatedCount++;
+            }
+          }
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+
+        if (updatedCount > 0) {
+          await saveServerChunks(serverId, mainList, namesList);
+          console.log(`[SCAN] Varredura no ${serverId} concluída! ${updatedCount} regiões consertadas.`);
+        } else {
+          console.log(`[SCAN] Varredura no ${serverId} concluída! Tudo já estava atualizado.`);
+        }
+
+      } catch (e) {
+        console.error("Erro durante o scan-hubs:", e);
+      }
+    });
+  })();
+});
+
+// ========================================================
+// FIM DA VARREDURA
+// ========================================================
+
 app.get("/get-msg", async (req, res) => {
   const uuid = req.query.uuid;
   if (!uuid) return res.status(400).json({ error: "missing uuid" });
