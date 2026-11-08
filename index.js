@@ -860,38 +860,6 @@ async function savePlayerData(uuid, data) {
 // ========================================================
 
 // ========================================================
-// FUNÇÃO DE BUSCA DA WORLD API (SISTEMA ANTI-TRAVAMENTO)
-// ========================================================
-async function fetchRegionFromWorldAPI(parcelUuid) {
-  try {
-    const url = `https://world.secondlife.com/place/${parcelUuid}`;
-    
-    // Timeout de 3 segundos para o Render não travar se o SL demorar
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 3000);
-    
-    const response = await fetch(url, { 
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
-        signal: controller.signal
-    });
-    
-    clearTimeout(timeoutId);
-    
-    if (!response.ok) return null;
-    
-    const html = await response.text();
-    const match = html.match(/<meta\s+name=["']region["']\s+content=["']([^"']+)["']/i);
-    
-    if (match && match[1]) {
-      return match[1].trim(); 
-    }
-  } catch (e) {
-    console.error(`[AUTO-SET] Timeout ou Erro ao buscar região:`, e.message);
-  }
-  return null;
-}
-
-// ========================================================
 // ROTA PRINCIPAL PARA OS HUBS (AGORA BLINDADA)
 // ========================================================
 app.post("/admin/parcel", requireToken, async (req, res) => {
