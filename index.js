@@ -713,6 +713,123 @@ async function processHallOfFame(rankString) {
   } catch(e) {}
 }
 
+// ========================================================
+// HELPERS DE CARREGAMENTO, REPARO E SALVAMENTO DOS HUBS
+// ========================================================
+function sanitizeRegionName(raw) {
+  if (!raw) return "";
+  return String(raw)
+    .replace(/[\r\n\t\\]/g, "")
+    .replace(/ç/g, "")
+    .replace(/#/g, "")
+    .trim();
+}
+
+async function loadAndCleanServerHubs(serverId) {
+  let rawMainStr = await dbGet(serverId) || "";
+  let mainStr = rawMainStr.replace(/[\r\n\t\\]/g, "");
+  let rawMainList = mainStr ? mainStr.split("ç").filter(Boolean) : [];
+
+  let rawNamesList = [];
+  for (let i = 1; i <= 5; i++) {
+    let rawChunk = await dbGet(`${serverId}_NAMES_${i}`) || "";
+    let chunk = rawChunk.replace(/[\r\n\t\\]/g, "").trim();
+    if (chunk !== "") {
+      // Sem .filter(Boolean) para não deslocar índices caso haja slot vazio no meio
+      let parsedChunk = chunk.split("ç");
+      rawNamesList.push(...parsedChunk);
+    }
+  }
+
+  let mainList = [];
+  let namesList = [];
+  let neededRepair = false;
+
+  for (let i = 0; i < rawMainList.length; i++) {
+    let parts = rawMainList[i].split("#");
+    let itemUuid = (parts[0] || "").toLowerCase().replace(/[^0-9a-f\-]/g, "");
+    if (itemUuid.length !== 36) {
+      itemUuid = (parts[0] || "").trim();
+    }
+    let itemPos = parts.length > 1 ? parts[1].trim() : "";
+    let embeddedRegion = parts.length > 2 ? sanitizeRegionName(parts[2]) : "";
+
+    if (parts.length > 2 || rawMainList[i] !== `${itemUuid}#${itemPos}`) {
+      neededRepair = true;
+    }
+
+    mainList.push(`${itemUuid}#${itemPos}`);
+
+    let existingName = sanitizeRegionName(rawNamesList[i] || "");
+    if ((!existingName || existingName === "Unknown Region") && embeddedRegion && embeddedRegion !== "Unknown Region") {
+      existingName = embeddedRegion;
+      neededRepair = true;
+    }
+    if (!existingName) {
+      existingName = "Unknown Region";
+      neededRepair = true;
+    }
+    namesList.push(existingName);
+  }
+
+  if (rawNamesList.length !== namesList.length) {
+    neededRepair = true;
+  }
+
+  return { mainList, namesList, neededRepair };
+}
+
+async function saveServerChunks(srvName, mainList, namesList) {
+  // Garante alinhamento estrito 1:1 entre mainList e namesList
+  const alignedNames = [];
+  for (let i = 0; i < mainList.length; i++) {
+    let cleanName = sanitizeRegionName(namesList[i]);
+    alignedNames.push(cleanName || "Unknown Region");
+  }
+
+  const newMainStr = mainList.join("ç");
+  const chunks = ["", "", "", "", ""];
+  for (let i = 0; i < alignedNames.length; i++) {
+    let chunkIdx = Math.floor(i / 20);
+    if (chunkIdx < 5) {
+      if (chunks[chunkIdx] !== "") chunks[chunkIdx] += "ç";
+      chunks[chunkIdx] += alignedNames[i];
+    }
+  }
+  await dbSet(srvName, newMainStr);
+  await dbSet(`${srvName}_NAMES_1`, chunks[0]);
+  await dbSet(`${srvName}_NAMES_2`, chunks[1]);
+  await dbSet(`${srvName}_NAMES_3`, chunks[2]);
+  await dbSet(`${srvName}_NAMES_4`, chunks[3]);
+  await dbSet(`${srvName}_NAMES_5`, chunks[4]);
+}
+
+async function healAllContinentsOnBoot() {
+  if (!DATABASE_URL) return;
+  try {
+    // Remove lixo caso algum comando "AUTO" tenha criado chaves fantasma
+    await db.query("DELETE FROM kvstore WHERE id = 'AUTO' OR id LIKE 'AUTO_NAMES_%'");
+
+    let serversStr = await dbGet("SERVERS");
+    if (!serversStr) return;
+    let continents = serversStr.replace(/[\r\n\t\\]/g, "").split("ç").filter(Boolean);
+
+    for (const cont of continents) {
+      const srv = cont.trim();
+      if (!srv) continue;
+      await withLock(`SERVER_${srv}`, async () => {
+        const { mainList, namesList, neededRepair } = await loadAndCleanServerHubs(srv);
+        if (neededRepair) {
+          await saveServerChunks(srv, mainList, namesList);
+          console.log(`[BOOT-HEAL] Continente '${srv}' realinhado (${mainList.length} HUBs).`);
+        }
+      });
+    }
+  } catch (e) {
+    console.error("Erro no healAllContinentsOnBoot:", e);
+  }
+}
+
 async function ensureTable() {
   if (!DATABASE_URL) return;
   try {
@@ -722,7 +839,8 @@ async function ensureTable() {
     await db.query("DELETE FROM kvstore WHERE id LIKE 'PARCEL_%'");
     await cleanupStaleAffinities();
     await initOilSystemOnBoot();
-    await initGacha(); // LOAD GACHA ON BOOT
+    await initGacha();
+    await healAllContinentsOnBoot(); // Limpa #regiao intrusa e alinha chunks automaticamente
 
     const lastRankRes = await dbGet("lastWeekTopFive");
     if (lastRankRes) {
@@ -746,7 +864,7 @@ setInterval(async () => {
       activeServerWeek = currentNowWeek;
     } catch (e) {}
   }
-  
+
   try {
       const dailyVeinCheck = await dbGet("last_daily_vein_reset");
       const currentDay = Math.floor(getUnixTime() / 86400);
@@ -761,24 +879,6 @@ function requireToken(req, res, next) {
   const token = req.header("x-api-token");
   if (!token || token !== API_TOKEN) return res.status(401).json({ error: "invalid token" });
   next();
-}
-
-async function saveServerChunks(srvName, mainList, namesList) {
-  const newMainStr = mainList.join("ç");
-  const chunks = ["", "", "", "", ""];
-  for (let i = 0; i < namesList.length; i++) {
-    let chunkIdx = Math.floor(i / 20);
-    if (chunkIdx < 5) {
-      if (chunks[chunkIdx] !== "") chunks[chunkIdx] += "ç";
-      chunks[chunkIdx] += namesList[i];
-    }
-  }
-  await dbSet(srvName, newMainStr);
-  await dbSet(`${srvName}_NAMES_1`, chunks[0]);
-  await dbSet(`${srvName}_NAMES_2`, chunks[1]);
-  await dbSet(`${srvName}_NAMES_3`, chunks[2]);
-  await dbSet(`${srvName}_NAMES_4`, chunks[3]);
-  await dbSet(`${srvName}_NAMES_5`, chunks[4]);
 }
 
 async function addPlayerMessage(uuid, msg) {
@@ -856,123 +956,158 @@ async function savePlayerData(uuid, data) {
 }
 
 // ========================================================
-// API ROUTES
+// FUNÇÃO DE BUSCA NA WORLD API (COM TIMEOUT DE 3s)
 // ========================================================
+async function fetchRegionFromWorldAPI(parcelUuid) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 3000);
+  try {
+    const url = `https://world.secondlife.com/place/${parcelUuid}`;
+    const response = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" },
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+    if (!response.ok) return null;
+
+    const html = await response.text();
+    const match = html.match(/<meta\s+name=["']region["']\s+content=["']([^"']+)["']/i);
+    if (match && match[1]) {
+      return sanitizeRegionName(match[1]);
+    }
+  } catch (e) {
+    clearTimeout(timeoutId);
+  }
+  return null;
+}
 
 // ========================================================
-// ROTA PRINCIPAL PARA OS HUBS (AGORA BLINDADA)
+// ROTA PRINCIPAL PARA OS HUBS (ALINHAMENTO 1:1 BLINDADO)
 // ========================================================
 app.post("/admin/parcel", requireToken, async (req, res) => {
   const { action, serverId, uuid, pos, regionName, num, newPos } = req.body;
   if (!serverId) return res.status(400).json({ error: "Missing serverId" });
 
+  let cleanUuid = uuid ? String(uuid).toLowerCase().replace(/[^0-9a-f\-]/g, "") : "";
+  let cleanPos = pos ? String(pos).replace(/[\r\n\t\\ç#]/g, "").trim() : "";
+  let effRegion = sanitizeRegionName(regionName);
+
+  // Se o LSL não enviou um nome válido de região, tenta buscar na World API como fallback
+  if ((!effRegion || effRegion === "Unknown Region" || effRegion === "Unknown") && cleanUuid.length === 36) {
+    if (action === "SET_PARCEL" || action === "MOVE_HUB" || action === "UPDATE_REGION") {
+      let autoRegion = await fetchRegionFromWorldAPI(cleanUuid);
+      if (autoRegion && autoRegion !== "Unknown" && autoRegion !== "UnknownRegion") {
+        effRegion = autoRegion;
+      }
+    }
+  }
+  if (!effRegion) effRegion = "Unknown Region";
+
+  // Caso especial: UPDATE_REGION com serverId === "AUTO" ou lista de continentes separada por "ç"
+  if (action === "UPDATE_REGION" && (serverId === "AUTO" || serverId.includes("ç"))) {
+    if (cleanUuid.length !== 36) return res.json({ status: "ignored_invalid_uuid" });
+    try {
+      let serversStr = serverId === "AUTO" ? (await dbGet("SERVERS") || "") : serverId;
+      let continents = serversStr.replace(/[\r\n\t\\]/g, "").split("ç").filter(Boolean);
+      let updatedServers = [];
+
+      for (const cont of continents) {
+        const srv = cont.trim();
+        if (!srv || srv === "AUTO") continue;
+        await withLock(`SERVER_${srv}`, async () => {
+          let { mainList, namesList, neededRepair } = await loadAndCleanServerHubs(srv);
+          let idx = mainList.findIndex(item => item.split("#")[0].toLowerCase().replace(/[^0-9a-f\-]/g, "") === cleanUuid);
+          if (idx !== -1) {
+            let oldParts = mainList[idx].split("#");
+            let oldPos = oldParts.length > 1 ? oldParts[1].trim() : cleanPos;
+            mainList[idx] = `${cleanUuid}#${oldPos}`;
+            namesList[idx] = effRegion;
+            await saveServerChunks(srv, mainList, namesList);
+            updatedServers.push(srv);
+          } else if (neededRepair) {
+            await saveServerChunks(srv, mainList, namesList);
+          }
+        });
+      }
+      return res.json({ status: "success", action, updatedServers, finalRegion: effRegion });
+    } catch (e) {
+      console.error("Erro no UPDATE_REGION AUTO:", e);
+      return res.status(500).json({ error: "Internal error" });
+    }
+  }
+
   await withLock(`SERVER_${serverId}`, async () => {
     try {
-      // 1. LIMPEZA PROFUNDA DO BANCO DE DADOS (Destrói o \r fantasma)
-      let rawMainStr = await dbGet(serverId) || "";
-      let mainStr = rawMainStr.replace(/[\r\n\t\\]/g, ""); 
-      let mainList = mainStr ? mainStr.split("ç").filter(Boolean) : [];
+      let { mainList, namesList } = await loadAndCleanServerHubs(serverId);
 
-      let namesList = [];
-      for (let i = 1; i <= 5; i++) {
-        let rawChunk = await dbGet(`${serverId}_NAMES_${i}`) || "";
-        let chunk = rawChunk.replace(/[\r\n\t\\]/g, ""); // Mata o \r de Royier que já estava salvo no banco!
-        if (chunk) {
-            let parsedChunk = chunk.split("ç").filter(Boolean);
-            namesList.push(...parsedChunk);
-        }
-      }
-
-      while (namesList.length < mainList.length) namesList.push("Unknown Region");
-
-      // 2. BUSCA BLINDADA DO UUID
       let findIndexByUuid = (target) => {
-          let cleanTarget = target ? String(target).toLowerCase().replace(/[^0-9a-f\-]/g, "") : "";
-          if (cleanTarget.length !== 36) return -1;
-          
-          return mainList.findIndex(item => {
-              let itemUuid = item.split("#")[0].toLowerCase().replace(/[^0-9a-f\-]/g, "");
-              return itemUuid === cleanTarget;
-          });
+        let cleanTarget = target ? String(target).toLowerCase().replace(/[^0-9a-f\-]/g, "") : "";
+        if (cleanTarget.length !== 36) return -1;
+        return mainList.findIndex(item => {
+          let itemUuid = item.split("#")[0].toLowerCase().replace(/[^0-9a-f\-]/g, "");
+          return itemUuid === cleanTarget;
+        });
       };
 
-      // 3. LIMPEZA DA REGIÃO QUE VEM DO LSL (Garante que nunca mais entre um \r)
-      let rawRegion = regionName ? String(regionName) : "Unknown Region";
-      let effRegion = rawRegion
-          .replace(/[\r\n\t\\]/g, "")
-          .replace(/ç/g, "")
-          .replace(/#/g, "")
-          .trim();
-      
-      let cleanUuid = uuid ? String(uuid).toLowerCase().replace(/[^0-9a-f\-]/g, "") : "";
-
-      // ========================================================
-      // 4. AUTO-DETECÇÃO DA REGIÃO (World API)
-      // ========================================================
-      if ((action === "SET_PARCEL" || action === "MOVE_HUB" || action === "UPDATE_REGION") && cleanUuid.length === 36) {
-         let autoRegion = await fetchRegionFromWorldAPI(cleanUuid);
-         
-         if (autoRegion && autoRegion !== "Unknown" && autoRegion !== "UnknownRegion") {
-             effRegion = autoRegion; // O nome da Linden Lab substitui qualquer nome corrompido!
-             console.log(`[AUTO-SET] Região [${effRegion}] aplicada ao HUB [${cleanUuid}]`);
-         }
-      }
-
-      // Monta a string principal limpa
-      let newItemStr = `${cleanUuid || uuid}#${pos || ""}#${effRegion}`;
-
-      // ========================================================
-      // 5. EXECUÇÃO DOS COMANDOS
-      // ========================================================
       if (action === "SET_PARCEL" || action === "MOVE_HUB") {
-        let idx = findIndexByUuid(uuid);
+        let idx = findIndexByUuid(cleanUuid);
         if (idx !== -1) {
-          mainList[idx] = newItemStr;
-          namesList[idx] = effRegion; 
-        } else {
-          mainList.push(newItemStr);
-          namesList.push(effRegion); 
+          let oldParts = mainList[idx].split("#");
+          let finalPos = cleanPos || (oldParts.length > 1 ? oldParts[1].trim() : "");
+          let finalRegion = (effRegion && effRegion !== "Unknown Region") ? effRegion : (namesList[idx] || "Unknown Region");
+          // IMPORTANTE: mainList guarda APENAS uuid#pos (2 campos) para não quebrar o LSL!
+          mainList[idx] = `${cleanUuid}#${finalPos}`;
+          namesList[idx] = finalRegion;
+        } else if (cleanUuid.length === 36) {
+          mainList.push(`${cleanUuid}#${cleanPos}`);
+          namesList.push(effRegion);
         }
       }
       else if (action === "DEL_PARCEL") {
-        let idx = findIndexByUuid(uuid);
+        let idx = findIndexByUuid(cleanUuid);
         if (idx !== -1) {
           mainList.splice(idx, 1);
           namesList.splice(idx, 1);
         }
       }
       else if (action === "DEL_NUM") {
-        let idx = parseInt(num); 
-        if (!isNaN(idx) && idx >= 0 && idx < mainList.length) {
-          mainList.splice(idx, 1);
-          namesList.splice(idx, 1);
+        let idx = parseInt(num, 10);
+        // Se o menu do LSL enviou índice base 1 (ex: 1 a N) ou base 0, trata com segurança
+        if (!isNaN(idx)) {
+          if (idx >= 0 && idx < mainList.length) {
+            mainList.splice(idx, 1);
+            namesList.splice(idx, 1);
+          } else if (idx === mainList.length && idx > 0) {
+            mainList.splice(idx - 1, 1);
+            namesList.splice(idx - 1, 1);
+          }
         }
       }
       else if (action === "REORDER") {
-         let oldIdx = findIndexByUuid(uuid);
-         let nPos = parseInt(newPos);
-         if (oldIdx !== -1 && !isNaN(nPos) && nPos >= 0 && nPos <= mainList.length) {
-            let mItem = mainList.splice(oldIdx, 1)[0];
-            let nItem = namesList.splice(oldIdx, 1)[0];
-            mainList.splice(nPos, 0, mItem);
-            namesList.splice(nPos, 0, nItem);
-         }
+        let oldIdx = findIndexByUuid(cleanUuid);
+        let nPos = parseInt(newPos, 10);
+        if (oldIdx !== -1 && !isNaN(nPos)) {
+          nPos = Math.max(0, Math.min(mainList.length - 1, nPos));
+          let mItem = mainList.splice(oldIdx, 1)[0];
+          let nItem = namesList.splice(oldIdx, 1)[0];
+          mainList.splice(nPos, 0, mItem);
+          namesList.splice(nPos, 0, nItem);
+        }
       }
       else if (action === "UPDATE_REGION") {
-        let idx = findIndexByUuid(uuid);
+        let idx = findIndexByUuid(cleanUuid);
         if (idx !== -1) {
-            let oldParts = mainList[idx].split("#");
-            let oldPos = oldParts.length > 1 ? oldParts[1] : "";
-            mainList[idx] = `${cleanUuid || uuid}#${oldPos}#${effRegion}`;
+          let oldParts = mainList[idx].split("#");
+          let oldPos = oldParts.length > 1 ? oldParts[1].trim() : cleanPos;
+          mainList[idx] = `${cleanUuid}#${oldPos}`;
+          if (effRegion && effRegion !== "Unknown Region") {
             namesList[idx] = effRegion;
+          }
         }
       }
 
-      // Salva no banco de dados e conserta as listas paralelas para sempre!
       await saveServerChunks(serverId, mainList, namesList);
-      
-      res.json({ status: "success", action, finalRegion: effRegion });
-
+      res.json({ status: "success", action, finalRegion: effRegion, totalHubs: mainList.length });
     } catch (e) {
       console.error("Erro no /admin/parcel:", e);
       res.status(500).json({ error: "Internal error" });
@@ -981,106 +1116,52 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
 });
 
 // ========================================================
-// FUNÇÃO E ROTA DE VARREDURA DE HUBS (SCAN GLOBAL FORÇADO)
+// ROTA DE VARREDURA DE HUBS (SEM CORROMPER MAINLIST)
 // ========================================================
-
-async function fetchRegionFromWorldAPI(parcelUuid) {
-  try {
-    const url = `https://world.secondlife.com/place/${parcelUuid}`;
-    const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } });
-    if (!response.ok) {
-        console.log(`[SCAN] Erro HTTP ${response.status} ao buscar ${parcelUuid}`);
-        return null;
-    }
-    
-    const html = await response.text();
-    const match = html.match(/<meta\s+name=["']region["']\s+content=["']([^"']+)["']/i);
-    
-    if (match && match[1]) {
-      return match[1].trim(); 
-    } else {
-      console.log(`[SCAN] ⚠️ A parcela ${parcelUuid} não expõe a região na World API (Lote oculto ou sem dados).`);
-    }
-  } catch (e) {
-    console.error(`[SCAN] Erro ao fazer scraping da parcela ${parcelUuid}:`, e.message);
-  }
-  return null;
-}
-
 app.post("/admin/scan-hubs", requireToken, async (req, res) => {
-  res.json({ status: "scanning_started", message: "Iniciando varredura GLOBAL forçada em background..." });
+  res.json({ status: "scanning_started", message: "Iniciando varredura GLOBAL em background..." });
 
   (async () => {
     try {
       let serversStr = await dbGet("SERVERS");
-      if (!serversStr) {
-        console.log("[SCAN GLOBAL] Nenhum servidor cadastrado no banco de dados (SERVERS vazia).");
-        return;
-      }
-      
-      let continents = serversStr.split("ç").filter(Boolean);
-      console.log(`[SCAN GLOBAL] Encontrados ${continents.length} continentes para varrer: ${continents.join(", ")}`);
+      if (!serversStr) return;
+
+      let continents = serversStr.replace(/[\r\n\t\\]/g, "").split("ç").filter(Boolean);
 
       for (let c = 0; c < continents.length; c++) {
         let serverId = continents[c].trim();
-        console.log(`\n[SCAN GLOBAL] Iniciando varredura FORÇADA no continente: ${serverId}...`);
+        if (!serverId) continue;
 
         await withLock(`SERVER_${serverId}`, async () => {
-          let mainStr = await dbGet(serverId) || "";
-          let mainList = mainStr ? mainStr.split("ç").filter(Boolean) : [];
-
-          let namesList = [];
-          for (let i = 1; i <= 5; i++) {
-            let chunk = await dbGet(`${serverId}_NAMES_${i}`);
-            if (chunk) {
-              let parsedChunk = chunk.split("ç").filter(Boolean);
-              namesList.push(...parsedChunk);
-            }
-          }
-
-          while (namesList.length < mainList.length) namesList.push("Unknown Region");
-
-          let updatedCount = 0;
+          let { mainList, namesList, neededRepair } = await loadAndCleanServerHubs(serverId);
+          let updatedCount = neededRepair ? 1 : 0;
 
           for (let i = 0; i < mainList.length; i++) {
             let parts = mainList[i].split("#");
-            
-            // Limpeza absoluta do UUID - se tiver espaços ocultos, eles morrem aqui
-            let rawUuid = parts[0] || "";
-            let cleanUuid = rawUuid.toLowerCase().replace(/[^0-9a-f\-]/g, "");
+            let cleanUuid = (parts[0] || "").toLowerCase().replace(/[^0-9a-f\-]/g, "");
             let pos = parts.length > 1 ? parts[1].trim() : "";
-            let oldRegion = parts.length > 2 ? parts[2].trim() : (namesList[i] ? namesList[i].trim() : "Unknown Region");
 
             if (cleanUuid.length === 36) {
-              console.log(`[SCAN] Lendo Hub ${i+1}/${mainList.length}: ${cleanUuid} (Banco: ${oldRegion})`);
-              
               let newRegion = await fetchRegionFromWorldAPI(cleanUuid);
+              mainList[i] = `${cleanUuid}#${pos}`; // Mantém estritamente 2 partes!
 
-              // SE RETORNOU UMA REGIÃO VÁLIDA, FORÇA A GRAVAÇÃO IGNORANDO SE JÁ ESTAVA "CORRETO"
               if (newRegion && newRegion !== "Unknown" && newRegion !== "UnknownRegion") {
-                console.log(`🔄 [FORÇANDO] Gravando região: ${newRegion}`);
-                
-                // Usamos o cleanUuid aqui para garantir que o banco seja reescrito sem lixo invisível
-                mainList[i] = `${cleanUuid}#${pos}#${newRegion}`;
                 namesList[i] = newRegion;
-                updatedCount++; // Sempre soma para garantir que vai salvar no banco
+                updatedCount++;
               }
             }
-            await new Promise(resolve => setTimeout(resolve, 500));
+            await new Promise(resolve => setTimeout(resolve, 400));
           }
 
-          // Como forçamos a contagem (updatedCount), ele sempre vai salvar e reestruturar os chunks
           if (updatedCount > 0) {
             await saveServerChunks(serverId, mainList, namesList);
-            console.log(`[SCAN GLOBAL] ${serverId} SALVO! ${updatedCount} regiões foram reescritas com sucesso.`);
-          } else {
-            console.log(`[SCAN GLOBAL] ${serverId} processado. Nenhuma parcela válida encontrada para atualizar.`);
+            console.log(`[SCAN GLOBAL] ${serverId} salvo e alinhado com sucesso!`);
           }
         });
 
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        await new Promise(resolve => setTimeout(resolve, 1500));
       }
-      console.log("\n[SCAN GLOBAL] Varredura global forçada finalizada 100%!");
+      console.log("[SCAN GLOBAL] Varredura global finalizada!");
     } catch (e) {
       console.error("Erro durante o scan-hubs global:", e);
     }
@@ -1088,7 +1169,7 @@ app.post("/admin/scan-hubs", requireToken, async (req, res) => {
 });
 
 // ========================================================
-// FIM DA VARREDURA
+// DEMAIS ROTAS DO SISTEMA
 // ========================================================
 
 app.get("/get-msg", async (req, res) => {
@@ -1322,7 +1403,7 @@ app.get("/oil/pump-access", async (req, res) => {
 app.post("/oil/pump-access", requireToken, async (req, res) => {
     const { uuid, action } = req.body;
     if (!uuid) return res.status(400).json({ error: "missing uuid" });
-    
+
     await withLock(uuid, async () => {
         let pData = await getPlayerData(uuid);
         if (action === "ALLOW_IN") pData.P_IN = true;
@@ -1340,7 +1421,7 @@ app.post("/oil/fluid-transaction", requireToken, async (req, res) => {
   const sOwner = String(tankOwner || "").trim();
   const tOwner = String(targetOwner || "").trim();
   const fType = String(fluid || "OIL").toUpperCase().trim();
-  
+
   let reqLiters = Math.round((parseFloat(amount) || 0.0) * 10) / 10;
   let reqPenalty = Math.round((parseFloat(penaltyAmount) || 0.0) * 10) / 10;
   if (reqPenalty > reqLiters) reqPenalty = reqLiters; 
@@ -1386,7 +1467,7 @@ app.post("/oil/fluid-transaction", requireToken, async (req, res) => {
 
         let unitPrice = basePrice * 1.0; 
         let penaltyUnitPrice = basePrice * 0.85; 
-        
+
         let fullCost = Math.ceil((normalLiters * unitPrice) + (reqPenalty * penaltyUnitPrice));
 
         let boost_m = 1.0;
@@ -1574,14 +1655,14 @@ app.post("/action", requireToken, async (req, res) => {
                 }
             }
         }
-        
+
         await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         player.LAST_DIST = 0; 
         await savePlayerData(user, player);
         responsePayload.recebido = recebido;
         responsePayload.msg = `⚓ Sold Dredge for ${recebido} F₵. Balance: ${player.M} F₵`;
       } 
-      
+
       else if (safeTopic === "cargo sell") {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
@@ -1719,7 +1800,7 @@ app.post("/action", requireToken, async (req, res) => {
                 }
             }
         }
-        
+
         await addPlayerMessage(user, `You have now ${player.M} F₵.`);
         player.LAST_DIST = 0; 
         await savePlayerData(user, player);
@@ -1735,7 +1816,7 @@ app.post("/action", requireToken, async (req, res) => {
         if (add_time > 31536000) add_time = 604800; 
         let current_time = player.B_T;
         if (current_time < now) current_time = now;
-        
+
         current_time += add_time; 
         player.B_M = add_mult; player.B_T = current_time;
         await savePlayerData(user, player);
@@ -1744,7 +1825,7 @@ app.post("/action", requireToken, async (req, res) => {
         let player = await getPlayerData(user);
         let currentWeek = getCurrentWeek();
         let weeklyPoints = (player.P_W === currentWeek) ? (player.P || 0) : 0;
-        
+
         await addPlayerMessage(user, `You have ${player.M} F₵.`);
         await addPlayerMessage(user, `You have ${weeklyPoints} points this week.`);
         await addPlayerMessage(user, `You have ${player.COOKIE_STOCK} Taming Cookies in stock.`);
@@ -1795,7 +1876,7 @@ app.post("/action", requireToken, async (req, res) => {
             let tPlayer = await getPlayerData(target);
             sender.M -= amountVal; tPlayer.M += amountVal;
             await savePlayerData(user, sender); await savePlayerData(target, tPlayer);
-            
+
             await addPlayerMessage(user, `You successfully paid ${amountVal} F₵ to secondlife:///app/agent/${target}/about. Your new balance: ${sender.M} F₵`);
             await addPlayerMessage(target, `You received ${amountVal} F₵ from secondlife:///app/agent/${user}/about. Your new balance: ${tPlayer.M} F₵`);
         }
@@ -1890,17 +1971,17 @@ app.get("/get", async (req, res) => {
         let xp = pData ? (pData.M_XP || 0) : 0;
         let bp = pData ? (pData.BOOST_PCT || 0.0) : 0.0;
         let be = pData ? (pData.BOOST_END || 0) : 0;
-        
+
         let forceVal = "50.0";
         const qForce = await db.query("SELECT value FROM kvstore WHERE id='P_FORCE'");
         if (qForce.rowCount > 0 && qForce.rows[0].value) forceVal = qForce.rows[0].value;
-        
+
         return res.json({ id, value: `${forceVal}|${xp}|${bp}|${be}` });
     }
 
     const q = await db.query("SELECT value FROM kvstore WHERE id=$1", [id]);
     let val = q.rowCount === 0 ? null : q.rows[0].value;
-    
+
     if (val && id.startsWith("PARCEL_")) {
         try {
             let parcel = JSON.parse(val);
@@ -1922,24 +2003,24 @@ app.get("/get", async (req, res) => {
 app.post("/set", requireToken, async (req, res) => {
   let { id, value } = req.body; 
   if (!id) return res.status(400).json({ error: "missing id" });
-  
+
   try {
     if (id === "gfn_admin_logs" && value) {
         let logs = value.split("|#|").filter(Boolean);
         let lastLog = logs[logs.length - 1] || "";
-        
+
         let agentMatch = lastLog.match(/\/app\/agent\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
         let parcelMatch = lastLog.match(/\/app\/parcel\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
-        
+
         if (agentMatch && parcelMatch) {
             let playerUuid = agentMatch[1].toLowerCase();
             let parcelUuid = parcelMatch[1].toLowerCase(); 
-            
+
             if (lastLog.includes("Action: Cargo Delivered")) {
                 let pData = await getPlayerData(playerUuid);
                 pData.ACTIVE_PARCEL = parcelUuid;
                 pData.PARCEL_TIME = getUnixTime();
-                
+
                 let distMatch = lastLog.match(/(?:dist(?:ancia|ance)?[:\s]*)([\d,\.]+)\s*m?/i) || lastLog.match(/([\d,\.]+)\s*m\b/i);
                 let distance = 0;
                 if (distMatch) distance = parseFloat(distMatch[1].replace(',', '.')) || 0;
@@ -1979,11 +2060,11 @@ app.get("/ai/kb", async (req, res) => {
 app.post("/ai/kb/add", requireToken, async (req, res) => {
   const { q, a } = req.body;
   if (!q || !a) return res.status(400).json({ error: "missing q or a" });
-  
+
   const newId = Date.now().toString().slice(-6);
-  Gבן_KB = GFN_KB || [];
+  GFN_KB = GFN_KB || [];
   GFN_KB.push({ id: newId, q, a });
-  
+
   await dbSet("GFN_KNOWLEDGE_BASE", JSON.stringify(GFN_KB));
   res.json({ status: "success", id: newId });
 });
@@ -1991,10 +2072,10 @@ app.post("/ai/kb/add", requireToken, async (req, res) => {
 app.post("/ai/kb/delete", requireToken, async (req, res) => {
   const { id } = req.body;
   if (!id) return res.status(400).json({ error: "missing id" });
-  
+
   const originalLength = GFN_KB.length;
   GFN_KB = GFN_KB.filter(item => item.id !== String(id));
-  
+
   if (GFN_KB.length < originalLength) {
     await dbSet("GFN_KNOWLEDGE_BASE", JSON.stringify(GFN_KB));
     res.json({ status: "success" });
@@ -2002,7 +2083,6 @@ app.post("/ai/kb/delete", requireToken, async (req, res) => {
     res.json({ status: "not_found" });
   }
 });
-
 
 // ========================================================
 // MINING VEIN ENDPOINTS
@@ -2017,10 +2097,10 @@ app.post("/mining/admin_set_limit", requireToken, async (req, res) => {
         let limitsData = {};
         let row = await dbGet("VEIN_LIMITS");
         if (row) { try { limitsData = JSON.parse(row); } catch(e){} }
-        
+
         limitsData[target_uuid] = newLimit;
         await dbSet("VEIN_LIMITS", JSON.stringify(limitsData));
-        
+
         res.json({ status: "OK", message: `Limit for ${target_uuid} set to ${newLimit} veins.` });
     } catch (e) {
         res.status(500).json({ error: "Database error" });
@@ -2034,12 +2114,12 @@ app.post("/mining/sync_xp", requireToken, async (req, res) => {
     await withLock(user_uuid, async () => {
         let pData = await getPlayerData(user_uuid);
         let added = parseFloat(added_xp) || 0;
-        
+
         if (added > 0.0) {
             pData.M_XP = (parseFloat(pData.M_XP) || 0) + added;
             await savePlayerData(user_uuid, pData);
         }
-        
+
         res.json({ 
             status: "OK", 
             xp: pData.M_XP || 0, 
@@ -2113,7 +2193,7 @@ app.post("/mining/register", requireToken, async (req, res) => {
                 const timeoutId = setTimeout(() => controller.abort(), 2000);
                 const pingRes = await fetch(v.url + "/ping", { method: "GET", signal: controller.signal });
                 clearTimeout(timeoutId);
-                
+
                 if (pingRes.status === 200) {
                     aliveVeins.push(v);
                 } else {
@@ -2142,7 +2222,7 @@ app.post("/mining/register", requireToken, async (req, res) => {
             aliveVeins.push(newVeinObj);
             let finalVeins = aliveVeins.concat(deadVeins);
             await dbSet(`veins_${user_uuid}`, JSON.stringify(finalVeins));
-            
+
             return res.json({ status: "RESTORE", inventory: restoredVein.inventory, max_kg: restoredVein.max, current_kg: restoredVein.cur });
         }
         else if (deadVeins.length > 0) {
@@ -2157,7 +2237,7 @@ app.post("/mining/register", requireToken, async (req, res) => {
             aliveVeins.push(newVeinObj);
             let finalVeins = aliveVeins.concat(deadVeins);
             await dbSet(`veins_${user_uuid}`, JSON.stringify(finalVeins));
-            
+
             return res.json({ status: "RESTORE", inventory: restoredVein.inventory, max_kg: restoredVein.max, current_kg: restoredVein.cur });
         } else {
             let newVeinObj = {
@@ -2169,7 +2249,7 @@ app.post("/mining/register", requireToken, async (req, res) => {
             };
             aliveVeins.push(newVeinObj);
             await dbSet(`veins_${user_uuid}`, JSON.stringify(aliveVeins));
-            
+
             return res.json({ status: "NEW" });
         }
     });
@@ -2205,7 +2285,7 @@ app.post("/mining/admin_reset", requireToken, async (req, res) => {
 });
 
 // ========================================================
-// GACHA & JELLY ENDPOINTS (RESTAURADOS)
+// GACHA & JELLY ENDPOINTS
 // ========================================================
 
 app.post("/gacha/set-price", requireToken, async (req, res) => {
