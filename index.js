@@ -716,26 +716,38 @@ async function processHallOfFame(rankString) {
 // ========================================================
 // HELPERS DE CARREGAMENTO, REPARO E SALVAMENTO DOS HUBS
 // ========================================================
+// Usa exclusivamente o range hexadecimal de controle ASCII (\x00-\x1F e \x7F)
+// para NUNCA tocar em letras como 'r', 'n', 't', 'b', 'f', 'v'.
+function stripControlChars(str) {
+  if (!str) return "";
+  return String(str).replace(/[\x00-\x1F\x7F]/g, "");
+}
+
 function sanitizeRegionName(raw) {
   if (!raw) return "";
-  return String(raw)
-    .replace(/[\r\n\t\\]/g, "")
+  let clean = stripControlChars(raw)
     .replace(/ç/g, "")
     .replace(/#/g, "")
+    .replace(/"/g, "")
     .trim();
+
+  // Corrige automaticamente se "Royier" tiver perdido o "r" em algum script LSL antigo
+  if (clean.toLowerCase() === "royie") {
+    clean = "Royier";
+  }
+  return clean;
 }
 
 async function loadAndCleanServerHubs(serverId) {
   let rawMainStr = await dbGet(serverId) || "";
-  let mainStr = rawMainStr.replace(/[\r\n\t\\]/g, "");
+  let mainStr = stripControlChars(rawMainStr);
   let rawMainList = mainStr ? mainStr.split("ç").filter(Boolean) : [];
 
   let rawNamesList = [];
   for (let i = 1; i <= 5; i++) {
     let rawChunk = await dbGet(`${serverId}_NAMES_${i}`) || "";
-    let chunk = rawChunk.replace(/[\r\n\t\\]/g, "").trim();
+    let chunk = stripControlChars(rawChunk).trim();
     if (chunk !== "") {
-      // Sem .filter(Boolean) para não deslocar índices caso haja slot vazio no meio
       let parsedChunk = chunk.split("ç");
       rawNamesList.push(...parsedChunk);
     }
@@ -760,7 +772,12 @@ async function loadAndCleanServerHubs(serverId) {
 
     mainList.push(`${itemUuid}#${itemPos}`);
 
-    let existingName = sanitizeRegionName(rawNamesList[i] || "");
+    let rawExisting = rawNamesList[i] || "";
+    let existingName = sanitizeRegionName(rawExisting);
+    if (existingName !== rawExisting.trim()) {
+      neededRepair = true;
+    }
+
     if ((!existingName || existingName === "Unknown Region") && embeddedRegion && embeddedRegion !== "Unknown Region") {
       existingName = embeddedRegion;
       neededRepair = true;
@@ -780,7 +797,6 @@ async function loadAndCleanServerHubs(serverId) {
 }
 
 async function saveServerChunks(srvName, mainList, namesList) {
-  // Garante alinhamento estrito 1:1 entre mainList e namesList
   const alignedNames = [];
   for (let i = 0; i < mainList.length; i++) {
     let cleanName = sanitizeRegionName(namesList[i]);
@@ -807,12 +823,11 @@ async function saveServerChunks(srvName, mainList, namesList) {
 async function healAllContinentsOnBoot() {
   if (!DATABASE_URL) return;
   try {
-    // Remove lixo caso algum comando "AUTO" tenha criado chaves fantasma
     await db.query("DELETE FROM kvstore WHERE id = 'AUTO' OR id LIKE 'AUTO_NAMES_%'");
 
     let serversStr = await dbGet("SERVERS");
     if (!serversStr) return;
-    let continents = serversStr.replace(/[\r\n\t\\]/g, "").split("ç").filter(Boolean);
+    let continents = stripControlChars(serversStr).split("ç").filter(Boolean);
 
     for (const cont of continents) {
       const srv = cont.trim();
@@ -840,7 +855,7 @@ async function ensureTable() {
     await cleanupStaleAffinities();
     await initOilSystemOnBoot();
     await initGacha();
-    await healAllContinentsOnBoot(); // Limpa #regiao intrusa e alinha chunks automaticamente
+    await healAllContinentsOnBoot();
 
     const lastRankRes = await dbGet("lastWeekTopFive");
     if (lastRankRes) {
@@ -989,7 +1004,7 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
   if (!serverId) return res.status(400).json({ error: "Missing serverId" });
 
   let cleanUuid = uuid ? String(uuid).toLowerCase().replace(/[^0-9a-f\-]/g, "") : "";
-  let cleanPos = pos ? String(pos).replace(/[\r\n\t\\ç#]/g, "").trim() : "";
+  let cleanPos = pos ? stripControlChars(pos).replace(/[ç#]/g, "").trim() : "";
   let effRegion = sanitizeRegionName(regionName);
 
   // Se o LSL não enviou um nome válido de região, tenta buscar na World API como fallback
@@ -1008,7 +1023,7 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
     if (cleanUuid.length !== 36) return res.json({ status: "ignored_invalid_uuid" });
     try {
       let serversStr = serverId === "AUTO" ? (await dbGet("SERVERS") || "") : serverId;
-      let continents = serversStr.replace(/[\r\n\t\\]/g, "").split("ç").filter(Boolean);
+      let continents = stripControlChars(serversStr).split("ç").filter(Boolean);
       let updatedServers = [];
 
       for (const cont of continents) {
@@ -1055,7 +1070,6 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
           let oldParts = mainList[idx].split("#");
           let finalPos = cleanPos || (oldParts.length > 1 ? oldParts[1].trim() : "");
           let finalRegion = (effRegion && effRegion !== "Unknown Region") ? effRegion : (namesList[idx] || "Unknown Region");
-          // IMPORTANTE: mainList guarda APENAS uuid#pos (2 campos) para não quebrar o LSL!
           mainList[idx] = `${cleanUuid}#${finalPos}`;
           namesList[idx] = finalRegion;
         } else if (cleanUuid.length === 36) {
@@ -1072,7 +1086,6 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
       }
       else if (action === "DEL_NUM") {
         let idx = parseInt(num, 10);
-        // Se o menu do LSL enviou índice base 1 (ex: 1 a N) ou base 0, trata com segurança
         if (!isNaN(idx)) {
           if (idx >= 0 && idx < mainList.length) {
             mainList.splice(idx, 1);
@@ -1126,7 +1139,7 @@ app.post("/admin/scan-hubs", requireToken, async (req, res) => {
       let serversStr = await dbGet("SERVERS");
       if (!serversStr) return;
 
-      let continents = serversStr.replace(/[\r\n\t\\]/g, "").split("ç").filter(Boolean);
+      let continents = stripControlChars(serversStr).split("ç").filter(Boolean);
 
       for (let c = 0; c < continents.length; c++) {
         let serverId = continents[c].trim();
@@ -1143,7 +1156,7 @@ app.post("/admin/scan-hubs", requireToken, async (req, res) => {
 
             if (cleanUuid.length === 36) {
               let newRegion = await fetchRegionFromWorldAPI(cleanUuid);
-              mainList[i] = `${cleanUuid}#${pos}`; // Mantém estritamente 2 partes!
+              mainList[i] = `${cleanUuid}#${pos}`;
 
               if (newRegion && newRegion !== "Unknown" && newRegion !== "UnknownRegion") {
                 namesList[i] = newRegion;
