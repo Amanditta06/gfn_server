@@ -859,18 +859,56 @@ async function savePlayerData(uuid, data) {
 // API ROUTES
 // ========================================================
 
+// ========================================================
+// FUNÇÃO DE BUSCA DA WORLD API (SISTEMA ANTI-TRAVAMENTO)
+// ========================================================
+async function fetchRegionFromWorldAPI(parcelUuid) {
+  try {
+    const url = `https://world.secondlife.com/place/${parcelUuid}`;
+    
+    // Timeout de 3 segundos para o Render não travar se o SL demorar
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 3000);
+    
+    const response = await fetch(url, { 
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+        signal: controller.signal
+    });
+    
+    clearTimeout(timeoutId);
+    
+    if (!response.ok) return null;
+    
+    const html = await response.text();
+    const match = html.match(/<meta\s+name=["']region["']\s+content=["']([^"']+)["']/i);
+    
+    if (match && match[1]) {
+      return match[1].trim(); 
+    }
+  } catch (e) {
+    console.error(`[AUTO-SET] Timeout ou Erro ao buscar região:`, e.message);
+  }
+  return null;
+}
+
+// ========================================================
+// ROTA PRINCIPAL PARA OS HUBS (AGORA BLINDADA)
+// ========================================================
 app.post("/admin/parcel", requireToken, async (req, res) => {
   const { action, serverId, uuid, pos, regionName, num, newPos } = req.body;
   if (!serverId) return res.status(400).json({ error: "Missing serverId" });
 
   await withLock(`SERVER_${serverId}`, async () => {
     try {
-      let mainStr = await dbGet(serverId) || "";
+      // 1. LIMPEZA PROFUNDA DO BANCO DE DADOS (Destrói o \r fantasma)
+      let rawMainStr = await dbGet(serverId) || "";
+      let mainStr = rawMainStr.replace(/[\r\n\t\\]/g, ""); 
       let mainList = mainStr ? mainStr.split("ç").filter(Boolean) : [];
 
       let namesList = [];
       for (let i = 1; i <= 5; i++) {
-        let chunk = await dbGet(`${serverId}_NAMES_${i}`);
+        let rawChunk = await dbGet(`${serverId}_NAMES_${i}`) || "";
+        let chunk = rawChunk.replace(/[\r\n\t\\]/g, ""); // Mata o \r de Royier que já estava salvo no banco!
         if (chunk) {
             let parsedChunk = chunk.split("ç").filter(Boolean);
             namesList.push(...parsedChunk);
@@ -879,9 +917,7 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
 
       while (namesList.length < mainList.length) namesList.push("Unknown Region");
 
-      // ========================================================
-      // 1. BLINDAGEM DO UUID (Ignora lixo, espaços e quebras de linha do LSL)
-      // ========================================================
+      // 2. BUSCA BLINDADA DO UUID
       let findIndexByUuid = (target) => {
           let cleanTarget = target ? String(target).toLowerCase().replace(/[^0-9a-f\-]/g, "") : "";
           if (cleanTarget.length !== 36) return -1;
@@ -892,35 +928,33 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
           });
       };
 
-      // ========================================================
-      // 2. BLINDAGEM DE CARACTERES DE ESCAPE (Protege o "R" de Royier)
-      // ========================================================
+      // 3. LIMPEZA DA REGIÃO QUE VEM DO LSL (Garante que nunca mais entre um \r)
       let rawRegion = regionName ? String(regionName) : "Unknown Region";
       let effRegion = rawRegion
-          .replace(/[\r\n\t\\]/g, "") // Mata o \r, \n, \t e \ antes que engulam letras
-          .replace(/ç/g, "")          // Protege o separador das listas paralelas
-          .replace(/#/g, "")          // Protege o separador da lista principal
+          .replace(/[\r\n\t\\]/g, "")
+          .replace(/ç/g, "")
+          .replace(/#/g, "")
           .trim();
       
       let cleanUuid = uuid ? String(uuid).toLowerCase().replace(/[^0-9a-f\-]/g, "") : "";
 
       // ========================================================
-      // AUTO-DETECÇÃO DA REGIÃO AO ADICIONAR OU MOVER UM HUB
+      // 4. AUTO-DETECÇÃO DA REGIÃO (World API)
       // ========================================================
       if ((action === "SET_PARCEL" || action === "MOVE_HUB" || action === "UPDATE_REGION") && cleanUuid.length === 36) {
          let autoRegion = await fetchRegionFromWorldAPI(cleanUuid);
          
          if (autoRegion && autoRegion !== "Unknown" && autoRegion !== "UnknownRegion") {
-             effRegion = autoRegion;
-             console.log(`[AUTO-SET] Região ${effRegion} detectada automaticamente para o HUB ${cleanUuid}`);
+             effRegion = autoRegion; // O nome da Linden Lab substitui qualquer nome corrompido!
+             console.log(`[AUTO-SET] Região [${effRegion}] aplicada ao HUB [${cleanUuid}]`);
          }
       }
 
-      // Monta a string principal usando o UUID limpo
+      // Monta a string principal limpa
       let newItemStr = `${cleanUuid || uuid}#${pos || ""}#${effRegion}`;
 
       // ========================================================
-      // EXECUÇÃO DOS COMANDOS
+      // 5. EXECUÇÃO DOS COMANDOS
       // ========================================================
       if (action === "SET_PARCEL" || action === "MOVE_HUB") {
         let idx = findIndexByUuid(uuid);
@@ -966,7 +1000,7 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
         }
       }
 
-      // Salva no banco de dados distribuindo corretamente nos Chunks de nomes
+      // Salva no banco de dados e conserta as listas paralelas para sempre!
       await saveServerChunks(serverId, mainList, namesList);
       
       res.json({ status: "success", action, finalRegion: effRegion });
