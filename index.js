@@ -716,8 +716,6 @@ async function processHallOfFame(rankString) {
 // ========================================================
 // HELPERS DE CARREGAMENTO, REPARO E SALVAMENTO DOS HUBS
 // ========================================================
-// Usa exclusivamente o range hexadecimal de controle ASCII (\x00-\x1F e \x7F)
-// para NUNCA tocar em letras como 'r', 'n', 't', 'b', 'f', 'v'.
 function stripControlChars(str) {
   if (!str) return "";
   return String(str).replace(/[\x00-\x1F\x7F]/g, "");
@@ -731,7 +729,6 @@ function sanitizeRegionName(raw) {
     .replace(/"/g, "")
     .trim();
 
-  // Corrige automaticamente se "Royier" tiver perdido o "r" em algum script LSL antigo
   if (clean.toLowerCase() === "royie") {
     clean = "Royier";
   }
@@ -997,7 +994,7 @@ async function fetchRegionFromWorldAPI(parcelUuid) {
 }
 
 // ========================================================
-// ROTA PRINCIPAL PARA OS HUBS (ALINHAMENTO 1:1 BLINDADO)
+// ROTA PRINCIPAL PARA OS HUBS (COM AUTO-DETECT COMPLETO)
 // ========================================================
 app.post("/admin/parcel", requireToken, async (req, res) => {
   const { action, serverId, uuid, pos, regionName, num, newPos } = req.body;
@@ -1018,8 +1015,10 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
   }
   if (!effRegion) effRegion = "Unknown Region";
 
-  // Caso especial: UPDATE_REGION com serverId === "AUTO" ou lista de continentes separada por "ç"
-  if (action === "UPDATE_REGION" && (serverId === "AUTO" || serverId.includes("ç"))) {
+  // ========================================================
+  // MODO AUTO-DETECT (DEL_PARCEL, REORDER e UPDATE_REGION com "AUTO")
+  // ========================================================
+  if (serverId === "AUTO" || serverId.includes("ç")) {
     if (cleanUuid.length !== 36) return res.json({ status: "ignored_invalid_uuid" });
     try {
       let serversStr = serverId === "AUTO" ? (await dbGet("SERVERS") || "") : serverId;
@@ -1029,16 +1028,43 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
       for (const cont of continents) {
         const srv = cont.trim();
         if (!srv || srv === "AUTO") continue;
+
         await withLock(`SERVER_${srv}`, async () => {
           let { mainList, namesList, neededRepair } = await loadAndCleanServerHubs(srv);
-          let idx = mainList.findIndex(item => item.split("#")[0].toLowerCase().replace(/[^0-9a-f\-]/g, "") === cleanUuid);
+          let findIdx = () => mainList.findIndex(item => item.split("#")[0].toLowerCase().replace(/[^0-9a-f\-]/g, "") === cleanUuid);
+          let idx = findIdx();
+
           if (idx !== -1) {
-            let oldParts = mainList[idx].split("#");
-            let oldPos = oldParts.length > 1 ? oldParts[1].trim() : cleanPos;
-            mainList[idx] = `${cleanUuid}#${oldPos}`;
-            namesList[idx] = effRegion;
-            await saveServerChunks(srv, mainList, namesList);
-            updatedServers.push(srv);
+            if (action === "DEL_PARCEL") {
+              while ((idx = findIdx()) !== -1) {
+                mainList.splice(idx, 1);
+                namesList.splice(idx, 1);
+              }
+              await saveServerChunks(srv, mainList, namesList);
+              updatedServers.push(srv);
+            }
+            else if (action === "REORDER") {
+              let nPos = parseInt(newPos, 10);
+              if (!isNaN(nPos)) {
+                let mItem = mainList.splice(idx, 1)[0];
+                let nItem = namesList.splice(idx, 1)[0];
+                nPos = Math.max(0, Math.min(mainList.length, nPos));
+                mainList.splice(nPos, 0, mItem);
+                namesList.splice(nPos, 0, nItem);
+                await saveServerChunks(srv, mainList, namesList);
+                updatedServers.push(srv);
+              }
+            }
+            else if (action === "UPDATE_REGION") {
+              let oldParts = mainList[idx].split("#");
+              let oldPos = oldParts.length > 1 ? oldParts[1].trim() : cleanPos;
+              mainList[idx] = `${cleanUuid}#${oldPos}`;
+              if (effRegion && effRegion !== "Unknown Region") {
+                namesList[idx] = effRegion;
+              }
+              await saveServerChunks(srv, mainList, namesList);
+              updatedServers.push(srv);
+            }
           } else if (neededRepair) {
             await saveServerChunks(srv, mainList, namesList);
           }
@@ -1046,11 +1072,41 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
       }
       return res.json({ status: "success", action, updatedServers, finalRegion: effRegion });
     } catch (e) {
-      console.error("Erro no UPDATE_REGION AUTO:", e);
+      console.error("Erro no /admin/parcel AUTO:", e);
       return res.status(500).json({ error: "Internal error" });
     }
   }
 
+  // ========================================================
+  // SE FOR MOVE_HUB, REMOVE DOS OUTROS CONTINENTES ANTES DE ADICIONAR NO DESTINO
+  // ========================================================
+  if (action === "MOVE_HUB" && cleanUuid.length === 36) {
+    try {
+      let serversStr = await dbGet("SERVERS") || "";
+      let continents = stripControlChars(serversStr).split("ç").filter(Boolean);
+      for (const cont of continents) {
+        const srv = cont.trim();
+        if (!srv || srv === "AUTO" || srv === serverId) continue;
+        await withLock(`SERVER_${srv}`, async () => {
+          let { mainList, namesList } = await loadAndCleanServerHubs(srv);
+          let idx;
+          let modified = false;
+          while ((idx = mainList.findIndex(item => item.split("#")[0].toLowerCase().replace(/[^0-9a-f\-]/g, "") === cleanUuid)) !== -1) {
+            mainList.splice(idx, 1);
+            namesList.splice(idx, 1);
+            modified = true;
+          }
+          if (modified) {
+            await saveServerChunks(srv, mainList, namesList);
+          }
+        });
+      }
+    } catch (e) {}
+  }
+
+  // ========================================================
+  // EXECUÇÃO EM UM CONTINENTE ESPECÍFICO
+  // ========================================================
   await withLock(`SERVER_${serverId}`, async () => {
     try {
       let { mainList, namesList } = await loadAndCleanServerHubs(serverId);
@@ -1078,31 +1134,26 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
         }
       }
       else if (action === "DEL_PARCEL") {
-        let idx = findIndexByUuid(cleanUuid);
-        if (idx !== -1) {
+        let idx;
+        while ((idx = findIndexByUuid(cleanUuid)) !== -1) {
           mainList.splice(idx, 1);
           namesList.splice(idx, 1);
         }
       }
       else if (action === "DEL_NUM") {
         let idx = parseInt(num, 10);
-        if (!isNaN(idx)) {
-          if (idx >= 0 && idx < mainList.length) {
-            mainList.splice(idx, 1);
-            namesList.splice(idx, 1);
-          } else if (idx === mainList.length && idx > 0) {
-            mainList.splice(idx - 1, 1);
-            namesList.splice(idx - 1, 1);
-          }
+        if (!isNaN(idx) && idx >= 0 && idx < mainList.length) {
+          mainList.splice(idx, 1);
+          namesList.splice(idx, 1);
         }
       }
       else if (action === "REORDER") {
         let oldIdx = findIndexByUuid(cleanUuid);
         let nPos = parseInt(newPos, 10);
         if (oldIdx !== -1 && !isNaN(nPos)) {
-          nPos = Math.max(0, Math.min(mainList.length - 1, nPos));
           let mItem = mainList.splice(oldIdx, 1)[0];
           let nItem = namesList.splice(oldIdx, 1)[0];
+          nPos = Math.max(0, Math.min(mainList.length, nPos));
           mainList.splice(nPos, 0, mItem);
           namesList.splice(nPos, 0, nItem);
         }
