@@ -879,37 +879,57 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
 
       while (namesList.length < mainList.length) namesList.push("Unknown Region");
 
-      let findIndexByUuid = (u) => mainList.findIndex(item => item.toLowerCase().startsWith(u.toLowerCase() + "#"));
-      
-      let effRegion = (regionName || "Unknown Region").replace(/ç/g, "").replace(/#/g, "");
-      let cleanUuid = uuid ? uuid.toLowerCase().replace(/[^0-9a-f\-]/g, "") : "";
+      // ========================================================
+      // 1. BLINDAGEM DO UUID (Ignora lixo, espaços e quebras de linha do LSL)
+      // ========================================================
+      let findIndexByUuid = (target) => {
+          let cleanTarget = target ? String(target).toLowerCase().replace(/[^0-9a-f\-]/g, "") : "";
+          if (cleanTarget.length !== 36) return -1;
+          
+          return mainList.findIndex(item => {
+              let itemUuid = item.split("#")[0].toLowerCase().replace(/[^0-9a-f\-]/g, "");
+              return itemUuid === cleanTarget;
+          });
+      };
 
       // ========================================================
-      // NOVO: AUTO-DETECÇÃO DA REGIÃO AO ADICIONAR OU MOVER UM HUB
+      // 2. BLINDAGEM DE CARACTERES DE ESCAPE (Protege o "R" de Royier)
+      // ========================================================
+      let rawRegion = regionName ? String(regionName) : "Unknown Region";
+      let effRegion = rawRegion
+          .replace(/[\r\n\t\\]/g, "") // Mata o \r, \n, \t e \ antes que engulam letras
+          .replace(/ç/g, "")          // Protege o separador das listas paralelas
+          .replace(/#/g, "")          // Protege o separador da lista principal
+          .trim();
+      
+      let cleanUuid = uuid ? String(uuid).toLowerCase().replace(/[^0-9a-f\-]/g, "") : "";
+
+      // ========================================================
+      // AUTO-DETECÇÃO DA REGIÃO AO ADICIONAR OU MOVER UM HUB
       // ========================================================
       if ((action === "SET_PARCEL" || action === "MOVE_HUB" || action === "UPDATE_REGION") && cleanUuid.length === 36) {
-         // O Node.js automaticamente busca a região na World API
          let autoRegion = await fetchRegionFromWorldAPI(cleanUuid);
          
-         // Se encontrar uma região válida, substitui o valor padrão
          if (autoRegion && autoRegion !== "Unknown" && autoRegion !== "UnknownRegion") {
              effRegion = autoRegion;
              console.log(`[AUTO-SET] Região ${effRegion} detectada automaticamente para o HUB ${cleanUuid}`);
          }
       }
+
+      // Monta a string principal usando o UUID limpo
+      let newItemStr = `${cleanUuid || uuid}#${pos || ""}#${effRegion}`;
+
       // ========================================================
-
-      // Monta a string principal já com a região verdadeira
-      let newItemStr = `${uuid}#${pos}#${effRegion}`;
-
+      // EXECUÇÃO DOS COMANDOS
+      // ========================================================
       if (action === "SET_PARCEL" || action === "MOVE_HUB") {
         let idx = findIndexByUuid(uuid);
         if (idx !== -1) {
           mainList[idx] = newItemStr;
-          namesList[idx] = effRegion; // Garante alinhamento na lista paralela
+          namesList[idx] = effRegion; 
         } else {
           mainList.push(newItemStr);
-          namesList.push(effRegion); // Garante alinhamento na lista paralela
+          namesList.push(effRegion); 
         }
       }
       else if (action === "DEL_PARCEL") {
@@ -941,7 +961,7 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
         if (idx !== -1) {
             let oldParts = mainList[idx].split("#");
             let oldPos = oldParts.length > 1 ? oldParts[1] : "";
-            mainList[idx] = `${uuid}#${oldPos}#${effRegion}`;
+            mainList[idx] = `${cleanUuid || uuid}#${oldPos}#${effRegion}`;
             namesList[idx] = effRegion;
         }
       }
@@ -949,7 +969,6 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
       // Salva no banco de dados distribuindo corretamente nos Chunks de nomes
       await saveServerChunks(serverId, mainList, namesList);
       
-      // Retorna sucesso para o LSL
       res.json({ status: "success", action, finalRegion: effRegion });
 
     } catch (e) {
