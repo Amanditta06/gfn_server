@@ -938,51 +938,50 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
 });
 
 // ========================================================
-// FUNÇÃO E ROTA DE VARREDURA DE HUBS (SCAN GLOBAL)
+// FUNÇÃO E ROTA DE VARREDURA DE HUBS (SCAN GLOBAL FORÇADO)
 // ========================================================
 
-// Função auxiliar para buscar o nome da região direto da World API do SL
 async function fetchRegionFromWorldAPI(parcelUuid) {
   try {
     const url = `https://world.secondlife.com/place/${parcelUuid}`;
-    const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-    if (!response.ok) return null;
+    const response = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } });
+    if (!response.ok) {
+        console.log(`[SCAN] Erro HTTP ${response.status} ao buscar ${parcelUuid}`);
+        return null;
+    }
     
     const html = await response.text();
-    const match = html.match(/<meta\s+name="region"\s+content="([^"]+)"/i);
+    const match = html.match(/<meta\s+name=["']region["']\s+content=["']([^"']+)["']/i);
+    
     if (match && match[1]) {
-      return match[1]; 
+      return match[1].trim(); 
+    } else {
+      console.log(`[SCAN] ⚠️ A parcela ${parcelUuid} não expõe a região na World API (Lote oculto ou sem dados).`);
     }
   } catch (e) {
-    console.error(`Erro ao fazer scraping da parcela ${parcelUuid}:`, e.message);
+    console.error(`[SCAN] Erro ao fazer scraping da parcela ${parcelUuid}:`, e.message);
   }
   return null;
 }
 
 app.post("/admin/scan-hubs", requireToken, async (req, res) => {
-  // Retorna sucesso imediatamente para o SL para não dar timeout no LSL
-  res.json({ status: "scanning_started", message: "Iniciando varredura GLOBAL em todos os continentes em background..." });
+  res.json({ status: "scanning_started", message: "Iniciando varredura GLOBAL forçada em background..." });
 
-  // Executa o trabalho pesado em background
   (async () => {
     try {
-      // 1. Pega a lista de todos os continentes cadastrados na chave SERVERS
       let serversStr = await dbGet("SERVERS");
       if (!serversStr) {
         console.log("[SCAN GLOBAL] Nenhum servidor cadastrado no banco de dados (SERVERS vazia).");
         return;
       }
       
-      // 2. Separa a string "WORLD-WIDEç-PH-" em uma array real do JavaScript
       let continents = serversStr.split("ç").filter(Boolean);
       console.log(`[SCAN GLOBAL] Encontrados ${continents.length} continentes para varrer: ${continents.join(", ")}`);
 
-      // 3. Faz o laço de repetição passando por TODOS os continentes
       for (let c = 0; c < continents.length; c++) {
-        let serverId = continents[c];
-        console.log(`[SCAN GLOBAL] Iniciando varredura no continente: ${serverId}...`);
+        let serverId = continents[c].trim();
+        console.log(`\n[SCAN GLOBAL] Iniciando varredura FORÇADA no continente: ${serverId}...`);
 
-        // Usa o seu sistema de Lock (Mutex) de segurança para não corromper se alguém adicionar um lote na mesma hora
         await withLock(`SERVER_${serverId}`, async () => {
           let mainStr = await dbGet(serverId) || "";
           let mainList = mainStr ? mainStr.split("ç").filter(Boolean) : [];
@@ -1000,41 +999,45 @@ app.post("/admin/scan-hubs", requireToken, async (req, res) => {
 
           let updatedCount = 0;
 
-          // Varre cada parcela dentro deste continente
           for (let i = 0; i < mainList.length; i++) {
             let parts = mainList[i].split("#");
-            let uuid = parts[0];
-            let pos = parts.length > 1 ? parts[1] : "";
-            let oldRegion = parts.length > 2 ? parts[2] : namesList[i];
+            
+            // Limpeza absoluta do UUID - se tiver espaços ocultos, eles morrem aqui
+            let rawUuid = parts[0] || "";
+            let cleanUuid = rawUuid.toLowerCase().replace(/[^0-9a-f\-]/g, "");
+            let pos = parts.length > 1 ? parts[1].trim() : "";
+            let oldRegion = parts.length > 2 ? parts[2].trim() : (namesList[i] ? namesList[i].trim() : "Unknown Region");
 
-            if (uuid && uuid.length === 36) {
-              let newRegion = await fetchRegionFromWorldAPI(uuid);
+            if (cleanUuid.length === 36) {
+              console.log(`[SCAN] Lendo Hub ${i+1}/${mainList.length}: ${cleanUuid} (Banco: ${oldRegion})`);
+              
+              let newRegion = await fetchRegionFromWorldAPI(cleanUuid);
 
-              if (newRegion && newRegion !== "Unknown" && newRegion !== oldRegion) {
-                console.log(`[SCAN] Hub ${uuid} atualizado: ${oldRegion} -> ${newRegion}`);
-                mainList[i] = `${uuid}#${pos}#${newRegion}`;
+              // SE RETORNOU UMA REGIÃO VÁLIDA, FORÇA A GRAVAÇÃO IGNORANDO SE JÁ ESTAVA "CORRETO"
+              if (newRegion && newRegion !== "Unknown" && newRegion !== "UnknownRegion") {
+                console.log(`🔄 [FORÇANDO] Gravando região: ${newRegion}`);
+                
+                // Usamos o cleanUuid aqui para garantir que o banco seja reescrito sem lixo invisível
+                mainList[i] = `${cleanUuid}#${pos}#${newRegion}`;
                 namesList[i] = newRegion;
-                updatedCount++;
+                updatedCount++; // Sempre soma para garantir que vai salvar no banco
               }
             }
-            // Pausa de 500ms entre as leituras para evitar banimento de IP da Linden Lab
             await new Promise(resolve => setTimeout(resolve, 500));
           }
 
+          // Como forçamos a contagem (updatedCount), ele sempre vai salvar e reestruturar os chunks
           if (updatedCount > 0) {
             await saveServerChunks(serverId, mainList, namesList);
-            console.log(`[SCAN GLOBAL] ${serverId} concluído! ${updatedCount} regiões foram consertadas.`);
+            console.log(`[SCAN GLOBAL] ${serverId} SALVO! ${updatedCount} regiões foram reescritas com sucesso.`);
           } else {
-            console.log(`[SCAN GLOBAL] ${serverId} concluído! Tudo já estava atualizado.`);
+            console.log(`[SCAN GLOBAL] ${serverId} processado. Nenhuma parcela válida encontrada para atualizar.`);
           }
         });
 
-        // Pausa de 2 segundos entre um continente e outro por segurança
         await new Promise(resolve => setTimeout(resolve, 2000));
       }
-
-      console.log("[SCAN GLOBAL] Varredura global finalizada 100%!");
-
+      console.log("\n[SCAN GLOBAL] Varredura global forçada finalizada 100%!");
     } catch (e) {
       console.error("Erro durante o scan-hubs global:", e);
     }
