@@ -880,17 +880,36 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
       while (namesList.length < mainList.length) namesList.push("Unknown Region");
 
       let findIndexByUuid = (u) => mainList.findIndex(item => item.toLowerCase().startsWith(u.toLowerCase() + "#"));
-      let effRegion = (regionName || "Unknown").replace(/ç/g, "").replace(/#/g, "");
+      
+      let effRegion = (regionName || "Unknown Region").replace(/ç/g, "").replace(/#/g, "");
+      let cleanUuid = uuid ? uuid.toLowerCase().replace(/[^0-9a-f\-]/g, "") : "";
+
+      // ========================================================
+      // NOVO: AUTO-DETECÇÃO DA REGIÃO AO ADICIONAR OU MOVER UM HUB
+      // ========================================================
+      if ((action === "SET_PARCEL" || action === "MOVE_HUB" || action === "UPDATE_REGION") && cleanUuid.length === 36) {
+         // O Node.js automaticamente busca a região na World API
+         let autoRegion = await fetchRegionFromWorldAPI(cleanUuid);
+         
+         // Se encontrar uma região válida, substitui o valor padrão
+         if (autoRegion && autoRegion !== "Unknown" && autoRegion !== "UnknownRegion") {
+             effRegion = autoRegion;
+             console.log(`[AUTO-SET] Região ${effRegion} detectada automaticamente para o HUB ${cleanUuid}`);
+         }
+      }
+      // ========================================================
+
+      // Monta a string principal já com a região verdadeira
       let newItemStr = `${uuid}#${pos}#${effRegion}`;
 
       if (action === "SET_PARCEL" || action === "MOVE_HUB") {
         let idx = findIndexByUuid(uuid);
         if (idx !== -1) {
           mainList[idx] = newItemStr;
-          namesList[idx] = effRegion;
+          namesList[idx] = effRegion; // Garante alinhamento na lista paralela
         } else {
           mainList.push(newItemStr);
-          namesList.push(effRegion);
+          namesList.push(effRegion); // Garante alinhamento na lista paralela
         }
       }
       else if (action === "DEL_PARCEL") {
@@ -927,8 +946,11 @@ app.post("/admin/parcel", requireToken, async (req, res) => {
         }
       }
 
+      // Salva no banco de dados distribuindo corretamente nos Chunks de nomes
       await saveServerChunks(serverId, mainList, namesList);
-      res.json({ status: "success", action });
+      
+      // Retorna sucesso para o LSL
+      res.json({ status: "success", action, finalRegion: effRegion });
 
     } catch (e) {
       console.error("Erro no /admin/parcel:", e);
