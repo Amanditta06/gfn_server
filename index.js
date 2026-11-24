@@ -93,16 +93,17 @@ let OIL_ZONES = new Map();
 let OIL_TANK_LEDGER = new Map();
 let OIL_SCAN_COOLDOWN = new Map();
 // ========================================================
-// LED OUTDOOR COMMERCIAL AD SYSTEM
+// LED OUTDOOR COMMERCIAL AD SYSTEM (MULTI-IMAGE + ADMIN)
 // ========================================================
-const OUTDOOR_CHUNK_SIZE = 40; // 40 UUIDs por pacote (~1.5KB, seguro para LSL 16KB/Mono)
-const OUTDOOR_WEEK_SECONDS = 604800; // 7 dias em segundos
+const OUTDOOR_CHUNK_SIZE = 40;
+const OUTDOOR_WEEK_SECONDS = 604800; // 7 days in seconds
 
 let OUTDOOR_CONFIG = {
-  weeklyPrice: 100 // Preço padrão de 1 semana em L$
+  weeklyPrice: 100,
+  maxImagesPerPlan: 5
 };
 
-let OUTDOOR_ACCOUNTS = new Map(); // uuid -> { uuid, legacyName, password, plans: [] }
+let OUTDOOR_ACCOUNTS = new Map(); // uuid -> { uuid, legacyName, password, isAdmin, plans: [] }
 let OUTDOOR_NAME_MAP = new Map(); // legacyNameLower -> uuid
 
 function normalizeLegacyName(raw) {
@@ -128,6 +129,95 @@ function formatRemainingShort(seconds) {
   return `${Math.max(1, mins)}m`;
 }
 
+function pruneExpiredPlansForAccount(acc, now = getUnixTime()) {
+  if (!acc) return false;
+  let changed = false;
+
+  if (typeof acc.isAdmin !== "boolean") {
+    acc.isAdmin = Boolean(acc.isAdmin);
+    changed = true;
+  }
+  if (!Array.isArray(acc.plans)) {
+    acc.plans = [];
+    changed = true;
+  }
+
+  const kept = [];
+  for (const p of acc.plans) {
+    // Migrate legacy single textureUuid -> images array
+    if (!Array.isArray(p.images)) {
+      p.images = [];
+      if (p.textureUuid && isValidUuid(p.textureUuid)) {
+        p.images.push(p.textureUuid.trim().toLowerCase());
+      }
+      delete p.textureUuid;
+      changed = true;
+    }
+
+    // Active Admin free infinite plan never expires
+    if (acc.isAdmin && p.isAdminFree) {
+      kept.push(p);
+      continue;
+    }
+
+    // Safety check: if no longer admin, convert free plan to expired waiting for payment
+    if (!acc.isAdmin && p.isAdminFree) {
+      p.isAdminFree = false;
+      p.wasAdminFree = true;
+      p.expiresAt = now;
+      changed = true;
+    }
+
+    // 1-week grace period after expiration before permanent deletion
+    const deleteAt = (p.expiresAt || 0) + OUTDOOR_WEEK_SECONDS;
+    if (now >= deleteAt) {
+      changed = true; // Permanently delete plan and all its images
+    } else {
+      kept.push(p);
+    }
+  }
+
+  if (kept.length !== acc.plans.length) {
+    acc.plans = kept;
+    changed = true;
+  }
+  return changed;
+}
+
+async function saveOutdoorAccount(acc) {
+  OUTDOOR_ACCOUNTS.set(acc.uuid, acc);
+  if (acc.legacyName) {
+    OUTDOOR_NAME_MAP.set(normalizeLegacyName(acc.legacyName).toLowerCase(), acc.uuid);
+  }
+  await dbSet(`outdoor_acc_${acc.uuid}`, JSON.stringify(acc));
+}
+
+async function pruneAllOutdoorPlans() {
+  const now = getUnixTime();
+  for (const acc of OUTDOOR_ACCOUNTS.values()) {
+    if (pruneExpiredPlansForAccount(acc, now)) {
+      await saveOutdoorAccount(acc);
+    }
+  }
+}
+
+function serializePlanForClient(p, isAdmin, now = getUnixTime()) {
+  const isInfinite = Boolean(isAdmin && p.isAdminFree);
+  const active = isInfinite || (p.expiresAt > now);
+  const remainingSeconds = isInfinite ? -1 : Math.max(0, (p.expiresAt || 0) - now);
+  const graceRemainingSeconds = active ? 0 : Math.max(0, ((p.expiresAt || 0) + OUTDOOR_WEEK_SECONDS) - now);
+
+  return {
+    name: p.name,
+    isAdminFree: isInfinite,
+    active,
+    expiresAt: p.expiresAt || 0,
+    remainingSeconds,
+    graceRemainingSeconds,
+    images: Array.isArray(p.images) ? p.images : []
+  };
+}
+
 async function initOutdoorSystem() {
   if (!DATABASE_URL) return;
   try {
@@ -142,44 +232,52 @@ async function initOutdoorSystem() {
     OUTDOOR_NAME_MAP.clear();
 
     const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'outdoor_acc_%'");
+    const now = getUnixTime();
     for (const row of q.rows) {
       try {
         const acc = JSON.parse(row.value);
         if (acc && acc.uuid) {
+          const modified = pruneExpiredPlansForAccount(acc, now);
           OUTDOOR_ACCOUNTS.set(acc.uuid, acc);
           if (acc.legacyName) {
             OUTDOOR_NAME_MAP.set(normalizeLegacyName(acc.legacyName).toLowerCase(), acc.uuid);
           }
+          if (modified) await saveOutdoorAccount(acc);
         }
       } catch (e) {}
     }
-    console.log(`[OUTDOOR] Loaded ${OUTDOOR_ACCOUNTS.size} accounts. Weekly price: L$${OUTDOOR_CONFIG.weeklyPrice}`);
+    console.log(`[OUTDOOR] Loaded ${OUTDOOR_ACCOUNTS.size} accounts. Price: L$${OUTDOOR_CONFIG.weeklyPrice} | Max images: ${OUTDOOR_CONFIG.maxImagesPerPlan}`);
   } catch (e) {
-    console.error("Erro no initOutdoorSystem:", e);
+    console.error("Error in initOutdoorSystem:", e);
   }
-}
-
-async function saveOutdoorAccount(acc) {
-  OUTDOOR_ACCOUNTS.set(acc.uuid, acc);
-  if (acc.legacyName) {
-    OUTDOOR_NAME_MAP.set(normalizeLegacyName(acc.legacyName).toLowerCase(), acc.uuid);
-  }
-  await dbSet(`outdoor_acc_${acc.uuid}`, JSON.stringify(acc));
 }
 
 function getActiveOutdoorAdsList() {
   const now = getUnixTime();
+  const maxImgs = OUTDOOR_CONFIG.maxImagesPerPlan || 5;
   const activeUuids = [];
+
   for (const acc of OUTDOOR_ACCOUNTS.values()) {
     if (!Array.isArray(acc.plans)) continue;
     for (const p of acc.plans) {
-      if (p.expiresAt > now && isValidUuid(p.textureUuid)) {
-        activeUuids.push(p.textureUuid.trim().toLowerCase());
+      const isActive = (acc.isAdmin && p.isAdminFree) || (p.expiresAt > now);
+      if (!isActive || !Array.isArray(p.images)) continue;
+
+      const allowed = p.images.slice(0, maxImgs);
+      for (const tex of allowed) {
+        if (isValidUuid(tex)) {
+          activeUuids.push(tex.trim().toLowerCase());
+        }
       }
     }
   }
   return activeUuids;
 }
+
+// Periodic cleanup every 10 minutes to delete plans past the 1-week grace period
+setInterval(pruneAllOutdoorPlans, 10 * 60 * 1000);
+/////////////////////////////////////////////////////////////////////////////////////////
+
 // ========================================================
 // CORE HELPERS & LOCKS
 // ========================================================
@@ -2603,12 +2701,14 @@ app.post("/gacha/build", requireToken, async (req, res) => {
 
   res.json({ status: "success", object_uuid, config });
 });
+
 // ========================================================
 // LED OUTDOOR ENDPOINTS
 // ========================================================
 
-// 1. Puxar UUIDs parcelados em chunks para o Outdoor LED
-app.get("/outdoor/ads", (req, res) => {
+// 1. Chunked active ad UUIDs for the LED Outdoor
+app.get("/outdoor/ads", async (req, res) => {
+  await pruneAllOutdoorPlans();
   const activeAds = getActiveOutdoorAdsList();
   const totalAds = activeAds.length;
 
@@ -2632,8 +2732,8 @@ app.get("/outdoor/ads", (req, res) => {
   });
 });
 
-// 2. Terminal busca preço semanal + planos do player
-app.get("/outdoor/player", requireToken, (req, res) => {
+// 2. Payment Terminal fetches pricing + player's plans
+app.get("/outdoor/player", requireToken, async (req, res) => {
   const uuid = String(req.query.uuid || "").trim().toLowerCase();
   if (!uuid) return res.status(400).json({ error: "missing uuid" });
 
@@ -2641,22 +2741,32 @@ app.get("/outdoor/player", requireToken, (req, res) => {
   const now = getUnixTime();
   let planEntries = [];
 
-  if (acc && Array.isArray(acc.plans)) {
-    planEntries = acc.plans.map(p => {
-      const rem = Math.max(0, (p.expiresAt || 0) - now);
-      return `${p.name}|${formatRemainingShort(rem)}`;
+  if (acc) {
+    if (pruneExpiredPlansForAccount(acc, now)) {
+      await saveOutdoorAccount(acc);
+    }
+    planEntries = (acc.plans || []).map(p => {
+      if (acc.isAdmin && p.isAdminFree) {
+        return `${p.name}|ADMIN FREE`;
+      }
+      if (p.expiresAt > now) {
+        return `${p.name}|${formatRemainingShort(p.expiresAt - now)}`;
+      }
+      const graceLeft = Math.max(0, (p.expiresAt + OUTDOOR_WEEK_SECONDS) - now);
+      return `${p.name}|EXP (del ${formatRemainingShort(graceLeft)})`;
     });
   }
 
   res.json({
     status: "OK",
     weeklyPrice: OUTDOOR_CONFIG.weeklyPrice,
+    maxImagesPerPlan: OUTDOOR_CONFIG.maxImagesPerPlan,
     hasPassword: Boolean(acc && acc.password),
     plans: planEntries.join("ç")
   });
 });
 
-// 3. Terminal registra pagamento (criação ou renovação de plano + senha automática na 1ª vez)
+// 3. Payment Terminal registers new plan or renewal
 app.post("/outdoor/pay", requireToken, async (req, res) => {
   const { uuid, legacyName, planName, weeks, autoPassword } = req.body;
   const cleanUuid = String(uuid || "").trim().toLowerCase();
@@ -2678,16 +2788,17 @@ app.post("/outdoor/pay", requireToken, async (req, res) => {
         uuid: cleanUuid,
         legacyName: cleanName || cleanUuid,
         password: String(autoPassword || "").trim(),
+        isAdmin: false,
         plans: []
       };
       isNewPassword = true;
     } else {
+      pruneExpiredPlansForAccount(acc, now);
       if (cleanName) acc.legacyName = cleanName;
       if (!acc.password && autoPassword) {
         acc.password = String(autoPassword).trim();
         isNewPassword = true;
       }
-      if (!Array.isArray(acc.plans)) acc.plans = [];
     }
 
     const addSeconds = numWeeks * OUTDOOR_WEEK_SECONDS;
@@ -2696,12 +2807,16 @@ app.post("/outdoor/pay", requireToken, async (req, res) => {
     if (existing) {
       const baseTime = existing.expiresAt > now ? existing.expiresAt : now;
       existing.expiresAt = baseTime + addSeconds;
+      existing.isAdminFree = false;
+      existing.wasAdminFree = false;
       existing.updatedAt = now;
     } else {
       existing = {
         name: cleanPlan,
         expiresAt: now + addSeconds,
-        textureUuid: "",
+        isAdminFree: false,
+        wasAdminFree: false,
+        images: [],
         updatedAt: now
       };
       acc.plans.push(existing);
@@ -2721,7 +2836,7 @@ app.post("/outdoor/pay", requireToken, async (req, res) => {
   });
 });
 
-// 4. Terminal altera ou define senha do player ([PASS])
+// 4. Payment Terminal changes player's password ([PASS])
 app.post("/outdoor/set-password", requireToken, async (req, res) => {
   const { uuid, legacyName, password } = req.body;
   const cleanUuid = String(uuid || "").trim().toLowerCase();
@@ -2739,6 +2854,7 @@ app.post("/outdoor/set-password", requireToken, async (req, res) => {
         uuid: cleanUuid,
         legacyName: cleanName || cleanUuid,
         password: cleanPass,
+        isAdmin: false,
         plans: []
       };
     } else {
@@ -2751,32 +2867,167 @@ app.post("/outdoor/set-password", requireToken, async (req, res) => {
   });
 });
 
-// 5. Painel Admin: consultar preço e estatísticas
-app.get("/outdoor/admin/info", requireToken, (req, res) => {
-  const activeAds = getActiveOutdoorAdsList().length;
+// 5. LSL Admin Panel: fetch current config & stats
+app.get("/outdoor/admin/info", requireToken, async (req, res) => {
+  await pruneAllOutdoorPlans();
+  let adminCount = 0;
+  for (const acc of OUTDOOR_ACCOUNTS.values()) {
+    if (acc.isAdmin) adminCount++;
+  }
   res.json({
     status: "OK",
     weeklyPrice: OUTDOOR_CONFIG.weeklyPrice,
+    maxImagesPerPlan: OUTDOOR_CONFIG.maxImagesPerPlan,
     totalAccounts: OUTDOOR_ACCOUNTS.size,
-    activeAds
+    activeAds: getActiveOutdoorAdsList().length,
+    adminCount
   });
 });
 
-// 6. Painel Admin: atualizar preço semanal
+// 6. LSL Admin Panel: update weekly price
 app.post("/outdoor/admin/set-price", requireToken, async (req, res) => {
   const newPrice = parseInt(req.body.weeklyPrice, 10);
   if (isNaN(newPrice) || newPrice < 5 || newPrice > 100000) {
     return res.status(400).json({ status: "ERROR", message: "Price must be between 5 and 100000 L$." });
   }
-
   OUTDOOR_CONFIG.weeklyPrice = newPrice;
   await dbSet("OUTDOOR_CONFIG", JSON.stringify(OUTDOOR_CONFIG));
   res.json({ status: "OK", weeklyPrice: OUTDOOR_CONFIG.weeklyPrice });
 });
 
-// 7. Site Google Sites: login com Legacy Name (sem "Resident") e senha
-app.post("/outdoor/web/login", (req, res) => {
-  const { legacyName, password } = req.body;
+// 7. LSL Admin Panel: update max images per plan
+app.post("/outdoor/admin/set-max-images", requireToken, async (req, res) => {
+  const newMax = parseInt(req.body.maxImagesPerPlan, 10);
+  if (isNaN(newMax) || newMax < 1 || newMax > 20) {
+    return res.status(400).json({ status: "ERROR", message: "Max images must be between 1 and 20." });
+  }
+  OUTDOOR_CONFIG.maxImagesPerPlan = newMax;
+  await dbSet("OUTDOOR_CONFIG", JSON.stringify(OUTDOOR_CONFIG));
+  res.json({ status: "OK", maxImagesPerPlan: OUTDOOR_CONFIG.maxImagesPerPlan });
+});
+
+// 8. LSL Admin Panel: grant Admin status + 1 free infinite plan
+app.post("/outdoor/admin/set-admin", requireToken, async (req, res) => {
+  const { uuid, legacyName, autoPassword } = req.body;
+  const cleanUuid = String(uuid || "").trim().toLowerCase();
+  const cleanName = normalizeLegacyName(legacyName);
+
+  if (!cleanUuid || !isValidUuid(cleanUuid)) {
+    return res.status(400).json({ status: "ERROR", message: "Invalid avatar UUID." });
+  }
+
+  await withLock(`OUTDOOR_${cleanUuid}`, async () => {
+    const now = getUnixTime();
+    let acc = OUTDOOR_ACCOUNTS.get(cleanUuid);
+    let isNewPassword = false;
+
+    if (!acc) {
+      acc = {
+        uuid: cleanUuid,
+        legacyName: cleanName || cleanUuid,
+        password: String(autoPassword || "").trim(),
+        isAdmin: true,
+        plans: []
+      };
+      isNewPassword = true;
+    } else {
+      pruneExpiredPlansForAccount(acc, now);
+      if (cleanName) acc.legacyName = cleanName;
+      if (!acc.password && autoPassword) {
+        acc.password = String(autoPassword).trim();
+        isNewPassword = true;
+      }
+      acc.isAdmin = true;
+    }
+
+    // Ensure admin has 1 free infinite plan
+    let freePlan = acc.plans.find(p => p.isAdminFree);
+    if (!freePlan) {
+      // Restore previously revoked admin plan if still inside its 1-week grace window
+      let prevFree = acc.plans.find(p => p.wasAdminFree);
+      if (prevFree) {
+        prevFree.isAdminFree = true;
+        prevFree.wasAdminFree = false;
+        prevFree.expiresAt = 0;
+        prevFree.updatedAt = now;
+        freePlan = prevFree;
+      } else {
+        // Pick a unique plan name (<= 7 chars)
+        let baseName = "ADMIN";
+        let counter = 1;
+        while (acc.plans.some(p => p.name.toLowerCase() === baseName.toLowerCase())) {
+          baseName = `ADM${counter}`;
+          counter++;
+        }
+        freePlan = {
+          name: baseName,
+          expiresAt: 0,
+          isAdminFree: true,
+          wasAdminFree: false,
+          images: [],
+          updatedAt: now
+        };
+        acc.plans.push(freePlan);
+      }
+    }
+
+    await saveOutdoorAccount(acc);
+
+    res.json({
+      status: "OK",
+      uuid: acc.uuid,
+      legacyName: acc.legacyName,
+      password: acc.password,
+      isNewPassword: isNewPassword ? 1 : 0,
+      freePlanName: freePlan.name
+    });
+  });
+});
+
+// 9. LSL Admin Panel: list all current admins
+app.get("/outdoor/admin/list-admins", requireToken, (req, res) => {
+  const entries = [];
+  for (const acc of OUTDOOR_ACCOUNTS.values()) {
+    if (acc.isAdmin) {
+      entries.push(`${acc.uuid}|${acc.legacyName}`);
+    }
+  }
+  res.json({
+    status: "OK",
+    count: entries.length,
+    admins: entries.join("ç")
+  });
+});
+
+// 10. LSL Admin Panel: revoke Admin status (free plan enters 1-week payment grace period)
+app.post("/outdoor/admin/unset-admin", requireToken, async (req, res) => {
+  const cleanUuid = String(req.body.uuid || "").trim().toLowerCase();
+  if (!cleanUuid) return res.status(400).json({ status: "ERROR", message: "Missing UUID." });
+
+  await withLock(`OUTDOOR_${cleanUuid}`, async () => {
+    const acc = OUTDOOR_ACCOUNTS.get(cleanUuid);
+    if (!acc) return res.status(404).json({ status: "ERROR", message: "Account not found." });
+
+    const now = getUnixTime();
+    acc.isAdmin = false;
+
+    for (const p of (acc.plans || [])) {
+      if (p.isAdminFree) {
+        p.isAdminFree = false;
+        p.wasAdminFree = true;
+        p.expiresAt = now; // Immediately stops showing on outdoor; 7-day deletion clock starts now
+        p.updatedAt = now;
+      }
+    }
+
+    await saveOutdoorAccount(acc);
+    res.json({ status: "OK", uuid: acc.uuid, legacyName: acc.legacyName });
+  });
+});
+
+// 11. Website: login (normal or as Admin)
+app.post("/outdoor/web/login", async (req, res) => {
+  const { legacyName, password, asAdmin } = req.body;
   const lookup = normalizeLegacyName(legacyName).toLowerCase();
   const pass = String(password || "").trim();
 
@@ -2786,7 +3037,7 @@ app.post("/outdoor/web/login", (req, res) => {
 
   const uuid = OUTDOOR_NAME_MAP.get(lookup);
   if (!uuid) {
-    return res.status(401).json({ status: "ERROR", message: "Account not found. Buy a plan or set a password at the in-world terminal first." });
+    return res.status(401).json({ status: "ERROR", message: "Account not found. Use the in-world terminal first." });
   }
 
   const acc = OUTDOOR_ACCOUNTS.get(uuid);
@@ -2794,58 +3045,181 @@ app.post("/outdoor/web/login", (req, res) => {
     return res.status(401).json({ status: "ERROR", message: "Invalid password." });
   }
 
+  if (asAdmin && !acc.isAdmin) {
+    return res.status(403).json({ status: "ERROR", message: "Access denied. This account does not have Admin status." });
+  }
+
   const now = getUnixTime();
-  const plans = (acc.plans || []).map(p => ({
-    name: p.name,
-    expiresAt: p.expiresAt || 0,
-    active: (p.expiresAt || 0) > now,
-    remainingSeconds: Math.max(0, (p.expiresAt || 0) - now),
-    textureUuid: p.textureUuid || ""
-  }));
+  if (pruneExpiredPlansForAccount(acc, now)) {
+    await saveOutdoorAccount(acc);
+  }
 
   res.json({
     status: "OK",
     legacyName: acc.legacyName,
-    plans
+    isAdmin: Boolean(acc.isAdmin),
+    adminMode: Boolean(asAdmin && acc.isAdmin),
+    maxImagesPerPlan: OUTDOOR_CONFIG.maxImagesPerPlan,
+    plans: (acc.plans || []).map(p => serializePlanForClient(p, acc.isAdmin, now))
   });
 });
 
-// 8. Site Google Sites: atualizar UUID da imagem de um plano
-app.post("/outdoor/web/update-image", async (req, res) => {
-  const { legacyName, password, planName, textureUuid } = req.body;
+// 12. Website: live session & admin status check (auto-kick heartbeat + Admin Mode toggle)
+app.post("/outdoor/web/status", (req, res) => {
+  const { legacyName, password } = req.body;
   const lookup = normalizeLegacyName(legacyName).toLowerCase();
   const pass = String(password || "").trim();
-  const tex = String(textureUuid || "").trim();
 
   const uuid = OUTDOOR_NAME_MAP.get(lookup);
-  if (!uuid) return res.status(401).json({ status: "ERROR", message: "Unauthorized." });
+  const acc = uuid ? OUTDOOR_ACCOUNTS.get(uuid) : null;
+  if (!acc || acc.password !== pass) {
+    return res.status(401).json({ status: "ERROR", message: "Invalid session." });
+  }
 
-  const accCheck = OUTDOOR_ACCOUNTS.get(uuid);
+  res.json({
+    status: "OK",
+    isAdmin: Boolean(acc.isAdmin),
+    maxImagesPerPlan: OUTDOOR_CONFIG.maxImagesPerPlan
+  });
+});
+
+// 13. Website: player updates up to maxImagesPerPlan image UUIDs on their plan
+app.post("/outdoor/web/update-images", async (req, res) => {
+  const { legacyName, password, planName, images } = req.body;
+  const lookup = normalizeLegacyName(legacyName).toLowerCase();
+  const pass = String(password || "").trim();
+
+  const uuid = OUTDOOR_NAME_MAP.get(lookup);
+  const accCheck = uuid ? OUTDOOR_ACCOUNTS.get(uuid) : null;
   if (!accCheck || accCheck.password !== pass) {
     return res.status(401).json({ status: "ERROR", message: "Invalid credentials." });
   }
 
-  if (tex !== "" && !isValidUuid(tex)) {
-    return res.status(400).json({ status: "ERROR", message: "Invalid Texture UUID format." });
+  if (!Array.isArray(images)) {
+    return res.status(400).json({ status: "ERROR", message: "Invalid images payload." });
+  }
+
+  const cleanImages = [];
+  for (const raw of images) {
+    const s = String(raw || "").trim();
+    if (!s) continue;
+    if (!isValidUuid(s)) {
+      return res.status(400).json({ status: "ERROR", message: `Invalid Texture UUID: ${s}` });
+    }
+    cleanImages.push(s.toLowerCase());
+  }
+
+  if (cleanImages.length > OUTDOOR_CONFIG.maxImagesPerPlan) {
+    return res.status(400).json({
+      status: "ERROR",
+      message: `Each plan supports up to ${OUTDOOR_CONFIG.maxImagesPerPlan} images.`
+    });
   }
 
   await withLock(`OUTDOOR_${uuid}`, async () => {
+    const now = getUnixTime();
     const acc = OUTDOOR_ACCOUNTS.get(uuid);
+    pruneExpiredPlansForAccount(acc, now);
+
     const plan = (acc.plans || []).find(p => p.name.toLowerCase() === String(planName || "").toLowerCase());
     if (!plan) {
-      return res.status(404).json({ status: "ERROR", message: "Plan not found." });
+      return res.status(404).json({ status: "ERROR", message: "Plan not found or already deleted." });
     }
 
-    plan.textureUuid = tex.toLowerCase();
-    plan.updatedAt = getUnixTime();
+    plan.images = cleanImages;
+    plan.updatedAt = now;
     await saveOutdoorAccount(acc);
 
     res.json({
       status: "OK",
       planName: plan.name,
-      textureUuid: plan.textureUuid
+      images: plan.images,
+      maxImagesPerPlan: OUTDOOR_CONFIG.maxImagesPerPlan
     });
   });
 });
+
+// 14. Website Admin Mode: list all players and their plans
+app.post("/outdoor/web/admin/players", async (req, res) => {
+  const { legacyName, password } = req.body;
+  const lookup = normalizeLegacyName(legacyName).toLowerCase();
+  const pass = String(password || "").trim();
+
+  const uuid = OUTDOOR_NAME_MAP.get(lookup);
+  const adminAcc = uuid ? OUTDOOR_ACCOUNTS.get(uuid) : null;
+  if (!adminAcc || adminAcc.password !== pass) {
+    return res.status(401).json({ status: "ERROR", message: "Unauthorized." });
+  }
+  if (!adminAcc.isAdmin) {
+    return res.status(403).json({ status: "ADMIN_REVOKED", message: "Your Admin privileges were revoked." });
+  }
+
+  await pruneAllOutdoorPlans();
+  const now = getUnixTime();
+  const players = [];
+
+  for (const acc of OUTDOOR_ACCOUNTS.values()) {
+    players.push({
+      uuid: acc.uuid,
+      legacyName: acc.legacyName,
+      isAdmin: Boolean(acc.isAdmin),
+      plans: (acc.plans || []).map(p => serializePlanForClient(p, acc.isAdmin, now))
+    });
+  }
+
+  players.sort((a, b) => a.legacyName.localeCompare(b.legacyName));
+  res.json({
+    status: "OK",
+    maxImagesPerPlan: OUTDOOR_CONFIG.maxImagesPerPlan,
+    players
+  });
+});
+
+// 15. Website Admin Mode: delete a prohibited image from any player's plan
+app.post("/outdoor/web/admin/delete-image", async (req, res) => {
+  const { legacyName, password, targetUuid, planName, imageIndex, imageUuid } = req.body;
+  const lookup = normalizeLegacyName(legacyName).toLowerCase();
+  const pass = String(password || "").trim();
+
+  const uuid = OUTDOOR_NAME_MAP.get(lookup);
+  const adminAcc = uuid ? OUTDOOR_ACCOUNTS.get(uuid) : null;
+  if (!adminAcc || adminAcc.password !== pass) {
+    return res.status(401).json({ status: "ERROR", message: "Unauthorized." });
+  }
+  if (!adminAcc.isAdmin) {
+    return res.status(403).json({ status: "ADMIN_REVOKED", message: "Your Admin privileges were revoked." });
+  }
+
+  const cleanTarget = String(targetUuid || "").trim().toLowerCase();
+  await withLock(`OUTDOOR_${cleanTarget}`, async () => {
+    const targetAcc = OUTDOOR_ACCOUNTS.get(cleanTarget);
+    if (!targetAcc) return res.status(404).json({ status: "ERROR", message: "Target player not found." });
+
+    const plan = (targetAcc.plans || []).find(p => p.name.toLowerCase() === String(planName || "").toLowerCase());
+    if (!plan || !Array.isArray(plan.images)) {
+      return res.status(404).json({ status: "ERROR", message: "Target plan not found." });
+    }
+
+    const idx = parseInt(imageIndex, 10);
+    if (!isNaN(idx) && idx >= 0 && idx < plan.images.length && (!imageUuid || plan.images[idx] === String(imageUuid).toLowerCase())) {
+      plan.images.splice(idx, 1);
+    } else if (imageUuid) {
+      const foundIdx = plan.images.indexOf(String(imageUuid).toLowerCase());
+      if (foundIdx !== -1) plan.images.splice(foundIdx, 1);
+    }
+
+    plan.updatedAt = getUnixTime();
+    await saveOutdoorAccount(targetAcc);
+
+    res.json({
+      status: "OK",
+      targetUuid: cleanTarget,
+      planName: plan.name,
+      images: plan.images
+    });
+  });
+});
+///////////////////////////////////////////////////////////////////
+
 app.get("/", (req, res) => res.json({ status: "ok" }));
 app.listen(PORT, () => console.log("API running on port", PORT));
