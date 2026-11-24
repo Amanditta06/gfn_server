@@ -92,7 +92,94 @@ let OIL_CONFIG = {
 let OIL_ZONES = new Map();
 let OIL_TANK_LEDGER = new Map();
 let OIL_SCAN_COOLDOWN = new Map();
+// ========================================================
+// LED OUTDOOR COMMERCIAL AD SYSTEM
+// ========================================================
+const OUTDOOR_CHUNK_SIZE = 40; // 40 UUIDs por pacote (~1.5KB, seguro para LSL 16KB/Mono)
+const OUTDOOR_WEEK_SECONDS = 604800; // 7 dias em segundos
 
+let OUTDOOR_CONFIG = {
+  weeklyPrice: 100 // Preço padrão de 1 semana em L$
+};
+
+let OUTDOOR_ACCOUNTS = new Map(); // uuid -> { uuid, legacyName, password, plans: [] }
+let OUTDOOR_NAME_MAP = new Map(); // legacyNameLower -> uuid
+
+function normalizeLegacyName(raw) {
+  if (!raw) return "";
+  let clean = String(raw).trim().replace(/\s+/g, " ");
+  if (clean.toLowerCase().endsWith(" resident")) {
+    clean = clean.slice(0, -9).trim();
+  }
+  return clean;
+}
+
+function isValidUuid(str) {
+  return typeof str === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str.trim());
+}
+
+function formatRemainingShort(seconds) {
+  if (seconds <= 0) return "EXPIRED";
+  const days = Math.floor(seconds / 86400);
+  const hrs = Math.floor((seconds % 86400) / 3600);
+  const mins = Math.floor((seconds % 3600) / 60);
+  if (days > 0) return `${days}d ${hrs}h`;
+  if (hrs > 0) return `${hrs}h ${mins}m`;
+  return `${Math.max(1, mins)}m`;
+}
+
+async function initOutdoorSystem() {
+  if (!DATABASE_URL) return;
+  try {
+    const cfgRes = await dbGet("OUTDOOR_CONFIG");
+    if (cfgRes) {
+      try { OUTDOOR_CONFIG = { ...OUTDOOR_CONFIG, ...JSON.parse(cfgRes) }; } catch (e) {}
+    } else {
+      await dbSet("OUTDOOR_CONFIG", JSON.stringify(OUTDOOR_CONFIG));
+    }
+
+    OUTDOOR_ACCOUNTS.clear();
+    OUTDOOR_NAME_MAP.clear();
+
+    const q = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'outdoor_acc_%'");
+    for (const row of q.rows) {
+      try {
+        const acc = JSON.parse(row.value);
+        if (acc && acc.uuid) {
+          OUTDOOR_ACCOUNTS.set(acc.uuid, acc);
+          if (acc.legacyName) {
+            OUTDOOR_NAME_MAP.set(normalizeLegacyName(acc.legacyName).toLowerCase(), acc.uuid);
+          }
+        }
+      } catch (e) {}
+    }
+    console.log(`[OUTDOOR] Loaded ${OUTDOOR_ACCOUNTS.size} accounts. Weekly price: L$${OUTDOOR_CONFIG.weeklyPrice}`);
+  } catch (e) {
+    console.error("Erro no initOutdoorSystem:", e);
+  }
+}
+
+async function saveOutdoorAccount(acc) {
+  OUTDOOR_ACCOUNTS.set(acc.uuid, acc);
+  if (acc.legacyName) {
+    OUTDOOR_NAME_MAP.set(normalizeLegacyName(acc.legacyName).toLowerCase(), acc.uuid);
+  }
+  await dbSet(`outdoor_acc_${acc.uuid}`, JSON.stringify(acc));
+}
+
+function getActiveOutdoorAdsList() {
+  const now = getUnixTime();
+  const activeUuids = [];
+  for (const acc of OUTDOOR_ACCOUNTS.values()) {
+    if (!Array.isArray(acc.plans)) continue;
+    for (const p of acc.plans) {
+      if (p.expiresAt > now && isValidUuid(p.textureUuid)) {
+        activeUuids.push(p.textureUuid.trim().toLowerCase());
+      }
+    }
+  }
+  return activeUuids;
+}
 // ========================================================
 // CORE HELPERS & LOCKS
 // ========================================================
@@ -853,7 +940,8 @@ async function ensureTable() {
     await initOilSystemOnBoot();
     await initGacha();
     await healAllContinentsOnBoot();
-
+    await initOutdoorSystem();
+    
     const lastRankRes = await dbGet("lastWeekTopFive");
     if (lastRankRes) {
        await processHallOfFame(lastRankRes);
@@ -2515,6 +2603,249 @@ app.post("/gacha/build", requireToken, async (req, res) => {
 
   res.json({ status: "success", object_uuid, config });
 });
+// ========================================================
+// LED OUTDOOR ENDPOINTS
+// ========================================================
 
+// 1. Puxar UUIDs parcelados em chunks para o Outdoor LED
+app.get("/outdoor/ads", (req, res) => {
+  const activeAds = getActiveOutdoorAdsList();
+  const totalAds = activeAds.length;
+
+  if (totalAds === 0) {
+    return res.json({ status: "OK", chunk: 1, totalChunks: 1, totalAds: 0, value: "" });
+  }
+
+  const totalChunks = Math.ceil(totalAds / OUTDOOR_CHUNK_SIZE);
+  let chunk = parseInt(req.query.chunk, 10) || 1;
+  if (chunk < 1 || chunk > totalChunks) chunk = 1;
+
+  const start = (chunk - 1) * OUTDOOR_CHUNK_SIZE;
+  const slice = activeAds.slice(start, start + OUTDOOR_CHUNK_SIZE);
+
+  res.json({
+    status: "OK",
+    chunk,
+    totalChunks,
+    totalAds,
+    value: slice.join("ç")
+  });
+});
+
+// 2. Terminal busca preço semanal + planos do player
+app.get("/outdoor/player", requireToken, (req, res) => {
+  const uuid = String(req.query.uuid || "").trim().toLowerCase();
+  if (!uuid) return res.status(400).json({ error: "missing uuid" });
+
+  const acc = OUTDOOR_ACCOUNTS.get(uuid);
+  const now = getUnixTime();
+  let planEntries = [];
+
+  if (acc && Array.isArray(acc.plans)) {
+    planEntries = acc.plans.map(p => {
+      const rem = Math.max(0, (p.expiresAt || 0) - now);
+      return `${p.name}|${formatRemainingShort(rem)}`;
+    });
+  }
+
+  res.json({
+    status: "OK",
+    weeklyPrice: OUTDOOR_CONFIG.weeklyPrice,
+    hasPassword: Boolean(acc && acc.password),
+    plans: planEntries.join("ç")
+  });
+});
+
+// 3. Terminal registra pagamento (criação ou renovação de plano + senha automática na 1ª vez)
+app.post("/outdoor/pay", requireToken, async (req, res) => {
+  const { uuid, legacyName, planName, weeks, autoPassword } = req.body;
+  const cleanUuid = String(uuid || "").trim().toLowerCase();
+  const cleanName = normalizeLegacyName(legacyName);
+  const cleanPlan = stripControlChars(planName || "").replace(/[ç|"#<>]/g, "").trim();
+  const numWeeks = parseInt(weeks, 10) || 0;
+
+  if (!cleanUuid || !cleanPlan || numWeeks < 1 || numWeeks > 4) {
+    return res.status(400).json({ status: "ERROR", message: "Invalid payment payload." });
+  }
+
+  await withLock(`OUTDOOR_${cleanUuid}`, async () => {
+    const now = getUnixTime();
+    let acc = OUTDOOR_ACCOUNTS.get(cleanUuid);
+    let isNewPassword = false;
+
+    if (!acc) {
+      acc = {
+        uuid: cleanUuid,
+        legacyName: cleanName || cleanUuid,
+        password: String(autoPassword || "").trim(),
+        plans: []
+      };
+      isNewPassword = true;
+    } else {
+      if (cleanName) acc.legacyName = cleanName;
+      if (!acc.password && autoPassword) {
+        acc.password = String(autoPassword).trim();
+        isNewPassword = true;
+      }
+      if (!Array.isArray(acc.plans)) acc.plans = [];
+    }
+
+    const addSeconds = numWeeks * OUTDOOR_WEEK_SECONDS;
+    let existing = acc.plans.find(p => p.name.toLowerCase() === cleanPlan.toLowerCase());
+
+    if (existing) {
+      const baseTime = existing.expiresAt > now ? existing.expiresAt : now;
+      existing.expiresAt = baseTime + addSeconds;
+      existing.updatedAt = now;
+    } else {
+      existing = {
+        name: cleanPlan,
+        expiresAt: now + addSeconds,
+        textureUuid: "",
+        updatedAt: now
+      };
+      acc.plans.push(existing);
+    }
+
+    await saveOutdoorAccount(acc);
+
+    const remainingText = formatRemainingShort(existing.expiresAt - now);
+    res.json({
+      status: "OK",
+      isNewPassword: isNewPassword ? 1 : 0,
+      password: isNewPassword ? acc.password : "",
+      legacyName: acc.legacyName,
+      planName: existing.name,
+      remaining: remainingText
+    });
+  });
+});
+
+// 4. Terminal altera ou define senha do player ([PASS])
+app.post("/outdoor/set-password", requireToken, async (req, res) => {
+  const { uuid, legacyName, password } = req.body;
+  const cleanUuid = String(uuid || "").trim().toLowerCase();
+  const cleanName = normalizeLegacyName(legacyName);
+  const cleanPass = String(password || "").trim();
+
+  if (!cleanUuid || cleanPass.length < 4 || cleanPass.length > 24) {
+    return res.status(400).json({ status: "ERROR", message: "Password must be 4-24 characters." });
+  }
+
+  await withLock(`OUTDOOR_${cleanUuid}`, async () => {
+    let acc = OUTDOOR_ACCOUNTS.get(cleanUuid);
+    if (!acc) {
+      acc = {
+        uuid: cleanUuid,
+        legacyName: cleanName || cleanUuid,
+        password: cleanPass,
+        plans: []
+      };
+    } else {
+      if (cleanName) acc.legacyName = cleanName;
+      acc.password = cleanPass;
+    }
+
+    await saveOutdoorAccount(acc);
+    res.json({ status: "OK", legacyName: acc.legacyName });
+  });
+});
+
+// 5. Painel Admin: consultar preço e estatísticas
+app.get("/outdoor/admin/info", requireToken, (req, res) => {
+  const activeAds = getActiveOutdoorAdsList().length;
+  res.json({
+    status: "OK",
+    weeklyPrice: OUTDOOR_CONFIG.weeklyPrice,
+    totalAccounts: OUTDOOR_ACCOUNTS.size,
+    activeAds
+  });
+});
+
+// 6. Painel Admin: atualizar preço semanal
+app.post("/outdoor/admin/set-price", requireToken, async (req, res) => {
+  const newPrice = parseInt(req.body.weeklyPrice, 10);
+  if (isNaN(newPrice) || newPrice < 5 || newPrice > 100000) {
+    return res.status(400).json({ status: "ERROR", message: "Price must be between 5 and 100000 L$." });
+  }
+
+  OUTDOOR_CONFIG.weeklyPrice = newPrice;
+  await dbSet("OUTDOOR_CONFIG", JSON.stringify(OUTDOOR_CONFIG));
+  res.json({ status: "OK", weeklyPrice: OUTDOOR_CONFIG.weeklyPrice });
+});
+
+// 7. Site Google Sites: login com Legacy Name (sem "Resident") e senha
+app.post("/outdoor/web/login", (req, res) => {
+  const { legacyName, password } = req.body;
+  const lookup = normalizeLegacyName(legacyName).toLowerCase();
+  const pass = String(password || "").trim();
+
+  if (!lookup || !pass) {
+    return res.status(400).json({ status: "ERROR", message: "Please enter your Legacy Name and Password." });
+  }
+
+  const uuid = OUTDOOR_NAME_MAP.get(lookup);
+  if (!uuid) {
+    return res.status(401).json({ status: "ERROR", message: "Account not found. Buy a plan or set a password at the in-world terminal first." });
+  }
+
+  const acc = OUTDOOR_ACCOUNTS.get(uuid);
+  if (!acc || acc.password !== pass) {
+    return res.status(401).json({ status: "ERROR", message: "Invalid password." });
+  }
+
+  const now = getUnixTime();
+  const plans = (acc.plans || []).map(p => ({
+    name: p.name,
+    expiresAt: p.expiresAt || 0,
+    active: (p.expiresAt || 0) > now,
+    remainingSeconds: Math.max(0, (p.expiresAt || 0) - now),
+    textureUuid: p.textureUuid || ""
+  }));
+
+  res.json({
+    status: "OK",
+    legacyName: acc.legacyName,
+    plans
+  });
+});
+
+// 8. Site Google Sites: atualizar UUID da imagem de um plano
+app.post("/outdoor/web/update-image", async (req, res) => {
+  const { legacyName, password, planName, textureUuid } = req.body;
+  const lookup = normalizeLegacyName(legacyName).toLowerCase();
+  const pass = String(password || "").trim();
+  const tex = String(textureUuid || "").trim();
+
+  const uuid = OUTDOOR_NAME_MAP.get(lookup);
+  if (!uuid) return res.status(401).json({ status: "ERROR", message: "Unauthorized." });
+
+  const accCheck = OUTDOOR_ACCOUNTS.get(uuid);
+  if (!accCheck || accCheck.password !== pass) {
+    return res.status(401).json({ status: "ERROR", message: "Invalid credentials." });
+  }
+
+  if (tex !== "" && !isValidUuid(tex)) {
+    return res.status(400).json({ status: "ERROR", message: "Invalid Texture UUID format." });
+  }
+
+  await withLock(`OUTDOOR_${uuid}`, async () => {
+    const acc = OUTDOOR_ACCOUNTS.get(uuid);
+    const plan = (acc.plans || []).find(p => p.name.toLowerCase() === String(planName || "").toLowerCase());
+    if (!plan) {
+      return res.status(404).json({ status: "ERROR", message: "Plan not found." });
+    }
+
+    plan.textureUuid = tex.toLowerCase();
+    plan.updatedAt = getUnixTime();
+    await saveOutdoorAccount(acc);
+
+    res.json({
+      status: "OK",
+      planName: plan.name,
+      textureUuid: plan.textureUuid
+    });
+  });
+});
 app.get("/", (req, res) => res.json({ status: "ok" }));
 app.listen(PORT, () => console.log("API running on port", PORT));
