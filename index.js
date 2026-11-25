@@ -93,10 +93,11 @@ let OIL_ZONES = new Map();
 let OIL_TANK_LEDGER = new Map();
 let OIL_SCAN_COOLDOWN = new Map();
 // ========================================================
-// LED OUTDOOR COMMERCIAL AD SYSTEM (MULTI-IMAGE + ADMIN)
+// LED OUTDOOR COMMERCIAL AD SYSTEM (MULTI-IMAGE + LINKS + ADMIN)
 // ========================================================
-const OUTDOOR_CHUNK_SIZE = 40;
+const OUTDOOR_CHUNK_SIZE = 25; // Reduzido para 25 por pacote para comportar UUID + Link com folga nos 16KB do LSL
 const OUTDOOR_WEEK_SECONDS = 604800; // 7 days in seconds
+const OUTDOOR_MAX_LINK_LEN = 250;
 
 let OUTDOOR_CONFIG = {
   weeklyPrice: 100,
@@ -117,6 +118,47 @@ function normalizeLegacyName(raw) {
 
 function isValidUuid(str) {
   return typeof str === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str.trim());
+}
+
+// Valida se a string é um link HTTP/HTTPS ou Second Life SLURL válido
+function isValidAdLink(raw) {
+  if (typeof raw !== "string") return false;
+  const s = raw.trim();
+  if (!s) return false;
+  if (s.length > OUTDOOR_MAX_LINK_LEN) return false;
+  if (/[\sç|"<>\x00-\x1F\x7F]/.test(s)) return false;
+
+  // Aceita SLURLs do Second Life (ex: secondlife://Region/128/128/25 ou secondlife:///app/...)
+  if (/^secondlife:\/\//i.test(s)) {
+    const rest = s.slice(13);
+    return rest.length >= 3;
+  }
+
+  // Aceita apenas http:// ou https:// com domínio válido
+  try {
+    const u = new URL(s);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+    if (!u.hostname || !u.hostname.includes(".")) return false;
+    if (u.hostname.startsWith(".") || u.hostname.endsWith(".")) return false;
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function normalizeImageEntry(entry) {
+  if (typeof entry === "string") {
+    const u = entry.trim().toLowerCase();
+    return isValidUuid(u) ? { uuid: u, link: "" } : null;
+  }
+  if (entry && typeof entry === "object") {
+    const u = String(entry.uuid || "").trim().toLowerCase();
+    if (!isValidUuid(u)) return null;
+    const rawLink = String(entry.link || "").trim();
+    const safeLink = isValidAdLink(rawLink) ? rawLink : "";
+    return { uuid: u, link: safeLink };
+  }
+  return null;
 }
 
 function formatRemainingShort(seconds) {
@@ -144,23 +186,39 @@ function pruneExpiredPlansForAccount(acc, now = getUnixTime()) {
 
   const kept = [];
   for (const p of acc.plans) {
-    // Migrate legacy single textureUuid -> images array
+    // Migra formato antigo (textureUuid ou array de strings) para [{ uuid, link }]
     if (!Array.isArray(p.images)) {
       p.images = [];
       if (p.textureUuid && isValidUuid(p.textureUuid)) {
-        p.images.push(p.textureUuid.trim().toLowerCase());
+        p.images.push({ uuid: p.textureUuid.trim().toLowerCase(), link: "" });
       }
       delete p.textureUuid;
       changed = true;
+    } else {
+      const normalized = [];
+      let imgChanged = false;
+      for (const item of p.images) {
+        const norm = normalizeImageEntry(item);
+        if (!norm) {
+          imgChanged = true;
+          continue;
+        }
+        if (typeof item === "string" || item.uuid !== norm.uuid || (item.link || "") !== norm.link) {
+          imgChanged = true;
+        }
+        normalized.push(norm);
+      }
+      if (imgChanged) {
+        p.images = normalized;
+        changed = true;
+      }
     }
 
-    // Active Admin free infinite plan never expires
     if (acc.isAdmin && p.isAdminFree) {
       kept.push(p);
       continue;
     }
 
-    // Safety check: if no longer admin, convert free plan to expired waiting for payment
     if (!acc.isAdmin && p.isAdminFree) {
       p.isAdminFree = false;
       p.wasAdminFree = true;
@@ -168,10 +226,9 @@ function pruneExpiredPlansForAccount(acc, now = getUnixTime()) {
       changed = true;
     }
 
-    // 1-week grace period after expiration before permanent deletion
     const deleteAt = (p.expiresAt || 0) + OUTDOOR_WEEK_SECONDS;
     if (now >= deleteAt) {
-      changed = true; // Permanently delete plan and all its images
+      changed = true;
     } else {
       kept.push(p);
     }
@@ -207,6 +264,10 @@ function serializePlanForClient(p, isAdmin, now = getUnixTime()) {
   const remainingSeconds = isInfinite ? -1 : Math.max(0, (p.expiresAt || 0) - now);
   const graceRemainingSeconds = active ? 0 : Math.max(0, ((p.expiresAt || 0) + OUTDOOR_WEEK_SECONDS) - now);
 
+  const normalizedImgs = (Array.isArray(p.images) ? p.images : [])
+    .map(normalizeImageEntry)
+    .filter(Boolean);
+
   return {
     name: p.name,
     isAdminFree: isInfinite,
@@ -214,7 +275,7 @@ function serializePlanForClient(p, isAdmin, now = getUnixTime()) {
     expiresAt: p.expiresAt || 0,
     remainingSeconds,
     graceRemainingSeconds,
-    images: Array.isArray(p.images) ? p.images : []
+    images: normalizedImgs
   };
 }
 
@@ -252,10 +313,11 @@ async function initOutdoorSystem() {
   }
 }
 
+// Retorna cada entrada no formato "uuid|link" (revalidando o link antes de enviar ao outdoor)
 function getActiveOutdoorAdsList() {
   const now = getUnixTime();
   const maxImgs = OUTDOOR_CONFIG.maxImagesPerPlan || 5;
-  const activeUuids = [];
+  const activeEntries = [];
 
   for (const acc of OUTDOOR_ACCOUNTS.values()) {
     if (!Array.isArray(acc.plans)) continue;
@@ -264,17 +326,17 @@ function getActiveOutdoorAdsList() {
       if (!isActive || !Array.isArray(p.images)) continue;
 
       const allowed = p.images.slice(0, maxImgs);
-      for (const tex of allowed) {
-        if (isValidUuid(tex)) {
-          activeUuids.push(tex.trim().toLowerCase());
-        }
+      for (const rawItem of allowed) {
+        const item = normalizeImageEntry(rawItem);
+        if (!item) continue;
+        const verifiedLink = isValidAdLink(item.link) ? item.link : "";
+        activeEntries.push(`${item.uuid}|${verifiedLink}`);
       }
     }
   }
-  return activeUuids;
+  return activeEntries;
 }
 
-// Periodic cleanup every 10 minutes to delete plans past the 1-week grace period
 setInterval(pruneAllOutdoorPlans, 10 * 60 * 1000);
 /////////////////////////////////////////////////////////////////////////////////////////
 
@@ -3083,7 +3145,7 @@ app.post("/outdoor/web/status", (req, res) => {
   });
 });
 
-// 13. Website: player updates up to maxImagesPerPlan image UUIDs on their plan
+// 13. Website: player updates up to maxImagesPerPlan image UUIDs + optional validated links
 app.post("/outdoor/web/update-images", async (req, res) => {
   const { legacyName, password, planName, images } = req.body;
   const lookup = normalizeLegacyName(legacyName).toLowerCase();
@@ -3100,13 +3162,30 @@ app.post("/outdoor/web/update-images", async (req, res) => {
   }
 
   const cleanImages = [];
-  for (const raw of images) {
-    const s = String(raw || "").trim();
-    if (!s) continue;
-    if (!isValidUuid(s)) {
-      return res.status(400).json({ status: "ERROR", message: `Invalid Texture UUID: ${s}` });
+  for (let i = 0; i < images.length; i++) {
+    const raw = images[i];
+    const rawUuid = typeof raw === "string" ? raw.trim() : String(raw?.uuid || "").trim();
+    const rawLink = typeof raw === "string" ? "" : String(raw?.link || "").trim();
+
+    if (!rawUuid && !rawLink) continue;
+
+    if (!rawUuid && rawLink) {
+      return res.status(400).json({ status: "ERROR", message: `Slot #${i + 1} has a link but no Texture UUID.` });
     }
-    cleanImages.push(s.toLowerCase());
+    if (!isValidUuid(rawUuid)) {
+      return res.status(400).json({ status: "ERROR", message: `Invalid Texture UUID in slot #${i + 1}: ${rawUuid}` });
+    }
+    if (rawLink && !isValidAdLink(rawLink)) {
+      return res.status(400).json({
+        status: "ERROR",
+        message: `Invalid link in slot #${i + 1}. Must be a valid http://, https://, or secondlife:// URL (max ${OUTDOOR_MAX_LINK_LEN} chars, no spaces).`
+      });
+    }
+
+    cleanImages.push({
+      uuid: rawUuid.toLowerCase(),
+      link: rawLink
+    });
   }
 
   if (cleanImages.length > OUTDOOR_CONFIG.maxImagesPerPlan) {
@@ -3175,7 +3254,7 @@ app.post("/outdoor/web/admin/players", async (req, res) => {
   });
 });
 
-// 15. Website Admin Mode: delete a prohibited image from any player's plan
+// 15. Website Admin Mode: delete a prohibited image (and its link) from any player's plan
 app.post("/outdoor/web/admin/delete-image", async (req, res) => {
   const { legacyName, password, targetUuid, planName, imageIndex, imageUuid } = req.body;
   const lookup = normalizeLegacyName(legacyName).toLowerCase();
@@ -3200,11 +3279,14 @@ app.post("/outdoor/web/admin/delete-image", async (req, res) => {
       return res.status(404).json({ status: "ERROR", message: "Target plan not found." });
     }
 
+    const getEntryUuid = (entry) => (typeof entry === "string" ? entry : (entry?.uuid || "")).toLowerCase();
+    const targetImgUuid = String(imageUuid || "").toLowerCase();
     const idx = parseInt(imageIndex, 10);
-    if (!isNaN(idx) && idx >= 0 && idx < plan.images.length && (!imageUuid || plan.images[idx] === String(imageUuid).toLowerCase())) {
+
+    if (!isNaN(idx) && idx >= 0 && idx < plan.images.length && (!targetImgUuid || getEntryUuid(plan.images[idx]) === targetImgUuid)) {
       plan.images.splice(idx, 1);
-    } else if (imageUuid) {
-      const foundIdx = plan.images.indexOf(String(imageUuid).toLowerCase());
+    } else if (targetImgUuid) {
+      const foundIdx = plan.images.findIndex(entry => getEntryUuid(entry) === targetImgUuid);
       if (foundIdx !== -1) plan.images.splice(foundIdx, 1);
     }
 
