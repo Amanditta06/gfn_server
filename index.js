@@ -3320,11 +3320,11 @@ const FACTION_PARCELS = new Map();        // parcelUuid -> parcelObj
 const FACTION_CONQUER_DEBOUNCE = new Map(); // parcelUuid -> { factionId, time }
 
 // XP & Capacity Tuning
-const FACTION_BASE_SQM_LIMIT = 2048;
+const FACTION_BASE_SQM_LIMIT = 4096;
 const FACTION_SQM_PER_LEVEL  = 512;
-const FACTION_XP_PER_1K_ALLY    = 2.0;   // Pouco XP (mesma facção)
-const FACTION_XP_PER_1K_NEUTRAL = 5.0;   // XP médio (vendedor sem facção)
-const FACTION_XP_PER_1K_RIVAL   = 10.0;  // Bastante XP (facção rival)
+const FACTION_XP_PER_1K_ALLY    = 5.0;   // Pouco XP (mesma facção)
+const FACTION_XP_PER_1K_NEUTRAL = 15.0;   // XP médio (vendedor sem facção)
+const FACTION_XP_PER_1K_RIVAL   = 30.0;  // Bastante XP (facção rival)
 const FACTION_MAX_RIVAL_PENALTY_PCT = 60.0;
 
 // Short 10-char password hashed from uuid + unixTime + GFNF
