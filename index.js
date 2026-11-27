@@ -3390,12 +3390,27 @@ async function pushFactionNews(type, text, meta = {}) {
     FACTION_NEWS_DEBOUNCE.set(meta.debounceKey, now);
   }
 
+  const cleanParcel  = meta.parcelUuid ? String(meta.parcelUuid).toLowerCase() : "";
+  const cleanFacId   = meta.factionId ? String(meta.factionId) : "";
+  const cleanFacName = meta.factionName ? String(meta.factionName).toLowerCase() : "";
+
+  // Remove notícias anteriores da MESMA gangue na MESMA parcela
+  if (cleanParcel && (cleanFacId || cleanFacName)) {
+    FACTION_NEWS = FACTION_NEWS.filter(n => {
+      if (String(n.parcelUuid || "").toLowerCase() !== cleanParcel) return true;
+      if (cleanFacId && n.factionId && n.factionId === cleanFacId) return false;
+      if (!n.factionId && cleanFacName && String(n.text || "").toLowerCase().includes(cleanFacName)) return false;
+      return true;
+    });
+  }
+
   const item = {
     id: `n_${now}_${crypto.randomBytes(2).toString("hex")}`,
     type: String(type || "INFO"),
     text: String(text || "").slice(0, 220),
     regionName: meta.regionName || "",
-    parcelUuid: meta.parcelUuid || "",
+    parcelUuid: cleanParcel,
+    factionId: cleanFacId,
     time: now
   };
 
@@ -3432,11 +3447,15 @@ function reportFailedCapture(cap) {
     text = `❌ ${cap.attackerFacName} tried to take control of "${pName}" in ${reg}, but failed!`;
   }
 
+  FACTION_NEWS_DEBOUNCE.delete(`cap_${cap.parcelUuid}_${cap.attackerFacId}`);
+
   pushFactionNews("CAPTURE_FAILED", text, {
     regionName: reg,
     parcelUuid: cap.parcelUuid || "",
+    factionId: cap.attackerFacId || "",
+    factionName: cap.attackerFacName || "",
     debounceKey: `fail_${cap.parcelUuid}_${cap.attackerFacId}`,
-    debounceSec: 25
+    debounceSec: 15
   }).catch(() => {});
 }
 
@@ -4781,23 +4800,33 @@ app.post("/faction/capture-ping", requireToken, async (req, res) => {
   });
 
   if (isNewAttack) {
+    FACTION_NEWS_DEBOUNCE.delete(`fail_${cleanParcel}_${attackerFac.id}`);
+    const newsMeta = {
+      regionName: cleanReg,
+      parcelUuid: cleanParcel,
+      factionId: attackerFac.id,
+      factionName: attackerFac.name,
+      debounceKey: `cap_${cleanParcel}_${attackerFac.id}`,
+      debounceSec: 15
+    };
+
     if (isNeutral) {
       await pushFactionNews(
         "NEUTRAL_CLAIMING",
         `🏴 ${attackerFac.name} started claiming "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm)!`,
-        { regionName: cleanReg, parcelUuid: cleanParcel, debounceKey: `cap_${cleanParcel}_${attackerFac.id}`, debounceSec: 20 }
+        newsMeta
       );
     } else if (isAllySteal) {
       await pushFactionNews(
         "ALLY_STEAL_START",
         `🔪 BETRAYAL IN PROGRESS! ${attackerFac.name} is trying to steal "${cleanPName}" in ${cleanReg} from ally ${defenderFac.name}!`,
-        { regionName: cleanReg, parcelUuid: cleanParcel, debounceKey: `cap_${cleanParcel}_${attackerFac.id}`, debounceSec: 20 }
+        newsMeta
       );
     } else {
       await pushFactionNews(
         "UNDER_ATTACK",
         `🚨 TURF UNDER ATTACK! ${attackerFac.name} is attacking ${defenderFac.name}'s turf "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm)!`,
-        { regionName: cleanReg, parcelUuid: cleanParcel, debounceKey: `cap_${cleanParcel}_${attackerFac.id}`, debounceSec: 20 }
+        newsMeta
       );
     }
   }
@@ -4906,12 +4935,21 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
     await saveFactionParcel(parcelObj);
     const updatedStats = getFactionTerritoryStats(fac.id);
 
-    // Publica notícia de conquista bem-sucedida na Street News
+    // Publica notícia de conquista bem-sucedida na Street News (substituindo notícias anteriores da mesma gangue nesta parcela)
+    FACTION_NEWS_DEBOUNCE.delete(`cap_${cleanParcel}_${fac.id}`);
+    FACTION_NEWS_DEBOUNCE.delete(`fail_${cleanParcel}_${fac.id}`);
+    const conquerNewsMeta = {
+      regionName: cleanReg,
+      parcelUuid: cleanParcel,
+      factionId: fac.id,
+      factionName: fac.name
+    };
+
     if (wasAllySteal && prevOwnerFac) {
       await pushFactionNews(
         "ALLY_STOLEN",
         `🐍 BETRAYAL! ${fac.name} just took control of "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm) by stealing it from ally ${prevOwnerFac.name}!`,
-        { regionName: cleanReg, parcelUuid: cleanParcel }
+        conquerNewsMeta
       );
       if (prevOwnerFac.leaderUuid) {
         await addPlayerMessage(
@@ -4923,13 +4961,13 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
       await pushFactionNews(
         "CONQUERED",
         `🔥 ${fac.name} just took control of "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm) from ${prevOwnerFac.name}!`,
-        { regionName: cleanReg, parcelUuid: cleanParcel }
+        conquerNewsMeta
       );
     } else {
       await pushFactionNews(
         "CLAIMED_NEUTRAL",
         `🏴 ${fac.name} just took control of "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm)!`,
-        { regionName: cleanReg, parcelUuid: cleanParcel }
+        conquerNewsMeta
       );
     }
 
