@@ -3311,13 +3311,21 @@ app.post("/outdoor/web/admin/delete-image", async (req, res) => {
 ///////////////////////////////////////////////////////////////////
 
 // ========================================================
-// STREET CONQUESTERS — FACTION & TERRITORY CONQUEST SYSTEM
+// STREET CONQUESTERS — FACTION, TERRITORY, XP & CARGO LINK
 // ========================================================
 const FACTIONS = new Map();               // factionId -> factionObj
 const FACTION_BY_MEMBER = new Map();      // memberUuid -> factionId
 const FACTION_BY_LEADER_NAME = new Map(); // leaderLegacyNameLower -> factionId
 const FACTION_PARCELS = new Map();        // parcelUuid -> parcelObj
 const FACTION_CONQUER_DEBOUNCE = new Map(); // parcelUuid -> { factionId, time }
+
+// XP & Capacity Tuning
+const FACTION_BASE_SQM_LIMIT = 2048;
+const FACTION_SQM_PER_LEVEL  = 512;
+const FACTION_XP_PER_1K_ALLY    = 2.0;   // Pouco XP (mesma facção)
+const FACTION_XP_PER_1K_NEUTRAL = 5.0;   // XP médio (vendedor sem facção)
+const FACTION_XP_PER_1K_RIVAL   = 10.0;  // Bastante XP (facção rival)
+const FACTION_MAX_RIVAL_PENALTY_PCT = 60.0;
 
 // Short 10-char password hashed from uuid + unixTime + GFNF
 function generateFactionPassword(avatarUuid, unixTime) {
@@ -3341,6 +3349,133 @@ function sanitizeFactionLogo(raw) {
   if (isValidUuid(s)) return s.toLowerCase();
   if (isValidAdLink(s)) return s;
   return null;
+}
+
+// RPG XP Curve: Level 0->1 = 50 XP, scaling x1.35 per level
+function getFactionXpStep(level) {
+  return Math.round(50 * Math.pow(1.35, level));
+}
+
+function computeFactionLevelInfo(totalXp) {
+  const safeTotal = Math.max(0, Number(totalXp) || 0);
+  let remaining = safeTotal;
+  let level = 0;
+  let needed = getFactionXpStep(level);
+
+  while (remaining >= needed && level < 500) {
+    remaining -= needed;
+    level++;
+    needed = getFactionXpStep(level);
+  }
+
+  const maxSqm = FACTION_BASE_SQM_LIMIT + (level * FACTION_SQM_PER_LEVEL);
+  return {
+    level,
+    totalXp: Math.round(safeTotal * 100) / 100,
+    currentLevelXp: Math.round(remaining * 100) / 100,
+    nextLevelXp: needed,
+    progressPct: Math.min(100, Math.round((remaining / needed) * 1000) / 10),
+    maxSqm
+  };
+}
+
+function getFactionTerritoryStats(factionId, excludeParcelUuid = "") {
+  let parcelCount = 0;
+  let totalArea = 0;
+  const ex = String(excludeParcelUuid || "").toLowerCase();
+  for (const p of FACTION_PARCELS.values()) {
+    if (p.factionId === factionId && p.parcelUuid !== ex) {
+      parcelCount++;
+      totalArea += Number(p.area) || 0;
+    }
+  }
+  return { parcelCount, totalArea };
+}
+
+// Called inside GFN /action "cargo sell" — modifies cargo value & awards faction XP
+async function applyFactionCargoEffect(userUuid, parcelUuid, baseCargoValue, currentPrice) {
+  const cleanParcel = String(parcelUuid || "").trim().toLowerCase();
+  const cleanUser = String(userUuid || "").trim().toLowerCase();
+  if (!cleanParcel || currentPrice <= 0) return currentPrice;
+
+  const parcelObj = FACTION_PARCELS.get(cleanParcel);
+  if (!parcelObj || !FACTIONS.has(parcelObj.factionId)) {
+    return currentPrice; // Neutral territory -> no changes
+  }
+
+  const ownerFac = FACTIONS.get(parcelObj.factionId);
+  const { totalArea: ownerTotalSqm } = getFactionTerritoryStats(ownerFac.id);
+
+  const sellerFacId = FACTION_BY_MEMBER.get(cleanUser);
+  const sellerFac = (sellerFacId && FACTIONS.has(sellerFacId)) ? FACTIONS.get(sellerFacId) : null;
+
+  let finalPrice = currentPrice;
+  let xpRatePer1k = FACTION_XP_PER_1K_NEUTRAL;
+
+  if (sellerFac && sellerFac.id === ownerFac.id) {
+    // SAME FACTION: +1% per 1,000 sqm controlled by the faction
+    xpRatePer1k = FACTION_XP_PER_1K_ALLY;
+    const bonusPct = ownerTotalSqm / 1000.0;
+    const bonusAmount = Math.round(currentPrice * (bonusPct / 100.0));
+    if (bonusAmount > 0) {
+      finalPrice = Math.min(MAX_TRANSACTION, currentPrice + bonusAmount);
+      await addPlayerMessage(
+        userUuid,
+        `🏴 [STREET CONQUESTERS] Friendly territory (${ownerFac.name})! +${bonusPct.toFixed(1)}% faction bonus (+${bonusAmount} F₵) from ${ownerTotalSqm.toLocaleString("en-US")} sqm controlled.`
+      );
+    }
+  } else if (sellerFac && sellerFac.id !== ownerFac.id) {
+    // RIVAL FACTION: dynamic penalty up to 60% based on SQM advantage (neutral if seller >= owner)
+    xpRatePer1k = FACTION_XP_PER_1K_RIVAL;
+    const { totalArea: sellerTotalSqm } = getFactionTerritoryStats(sellerFac.id);
+
+    if (sellerTotalSqm >= ownerTotalSqm) {
+      await addPlayerMessage(
+        userUuid,
+        `🛡 [STREET CONQUESTERS] Rival territory (${ownerFac.name}), but your faction's territory (${sellerTotalSqm.toLocaleString("en-US")} sqm) neutralized their cargo tax!`
+      );
+    } else {
+      const sqmDiff = ownerTotalSqm - sellerTotalSqm;
+      const penaltyPct = Math.min(FACTION_MAX_RIVAL_PENALTY_PCT, sqmDiff / 1000.0);
+      const penaltyAmount = Math.round(currentPrice * (penaltyPct / 100.0));
+      if (penaltyAmount > 0) {
+        finalPrice = Math.max(0, currentPrice - penaltyAmount);
+        await addPlayerMessage(
+          userUuid,
+          `⚔ [STREET CONQUESTERS] Rival territory (${ownerFac.name})! -${penaltyPct.toFixed(1)}% cargo tax (-${penaltyAmount} F₵) due to territorial disadvantage (${sellerTotalSqm.toLocaleString("en-US")} vs ${ownerTotalSqm.toLocaleString("en-US")} sqm).`
+        );
+      }
+    }
+  } else {
+    // NEUTRAL PLAYER (no faction): unchanged payout, medium XP for controlling faction
+    xpRatePer1k = FACTION_XP_PER_1K_NEUTRAL;
+  }
+
+  // Convert normal cargo value into XP for the territory's controlling faction
+  const safeBase = Math.max(0, Number(baseCargoValue) || 0);
+  const xpGain = Math.round(((safeBase / 1000.0) * xpRatePer1k) * 100) / 100;
+
+  if (xpGain > 0) {
+    await withLock("FACTION_GLOBAL_LOCK", async () => {
+      const liveFac = FACTIONS.get(ownerFac.id);
+      if (!liveFac) return;
+      const prevInfo = computeFactionLevelInfo(liveFac.xp || 0);
+      liveFac.xp = Math.round(((Number(liveFac.xp) || 0) + xpGain) * 100) / 100;
+      const newInfo = computeFactionLevelInfo(liveFac.xp);
+      liveFac.level = newInfo.level;
+      liveFac.updatedAt = getUnixTime();
+      await saveFaction(liveFac);
+
+      if (newInfo.level > prevInfo.level && liveFac.leaderUuid) {
+        await addPlayerMessage(
+          liveFac.leaderUuid,
+          `🎉 [STREET CONQUESTERS] Your faction "${liveFac.name}" reached LEVEL ${newInfo.level}! Territory capacity increased to ${newInfo.maxSqm.toLocaleString("en-US")} sqm.`
+        );
+      }
+    });
+  }
+
+  return finalPrice;
 }
 
 // Logarithmic thermal spectrum: 16 sqm (cold blue #0A2EFF) -> 65,536 sqm (hot red #F50A0A)
@@ -3558,6 +3693,11 @@ async function saveFactionParcel(parcelObj) {
   await dbSet(`faction_parcel_${parcelObj.parcelUuid}`, JSON.stringify(parcelObj));
 }
 
+async function deleteFactionParcelFromDb(parcelUuid) {
+  FACTION_PARCELS.delete(parcelUuid);
+  await db.query("DELETE FROM kvstore WHERE id=$1", [`faction_parcel_${parcelUuid}`]);
+}
+
 async function initFactionSystem() {
   if (!DATABASE_URL) return;
   try {
@@ -3570,7 +3710,11 @@ async function initFactionSystem() {
     for (const row of fq.rows) {
       try {
         const fac = JSON.parse(row.value);
-        if (fac && fac.id) FACTIONS.set(fac.id, fac);
+        if (fac && fac.id) {
+          if (typeof fac.xp !== "number") fac.xp = 0;
+          fac.level = computeFactionLevelInfo(fac.xp).level;
+          FACTIONS.set(fac.id, fac);
+        }
       } catch (e) {}
     }
     rebuildFactionIndexes();
@@ -3591,14 +3735,9 @@ async function initFactionSystem() {
 
 function serializeFactionPublic(fac) {
   const membersArr = Object.values(fac.members || {});
-  let parcelCount = 0;
-  let totalArea = 0;
-  for (const p of FACTION_PARCELS.values()) {
-    if (p.factionId === fac.id) {
-      parcelCount++;
-      totalArea += Number(p.area) || 0;
-    }
-  }
+  const { parcelCount, totalArea } = getFactionTerritoryStats(fac.id);
+  const lvl = computeFactionLevelInfo(fac.xp || 0);
+
   return {
     id: fac.id,
     name: fac.name,
@@ -3608,11 +3747,18 @@ function serializeFactionPublic(fac) {
     memberCount: membersArr.length,
     parcelCount,
     totalArea,
+    level: lvl.level,
+    totalXp: lvl.totalXp,
+    currentLevelXp: lvl.currentLevelXp,
+    nextLevelXp: lvl.nextLevelXp,
+    progressPct: lvl.progressPct,
+    maxSqm: lvl.maxSqm,
+    cargoBonusPct: Math.round((totalArea / 1000.0) * 100) / 100,
     createdAt: fac.createdAt
   };
 }
 
-// 1. LSL: sync player faction state
+// 1. LSL: sync player faction state (includes level, XP, used SQM and max SQM)
 app.get("/faction/player", requireToken, async (req, res) => {
   const cleanUuid = String(req.query.uuid || "").trim().toLowerCase();
   const cleanName = normalizeLegacyName(req.query.legacyName || "");
@@ -3633,6 +3779,9 @@ app.get("/faction/player", requireToken, async (req, res) => {
     await saveFaction(fac);
   }
 
+  const { totalArea } = getFactionTerritoryStats(fac.id);
+  const lvl = computeFactionLevelInfo(fac.xp || 0);
+
   res.json({
     status: "OK",
     inFaction: 1,
@@ -3642,7 +3791,12 @@ app.get("/faction/player", requireToken, async (req, res) => {
     role: member.role,
     leaderUuid: fac.leaderUuid,
     leaderName: fac.leaderName,
-    memberCount: Object.keys(fac.members || {}).length
+    memberCount: Object.keys(fac.members || {}).length,
+    level: lvl.level,
+    currentLevelXp: lvl.currentLevelXp,
+    nextLevelXp: lvl.nextLevelXp,
+    totalArea,
+    maxSqm: lvl.maxSqm
   });
 });
 
@@ -3681,6 +3835,8 @@ app.post("/faction/create", requireToken, async (req, res) => {
       leaderUuid: cleanUuid,
       leaderName: cleanUser,
       password,
+      xp: 0,
+      level: 0,
       createdAt: now,
       updatedAt: now,
       members: {
@@ -3694,6 +3850,7 @@ app.post("/faction/create", requireToken, async (req, res) => {
     };
 
     await saveFaction(newFac);
+    const lvl = computeFactionLevelInfo(0);
 
     res.json({
       status: "OK",
@@ -3703,7 +3860,12 @@ app.post("/faction/create", requireToken, async (req, res) => {
       leaderUuid: cleanUuid,
       login: cleanUser,
       password,
-      memberCount: 1
+      memberCount: 1,
+      level: lvl.level,
+      currentLevelXp: 0,
+      nextLevelXp: lvl.nextLevelXp,
+      totalArea: 0,
+      maxSqm: lvl.maxSqm
     });
   });
 });
@@ -3992,7 +4154,7 @@ app.get("/faction/parcel-status", requireToken, (req, res) => {
   });
 });
 
-// 8. LSL: register parcel conquest + exact borders + thermal color + logo center
+// 8. LSL: register parcel conquest (enforces faction level SQM limit)
 app.post("/faction/conquer", requireToken, async (req, res) => {
   const { factionId, winnerUuid, regionName, regionCorner, parcelUuid, parcelName, area, gridRows } = req.body;
   const cleanParcel = String(parcelUuid || "").trim().toLowerCase();
@@ -4015,10 +4177,22 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
     if (lastClaim && lastClaim.factionId === cleanFacId && (now - lastClaim.time) < 15) {
       return res.json({ status: "OK", deduplicated: 1, factionName: fac.name });
     }
-    FACTION_CONQUER_DEBOUNCE.set(cleanParcel, { factionId: cleanFacId, time: now });
 
     const geom = buildParcelGeometryFromGrid(gridRows);
     const finalArea = Math.max(16, parseInt(area, 10) || geom.scannedArea || 16);
+
+    // Authoritative Level SQM Limit Check
+    const lvl = computeFactionLevelInfo(fac.xp || 0);
+    const { totalArea: existingArea } = getFactionTerritoryStats(fac.id, cleanParcel);
+    if ((existingArea + finalArea) > lvl.maxSqm) {
+      return res.json({
+        status: "SQM_LIMIT",
+        message: `Territory limit exceeded! Level ${lvl.level} capacity is ${lvl.maxSqm.toLocaleString("en-US")} sqm (currently using ${existingArea.toLocaleString("en-US")} sqm; this parcel needs ${finalArea.toLocaleString("en-US")} sqm). Level up or abandon a territory on the website.`
+      });
+    }
+
+    FACTION_CONQUER_DEBOUNCE.set(cleanParcel, { factionId: cleanFacId, time: now });
+
     const colorHex = computeParcelThermalColor(finalArea);
 
     let cornerX = 0, cornerY = 0;
@@ -4045,12 +4219,15 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
     };
 
     await saveFactionParcel(parcelObj);
+    const updatedStats = getFactionTerritoryStats(fac.id);
 
     res.json({
       status: "OK",
       parcelUuid: cleanParcel,
       factionName: fac.name,
       area: finalArea,
+      totalArea: updatedStats.totalArea,
+      maxSqm: lvl.maxSqm,
       colorHex,
       center: geom.center,
       polygonCount: geom.borders.length
@@ -4178,6 +4355,34 @@ app.post("/faction/web/manage", async (req, res) => {
   });
 });
 
+// Leader abandons a conquered parcel via website
+app.post("/faction/web/abandon-parcel", async (req, res) => {
+  const { legacyName, password, parcelUuid } = req.body;
+  const fac = authenticateFactionLeader(legacyName, password);
+  if (!fac) return res.status(401).json({ status: "ERROR", message: "Unauthorized." });
+
+  const cleanParcel = String(parcelUuid || "").trim().toLowerCase();
+  if (!isValidUuid(cleanParcel)) {
+    return res.status(400).json({ status: "ERROR", message: "Invalid parcel UUID." });
+  }
+
+  await withLock(`FACTION_PARCEL_${cleanParcel}`, async () => {
+    const pObj = FACTION_PARCELS.get(cleanParcel);
+    if (!pObj || pObj.factionId !== fac.id) {
+      return res.status(404).json({ status: "ERROR", message: "Parcel not found or not controlled by your faction." });
+    }
+
+    const abandonedName = `${pObj.regionName} — ${pObj.parcelName || "Parcel"}`;
+    await deleteFactionParcelFromDb(cleanParcel);
+    res.json({
+      status: "OK",
+      abandonedParcelUuid: cleanParcel,
+      abandonedName,
+      faction: serializeFactionPublic(fac)
+    });
+  });
+});
+
 app.post("/faction/web/delete", async (req, res) => {
   const { legacyName, password } = req.body;
   const fac = authenticateFactionLeader(legacyName, password);
@@ -4194,7 +4399,7 @@ app.get("/faction/web/map", (req, res) => {
   for (const fac of FACTIONS.values()) {
     factions.push(serializeFactionPublic(fac));
   }
-  factions.sort((a, b) => b.totalArea - a.totalArea);
+  factions.sort((a, b) => b.totalArea - a.totalArea || b.level - a.level);
 
   const parcels = Array.from(FACTION_PARCELS.values());
   res.json({
@@ -4211,7 +4416,7 @@ app.get("/faction/web/factions", (req, res) => {
   for (const fac of FACTIONS.values()) {
     factions.push(serializeFactionPublic(fac));
   }
-  factions.sort((a, b) => b.memberCount - a.memberCount);
+  factions.sort((a, b) => b.level - a.level || b.memberCount - a.memberCount);
   res.json({ status: "OK", factions });
 });
 
