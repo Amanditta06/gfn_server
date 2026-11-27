@@ -2,6 +2,7 @@ import express from "express";
 import bodyParser from "body-parser";
 import cors from "cors";
 import pkg from "pg";
+import crypto from "crypto";
 
 const { Pool } = pkg;
 
@@ -1101,6 +1102,7 @@ async function ensureTable() {
     await initGacha();
     await healAllContinentsOnBoot();
     await initOutdoorSystem();
+    await initFactionSystem();
     
     const lastRankRes = await dbGet("lastWeekTopFive");
     if (lastRankRes) {
@@ -3302,6 +3304,923 @@ app.post("/outdoor/web/admin/delete-image", async (req, res) => {
   });
 });
 ///////////////////////////////////////////////////////////////////
+
+// ========================================================
+// GFNF FACTION & TERRITORY CONQUEST SYSTEM
+// ========================================================
+const FACTIONS = new Map();             // factionId -> factionObj
+const FACTION_BY_MEMBER = new Map();    // memberUuid -> factionId
+const FACTION_BY_LEADER_NAME = new Map(); // leaderLegacyNameLower -> factionId
+const FACTION_PARCELS = new Map();      // parcelUuid -> parcelObj
+const FACTION_CONQUER_DEBOUNCE = new Map(); // parcelUuid -> { factionId, time }
+
+function generateFactionPassword(avatarUuid, unixTime) {
+  return crypto
+    .createHash("md5")
+    .update(`${String(avatarUuid).trim().toLowerCase()}${unixTime}GFNF`)
+    .digest("hex");
+}
+
+function sanitizeFactionName(raw) {
+  if (!raw) return "";
+  return stripControlChars(raw).replace(/[ç|#<>"]/g, "").trim().slice(0, 32);
+}
+
+function sanitizeFactionLogo(raw) {
+  if (!raw) return "";
+  const s = String(raw).trim();
+  if (!s || s.toUpperCase() === "NONE" || s.toUpperCase() === "CLEAR") return "";
+  if (isValidUuid(s)) return s.toLowerCase();
+  if (isValidAdLink(s)) return s;
+  return null;
+}
+
+// Espectro térmico logarítmico: 16 sqm (azul frio #0A2EFF) -> 65.536 sqm (vermelho #F50A0A)
+function computeParcelThermalColor(areaSqm) {
+  const clamped = Math.max(16, Math.min(65536, Number(areaSqm) || 16));
+  const t = Math.max(0, Math.min(1, (Math.log2(clamped) - 4.0) / 12.0));
+  const hue = 230.0 * (1.0 - t); // 230 (azul frio) -> 0 (vermelho quente)
+  const sat = 0.92;
+  const light = 0.50;
+
+  const c = (1 - Math.abs(2 * light - 1)) * sat;
+  const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
+  const m = light - c / 2;
+  let r = 0, g = 0, b = 0;
+
+  if (hue < 60) { r = c; g = x; b = 0; }
+  else if (hue < 120) { r = x; g = c; b = 0; }
+  else if (hue < 180) { r = 0; g = c; b = x; }
+  else if (hue < 240) { r = 0; g = x; b = c; }
+  else if (hue < 300) { r = x; g = 0; b = c; }
+  else { r = c; g = 0; b = x; }
+
+  const toHex = (v) => Math.round((v + m) * 255).toString(16).padStart(2, "0").toUpperCase();
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
+}
+
+// Decodifica bitmask 64x64 enviada pelo LSL e extrai polígonos exatos + centro interno garantido
+function buildParcelGeometryFromGrid(gridRowsStr) {
+  const grid = Array.from({ length: 64 }, () => new Uint8Array(64));
+  let insideCount = 0;
+
+  if (typeof gridRowsStr === "string" && gridRowsStr.trim() !== "") {
+    const entries = gridRowsStr.split(";").filter(Boolean);
+    for (const entry of entries) {
+      const [rowStr, hex16] = entry.split(":");
+      const y = parseInt(rowStr, 10);
+      if (isNaN(y) || y < 0 || y >= 64 || !hex16 || hex16.length !== 16) continue;
+
+      const hi = parseInt(hex16.slice(0, 8), 16) >>> 0;
+      const lo = parseInt(hex16.slice(8, 16), 16) >>> 0;
+
+      for (let x = 0; x < 32; x++) {
+        if ((lo >>> x) & 1) { grid[y][x] = 1; insideCount++; }
+      }
+      for (let x = 32; x < 64; x++) {
+        if ((hi >>> (x - 32)) & 1) { grid[y][x] = 1; insideCount++; }
+      }
+    }
+  }
+
+  if (insideCount === 0) {
+    return { borders: [], center: { x: 128, y: 128 }, scannedArea: 0 };
+  }
+
+  // 1. Extrai arestas direcionadas (CCW) entre células internas (1) e externas (0)
+  const edgesByStart = new Map();
+  const addEdge = (x1, y1, x2, y2) => {
+    const k = `${x1},${y1}`;
+    if (!edgesByStart.has(k)) edgesByStart.set(k, []);
+    edgesByStart.get(k).push({ x1, y1, x2, y2, used: false });
+  };
+
+  for (let y = 0; y < 64; y++) {
+    for (let x = 0; x < 64; x++) {
+      if (!grid[y][x]) continue;
+      if (y === 0 || !grid[y - 1][x]) addEdge(x, y, x + 1, y);
+      if (x === 63 || !grid[y][x + 1]) addEdge(x + 1, y, x + 1, y + 1);
+      if (y === 63 || !grid[y + 1][x]) addEdge(x + 1, y + 1, x, y + 1);
+      if (x === 0 || !grid[y][x - 1]) addEdge(x, y + 1, x, y);
+    }
+  }
+
+  // 2. Encadeia arestas em loops fechados (resolvendo quinas tocando na diagonal)
+  const borders = [];
+  for (const edgeList of edgesByStart.values()) {
+    for (const startEdge of edgeList) {
+      if (startEdge.used) continue;
+
+      const rawLoop = [];
+      let curr = startEdge;
+      let guard = 0;
+
+      while (curr && !curr.used && guard < 20000) {
+        curr.used = true;
+        rawLoop.push([curr.x1, curr.y1]);
+        const dxIn = curr.x2 - curr.x1;
+        const dyIn = curr.y2 - curr.y1;
+        const nextList = edgesByStart.get(`${curr.x2},${curr.y2}`) || [];
+        const available = nextList.filter(e => !e.used);
+
+        if (available.length === 0) break;
+        if (available.length === 1) {
+          curr = available[0];
+        } else {
+          // Prefere curva à direita para separar polígonos que tocam apenas no vértice
+          let best = available[0];
+          let bestScore = -99;
+          for (const cand of available) {
+            const dxOut = cand.x2 - cand.x1;
+            const dyOut = cand.y2 - cand.y1;
+            const cross = dxIn * dyOut - dyIn * dxOut; // -1 = direita, 0 = reto, +1 = esquerda
+            const score = cross < 0 ? 3 : (cross === 0 ? 2 : 1);
+            if (score > bestScore) { bestScore = score; best = cand; }
+          }
+          curr = best;
+        }
+        guard++;
+      }
+
+      // 3. Simplifica vértices colineares e converte para metros (0..256)
+      if (rawLoop.length >= 3) {
+        const simplified = [];
+        const n = rawLoop.length;
+        for (let i = 0; i < n; i++) {
+          const prev = rawLoop[(i - 1 + n) % n];
+          const cur = rawLoop[i];
+          const next = rawLoop[(i + 1) % n];
+          const cross = (cur[0] - prev[0]) * (next[1] - cur[1]) - (cur[1] - prev[1]) * (next[0] - cur[0]);
+          if (cross !== 0) {
+            simplified.push([cur[0] * 4, cur[1] * 4]);
+          }
+        }
+        if (simplified.length >= 3) borders.push(simplified);
+      }
+    }
+  }
+
+  // 4. Centro interno garantido (célula mais distante das bordas, desempate pelo centroide)
+  let sumX = 0, sumY = 0;
+  const dist = Array.from({ length: 64 }, () => new Int16Array(64).fill(-1));
+  const queue = [];
+
+  for (let y = 0; y < 64; y++) {
+    for (let x = 0; x < 64; x++) {
+      if (!grid[y][x]) continue;
+      sumX += x;
+      sumY += y;
+      const isEdge = (x === 0 || x === 63 || y === 0 || y === 63 ||
+        !grid[y - 1][x] || !grid[y + 1][x] || !grid[y][x - 1] || !grid[y][x + 1]);
+      if (isEdge) {
+        dist[y][x] = 1;
+        queue.push([x, y]);
+      }
+    }
+  }
+
+  let head = 0;
+  const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  while (head < queue.length) {
+    const [cx, cy] = queue[head++];
+    const nd = dist[cy][cx] + 1;
+    for (const [dx, dy] of dirs) {
+      const nx = cx + dx, ny = cy + dy;
+      if (nx >= 0 && nx < 64 && ny >= 0 && ny < 64 && grid[ny][nx] && dist[ny][nx] === -1) {
+        dist[ny][nx] = nd;
+        queue.push([nx, ny]);
+      }
+    }
+  }
+
+  const centroidX = sumX / insideCount;
+  const centroidY = sumY / insideCount;
+  let bestX = 32, bestY = 32, bestDist = -1, bestCentDist = Infinity;
+
+  for (let y = 0; y < 64; y++) {
+    for (let x = 0; x < 64; x++) {
+      if (!grid[y][x]) continue;
+      const d = dist[y][x];
+      const cd = Math.hypot(x - centroidX, y - centroidY);
+      if (d > bestDist || (d === bestDist && cd < bestCentDist)) {
+        bestDist = d;
+        bestCentDist = cd;
+        bestX = x;
+        bestY = y;
+      }
+    }
+  }
+
+  return {
+    borders,
+    center: { x: bestX * 4 + 2, y: bestY * 4 + 2 },
+    scannedArea: insideCount * 16
+  };
+}
+
+function rebuildFactionIndexes() {
+  FACTION_BY_MEMBER.clear();
+  FACTION_BY_LEADER_NAME.clear();
+  for (const fac of FACTIONS.values()) {
+    if (fac.leaderName) {
+      FACTION_BY_LEADER_NAME.set(normalizeLegacyName(fac.leaderName).toLowerCase(), fac.id);
+    }
+    for (const mUuid of Object.keys(fac.members || {})) {
+      FACTION_BY_MEMBER.set(mUuid.toLowerCase(), fac.id);
+    }
+  }
+}
+
+async function saveFaction(fac) {
+  FACTIONS.set(fac.id, fac);
+  rebuildFactionIndexes();
+  await dbSet(`faction_${fac.id}`, JSON.stringify(fac));
+}
+
+async function deleteFactionFromDb(factionId) {
+  FACTIONS.delete(factionId);
+  rebuildFactionIndexes();
+  await db.query("DELETE FROM kvstore WHERE id=$1", [`faction_${factionId}`]);
+
+  // Remove domínio das parcelas que pertenciam à facção deletada
+  for (const [pUuid, pObj] of FACTION_PARCELS.entries()) {
+    if (pObj.factionId === factionId) {
+      FACTION_PARCELS.delete(pUuid);
+      await db.query("DELETE FROM kvstore WHERE id=$1", [`faction_parcel_${pUuid}`]);
+    }
+  }
+}
+
+async function saveFactionParcel(parcelObj) {
+  FACTION_PARCELS.set(parcelObj.parcelUuid, parcelObj);
+  await dbSet(`faction_parcel_${parcelObj.parcelUuid}`, JSON.stringify(parcelObj));
+}
+
+async function initFactionSystem() {
+  if (!DATABASE_URL) return;
+  try {
+    FACTIONS.clear();
+    FACTION_BY_MEMBER.clear();
+    FACTION_BY_LEADER_NAME.clear();
+    FACTION_PARCELS.clear();
+
+    const fq = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'faction_%' AND id NOT LIKE 'faction_parcel_%'");
+    for (const row of fq.rows) {
+      try {
+        const fac = JSON.parse(row.value);
+        if (fac && fac.id) FACTIONS.set(fac.id, fac);
+      } catch (e) {}
+    }
+    rebuildFactionIndexes();
+
+    const pq = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'faction_parcel_%'");
+    for (const row of pq.rows) {
+      try {
+        const pObj = JSON.parse(row.value);
+        if (pObj && pObj.parcelUuid) FACTION_PARCELS.set(pObj.parcelUuid, pObj);
+      } catch (e) {}
+    }
+
+    console.log(`[GFNF-FACTION] Loaded ${FACTIONS.size} factions and ${FACTION_PARCELS.size} conquered parcels.`);
+  } catch (e) {
+    console.error("Error in initFactionSystem:", e);
+  }
+}
+
+function serializeFactionPublic(fac) {
+  const membersArr = Object.values(fac.members || {});
+  let parcelCount = 0;
+  let totalArea = 0;
+  for (const p of FACTION_PARCELS.values()) {
+    if (p.factionId === fac.id) {
+      parcelCount++;
+      totalArea += Number(p.area) || 0;
+    }
+  }
+  return {
+    id: fac.id,
+    name: fac.name,
+    logo: fac.logo || "",
+    leaderUuid: fac.leaderUuid,
+    leaderName: fac.leaderName,
+    memberCount: membersArr.length,
+    parcelCount,
+    totalArea,
+    createdAt: fac.createdAt
+  };
+}
+
+// 1. LSL: sincroniza estado da facção do jogador
+app.get("/faction/player", requireToken, async (req, res) => {
+  const cleanUuid = String(req.query.uuid || "").trim().toLowerCase();
+  const cleanName = normalizeLegacyName(req.query.legacyName || "");
+  if (!cleanUuid) return res.status(400).json({ status: "ERROR", message: "missing uuid" });
+
+  const facId = FACTION_BY_MEMBER.get(cleanUuid);
+  if (!facId || !FACTIONS.has(facId)) {
+    return res.json({ status: "OK", inFaction: 0 });
+  }
+
+  const fac = FACTIONS.get(facId);
+  const member = fac.members[cleanUuid];
+  if (!member) return res.json({ status: "OK", inFaction: 0 });
+
+  if (cleanName && member.legacyName !== cleanName) {
+    member.legacyName = cleanName;
+    if (fac.leaderUuid === cleanUuid) fac.leaderName = cleanName;
+    await saveFaction(fac);
+  }
+
+  res.json({
+    status: "OK",
+    inFaction: 1,
+    factionId: fac.id,
+    factionName: fac.name,
+    logo: fac.logo || "",
+    role: member.role,
+    leaderUuid: fac.leaderUuid,
+    leaderName: fac.leaderName,
+    memberCount: Object.keys(fac.members || {}).length
+  });
+});
+
+// 2. LSL: criar nova facção
+app.post("/faction/create", requireToken, async (req, res) => {
+  const { uuid, legacyName, factionName } = req.body;
+  const cleanUuid = String(uuid || "").trim().toLowerCase();
+  const cleanUser = normalizeLegacyName(legacyName);
+  const cleanFacName = sanitizeFactionName(factionName);
+
+  if (!isValidUuid(cleanUuid) || !cleanUser) {
+    return res.status(400).json({ status: "ERROR", message: "Dados do avatar inválidos." });
+  }
+  if (cleanFacName.length < 2) {
+    return res.status(400).json({ status: "ERROR", message: "O nome da facção deve ter entre 2 e 32 caracteres." });
+  }
+
+  await withLock("FACTION_GLOBAL_LOCK", async () => {
+    if (FACTION_BY_MEMBER.has(cleanUuid)) {
+      return res.json({ status: "ERROR", message: "Você já pertence a uma facção." });
+    }
+    for (const f of FACTIONS.values()) {
+      if (f.name.toLowerCase() === cleanFacName.toLowerCase()) {
+        return res.json({ status: "ERROR", message: "Já existe uma facção com esse nome." });
+      }
+    }
+
+    const now = getUnixTime();
+    const factionId = `fac_${now}_${crypto.randomBytes(3).toString("hex")}`;
+    const password = generateFactionPassword(cleanUuid, now);
+
+    const newFac = {
+      id: factionId,
+      name: cleanFacName,
+      logo: "",
+      leaderUuid: cleanUuid,
+      leaderName: cleanUser,
+      password,
+      createdAt: now,
+      updatedAt: now,
+      members: {
+        [cleanUuid]: {
+          uuid: cleanUuid,
+          legacyName: cleanUser,
+          role: "leader",
+          joinedAt: now
+        }
+      }
+    };
+
+    await saveFaction(newFac);
+
+    res.json({
+      status: "OK",
+      factionId: newFac.id,
+      factionName: newFac.name,
+      role: "leader",
+      leaderUuid: cleanUuid,
+      login: cleanUser,
+      password,
+      memberCount: 1
+    });
+  });
+});
+
+// 3. LSL: líder altera nome ou logo da facção
+app.post("/faction/update", requireToken, async (req, res) => {
+  const { uuid, factionName, logo } = req.body;
+  const cleanUuid = String(uuid || "").trim().toLowerCase();
+
+  await withLock("FACTION_GLOBAL_LOCK", async () => {
+    const facId = FACTION_BY_MEMBER.get(cleanUuid);
+    const fac = facId ? FACTIONS.get(facId) : null;
+    if (!fac) return res.json({ status: "ERROR", message: "Você não está em uma facção." });
+    if (fac.leaderUuid !== cleanUuid) {
+      return res.json({ status: "ERROR", message: "Apenas o líder pode alterar as configurações da facção." });
+    }
+
+    if (factionName !== undefined) {
+      const cleanFacName = sanitizeFactionName(factionName);
+      if (cleanFacName.length < 2) {
+        return res.json({ status: "ERROR", message: "Nome inválido (mínimo 2 caracteres)." });
+      }
+      for (const f of FACTIONS.values()) {
+        if (f.id !== fac.id && f.name.toLowerCase() === cleanFacName.toLowerCase()) {
+          return res.json({ status: "ERROR", message: "Já existe outra facção com esse nome." });
+        }
+      }
+      fac.name = cleanFacName;
+      // Atualiza nome nas parcelas já conquistadas
+      for (const p of FACTION_PARCELS.values()) {
+        if (p.factionId === fac.id) {
+          p.factionName = fac.name;
+          await saveFactionParcel(p);
+        }
+      }
+    }
+
+    if (logo !== undefined) {
+      const parsedLogo = sanitizeFactionLogo(logo);
+      if (parsedLogo === null) {
+        return res.json({ status: "ERROR", message: "Logo inválida. Informe um UUID de textura do SL, URL http(s) válida ou NONE para remover." });
+      }
+      fac.logo = parsedLogo;
+      for (const p of FACTION_PARCELS.values()) {
+        if (p.factionId === fac.id) {
+          p.factionLogo = fac.logo;
+          await saveFactionParcel(p);
+        }
+      }
+    }
+
+    fac.updatedAt = getUnixTime();
+    await saveFaction(fac);
+
+    res.json({
+      status: "OK",
+      factionId: fac.id,
+      factionName: fac.name,
+      logo: fac.logo,
+      memberCount: Object.keys(fac.members).length
+    });
+  });
+});
+
+// 4. LSL: líder deleta a facção
+app.post("/faction/delete", requireToken, async (req, res) => {
+  const cleanUuid = String(req.body.uuid || "").trim().toLowerCase();
+
+  await withLock("FACTION_GLOBAL_LOCK", async () => {
+    const facId = FACTION_BY_MEMBER.get(cleanUuid);
+    const fac = facId ? FACTIONS.get(facId) : null;
+    if (!fac) return res.json({ status: "ERROR", message: "Você não está em uma facção." });
+    if (fac.leaderUuid !== cleanUuid) {
+      return res.json({ status: "ERROR", message: "Apenas o líder pode deletar a facção." });
+    }
+
+    const oldName = fac.name;
+    await deleteFactionFromDb(fac.id);
+    res.json({ status: "OK", deletedFaction: oldName });
+  });
+});
+
+// 5. LSL: membro (não-líder) sai da facção
+app.post("/faction/leave", requireToken, async (req, res) => {
+  const cleanUuid = String(req.body.uuid || "").trim().toLowerCase();
+
+  await withLock("FACTION_GLOBAL_LOCK", async () => {
+    const facId = FACTION_BY_MEMBER.get(cleanUuid);
+    const fac = facId ? FACTIONS.get(facId) : null;
+    if (!fac) return res.json({ status: "ERROR", message: "Você não está em uma facção." });
+    if (fac.leaderUuid === cleanUuid) {
+      return res.json({ status: "ERROR", message: "O líder não pode sair da facção. Passe a liderança para outro membro primeiro." });
+    }
+
+    delete fac.members[cleanUuid];
+    fac.updatedAt = getUnixTime();
+    await saveFaction(fac);
+    res.json({ status: "OK", factionName: fac.name });
+  });
+});
+
+// 6. LSL: gerenciamento de membros (Recrutar, Demitir, Cargos e Transferência de Liderança)
+app.post("/faction/manage", requireToken, async (req, res) => {
+  const { actorUuid, targetUuid, targetName, action } = req.body;
+  const cleanActor = String(actorUuid || "").trim().toLowerCase();
+  const cleanTarget = String(targetUuid || "").trim().toLowerCase();
+  const cleanTargetName = normalizeLegacyName(targetName || "");
+  const act = String(action || "").toUpperCase().trim();
+
+  if (!isValidUuid(cleanActor) || !isValidUuid(cleanTarget)) {
+    return res.status(400).json({ status: "ERROR", message: "UUID inválido." });
+  }
+  if (cleanActor === cleanTarget) {
+    return res.json({ status: "ERROR", message: "Você não pode aplicar essa ação em si mesmo." });
+  }
+
+  await withLock("FACTION_GLOBAL_LOCK", async () => {
+    const facId = FACTION_BY_MEMBER.get(cleanActor);
+    const fac = facId ? FACTIONS.get(facId) : null;
+    if (!fac || !fac.members[cleanActor]) {
+      return res.json({ status: "ERROR", message: "Você não pertence a uma facção." });
+    }
+
+    const actorRole = fac.members[cleanActor].role;
+    if (actorRole !== "leader" && actorRole !== "subleader") {
+      return res.json({ status: "ERROR", message: "Você não tem permissão para gerenciar membros." });
+    }
+
+    const targetFacId = FACTION_BY_MEMBER.get(cleanTarget);
+    const targetMember = fac.members[cleanTarget];
+    const now = getUnixTime();
+
+    // Sublíder não pode fazer nada contra o líder
+    if (actorRole === "subleader" && cleanTarget === fac.leaderUuid) {
+      return res.json({ status: "ERROR", message: "Sublíderes não podem executar ações contra o líder." });
+    }
+
+    if (act === "RECRUIT") {
+      if (targetFacId === fac.id) {
+        return res.json({ status: "ERROR", message: "Este jogador já está na sua facção." });
+      }
+      if (targetFacId && FACTIONS.has(targetFacId)) {
+        return res.json({ status: "ERROR", message: "Este jogador já pertence a outra facção." });
+      }
+
+      fac.members[cleanTarget] = {
+        uuid: cleanTarget,
+        legacyName: cleanTargetName || cleanTarget,
+        role: "capanga",
+        joinedAt: now
+      };
+      fac.updatedAt = now;
+      await saveFaction(fac);
+
+      return res.json({
+        status: "OK",
+        action: act,
+        factionId: fac.id,
+        factionName: fac.name,
+        targetUuid: cleanTarget,
+        targetName: fac.members[cleanTarget].legacyName,
+        memberCount: Object.keys(fac.members).length
+      });
+    }
+
+    if (!targetMember) {
+      return res.json({ status: "ERROR", message: "Este jogador não é membro da sua facção." });
+    }
+
+    if (act === "KICK") {
+      if (cleanTarget === fac.leaderUuid) {
+        return res.json({ status: "ERROR", message: "O líder não pode ser demitido." });
+      }
+      const kickedName = targetMember.legacyName;
+      delete fac.members[cleanTarget];
+      fac.updatedAt = now;
+      await saveFaction(fac);
+
+      return res.json({
+        status: "OK",
+        action: act,
+        factionId: fac.id,
+        factionName: fac.name,
+        targetUuid: cleanTarget,
+        targetName: kickedName,
+        memberCount: Object.keys(fac.members).length
+      });
+    }
+
+    if (act === "SET_CAPANGA") {
+      if (cleanTarget === fac.leaderUuid) {
+        return res.json({ status: "ERROR", message: "Não é possível rebaixar o líder diretamente." });
+      }
+      targetMember.role = "capanga";
+      if (cleanTargetName) targetMember.legacyName = cleanTargetName;
+      fac.updatedAt = now;
+      await saveFaction(fac);
+
+      return res.json({
+        status: "OK",
+        action: act,
+        factionId: fac.id,
+        factionName: fac.name,
+        targetUuid: cleanTarget,
+        targetName: targetMember.legacyName,
+        newRole: "capanga",
+        memberCount: Object.keys(fac.members).length
+      });
+    }
+
+    if (act === "SET_SUBLEADER") {
+      if (actorRole !== "leader") {
+        return res.json({ status: "ERROR", message: "Apenas o líder pode promover alguém a sublíder." });
+      }
+      targetMember.role = "subleader";
+      if (cleanTargetName) targetMember.legacyName = cleanTargetName;
+      fac.updatedAt = now;
+      await saveFaction(fac);
+
+      return res.json({
+        status: "OK",
+        action: act,
+        factionId: fac.id,
+        factionName: fac.name,
+        targetUuid: cleanTarget,
+        targetName: targetMember.legacyName,
+        newRole: "subleader",
+        memberCount: Object.keys(fac.members).length
+      });
+    }
+
+    if (act === "SET_LEADER") {
+      if (actorRole !== "leader") {
+        return res.json({ status: "ERROR", message: "Apenas o líder atual pode transferir a liderança." });
+      }
+
+      const finalTargetName = cleanTargetName || targetMember.legacyName;
+      const newPassword = generateFactionPassword(cleanTarget, now);
+
+      // Antigo líder vira sublíder automaticamente e perde acesso ao site
+      fac.members[cleanActor].role = "subleader";
+      targetMember.role = "leader";
+      targetMember.legacyName = finalTargetName;
+
+      fac.leaderUuid = cleanTarget;
+      fac.leaderName = finalTargetName;
+      fac.password = newPassword;
+      fac.updatedAt = now;
+
+      await saveFaction(fac);
+
+      return res.json({
+        status: "OK",
+        action: act,
+        factionId: fac.id,
+        factionName: fac.name,
+        targetUuid: cleanTarget,
+        targetName: finalTargetName,
+        newRole: "leader",
+        actorNewRole: "subleader",
+        newLogin: finalTargetName,
+        newPassword,
+        memberCount: Object.keys(fac.members).length
+      });
+    }
+
+    return res.status(400).json({ status: "ERROR", message: "Ação desconhecida." });
+  });
+});
+
+// 7. LSL: consulta quem domina a parcela atual
+app.get("/faction/parcel-status", requireToken, (req, res) => {
+  const parcelUuid = String(req.query.parcelUuid || "").trim().toLowerCase();
+  if (!parcelUuid) return res.status(400).json({ status: "ERROR" });
+
+  const pObj = FACTION_PARCELS.get(parcelUuid);
+  if (!pObj || !FACTIONS.has(pObj.factionId)) {
+    return res.json({ status: "OK", owned: 0, factionId: "", factionName: "" });
+  }
+
+  const fac = FACTIONS.get(pObj.factionId);
+  res.json({
+    status: "OK",
+    owned: 1,
+    factionId: fac.id,
+    factionName: fac.name,
+    area: pObj.area,
+    colorHex: pObj.colorHex
+  });
+});
+
+// 8. LSL: registra conquista de parcela + contorno preciso + cor térmica + centro da logo
+app.post("/faction/conquer", requireToken, async (req, res) => {
+  const { factionId, winnerUuid, regionName, regionCorner, parcelUuid, parcelName, area, gridRows } = req.body;
+  const cleanParcel = String(parcelUuid || "").trim().toLowerCase();
+  const cleanWinner = String(winnerUuid || "").trim().toLowerCase();
+  const cleanFacId = String(factionId || "").trim();
+
+  if (!isValidUuid(cleanParcel) || !cleanFacId) {
+    return res.status(400).json({ status: "ERROR", message: "Dados de conquista inválidos." });
+  }
+
+  await withLock(`FACTION_PARCEL_${cleanParcel}`, async () => {
+    const fac = FACTIONS.get(cleanFacId);
+    if (!fac) return res.json({ status: "ERROR", message: "Facção não encontrada." });
+    if (cleanWinner && !fac.members[cleanWinner]) {
+      return res.json({ status: "ERROR", message: "Jogador vencedor não pertence a esta facção." });
+    }
+
+    const now = getUnixTime();
+    const lastClaim = FACTION_CONQUER_DEBOUNCE.get(cleanParcel);
+    if (lastClaim && lastClaim.factionId === cleanFacId && (now - lastClaim.time) < 15) {
+      return res.json({ status: "OK", deduplicated: 1, factionName: fac.name });
+    }
+    FACTION_CONQUER_DEBOUNCE.set(cleanParcel, { factionId: cleanFacId, time: now });
+
+    const geom = buildParcelGeometryFromGrid(gridRows);
+    const finalArea = Math.max(16, parseInt(area, 10) || geom.scannedArea || 16);
+    const colorHex = computeParcelThermalColor(finalArea);
+
+    let cornerX = 0, cornerY = 0;
+    if (typeof regionCorner === "string" && regionCorner.includes(",")) {
+      const cp = regionCorner.split(",");
+      cornerX = parseInt(cp[0], 10) || 0;
+      cornerY = parseInt(cp[1], 10) || 0;
+    }
+
+    const parcelObj = {
+      parcelUuid: cleanParcel,
+      parcelName: stripControlChars(parcelName || "Parcel").trim().slice(0, 64),
+      regionName: sanitizeRegionName(regionName || "Unknown Region"),
+      regionCorner: { x: cornerX, y: cornerY },
+      factionId: fac.id,
+      factionName: fac.name,
+      factionLogo: fac.logo || "",
+      area: finalArea,
+      colorHex,
+      center: geom.center,
+      borders: geom.borders,
+      conqueredBy: cleanWinner,
+      conqueredAt: now
+    };
+
+    await saveFactionParcel(parcelObj);
+
+    res.json({
+      status: "OK",
+      parcelUuid: cleanParcel,
+      factionName: fac.name,
+      area: finalArea,
+      colorHex,
+      center: geom.center,
+      polygonCount: geom.borders.length
+    });
+  });
+});
+
+// ========================================================
+// GFNF WEBSITE ENDPOINTS (MAPA + PAINEL DO LÍDER)
+// ========================================================
+
+function authenticateFactionLeader(legacyName, password) {
+  const lookup = normalizeLegacyName(legacyName).toLowerCase();
+  const pass = String(password || "").trim();
+  if (!lookup || !pass) return null;
+
+  const facId = FACTION_BY_LEADER_NAME.get(lookup);
+  if (!facId) return null;
+  const fac = FACTIONS.get(facId);
+  if (!fac || fac.password !== pass) return null;
+  return fac;
+}
+
+// 9. Website: login exclusivo do líder atual
+app.post("/faction/web/login", (req, res) => {
+  const { legacyName, password } = req.body;
+  const fac = authenticateFactionLeader(legacyName, password);
+  if (!fac) {
+    return res.status(401).json({ status: "ERROR", message: "Credenciais inválidas ou você não é mais o líder da facção." });
+  }
+
+  const parcels = [];
+  for (const p of FACTION_PARCELS.values()) {
+    if (p.factionId === fac.id) parcels.push(p);
+  }
+
+  res.json({
+    status: "OK",
+    faction: {
+      ...serializeFactionPublic(fac),
+      members: Object.values(fac.members || {}),
+      parcels
+    }
+  });
+});
+
+// 10. Website: líder altera nome/logo
+app.post("/faction/web/update", async (req, res) => {
+  const { legacyName, password, factionName, logo } = req.body;
+  const fac = authenticateFactionLeader(legacyName, password);
+  if (!fac) return res.status(401).json({ status: "ERROR", message: "Não autorizado." });
+
+  await withLock("FACTION_GLOBAL_LOCK", async () => {
+    if (factionName !== undefined) {
+      const cleanName = sanitizeFactionName(factionName);
+      if (cleanName.length < 2) return res.status(400).json({ status: "ERROR", message: "Nome muito curto." });
+      for (const f of FACTIONS.values()) {
+        if (f.id !== fac.id && f.name.toLowerCase() === cleanName.toLowerCase()) {
+          return res.status(400).json({ status: "ERROR", message: "Nome já em uso." });
+        }
+      }
+      fac.name = cleanName;
+      for (const p of FACTION_PARCELS.values()) {
+        if (p.factionId === fac.id) { p.factionName = fac.name; await saveFactionParcel(p); }
+      }
+    }
+
+    if (logo !== undefined) {
+      const parsedLogo = sanitizeFactionLogo(logo);
+      if (parsedLogo === null) return res.status(400).json({ status: "ERROR", message: "Logo inválida." });
+      fac.logo = parsedLogo;
+      for (const p of FACTION_PARCELS.values()) {
+        if (p.factionId === fac.id) { p.factionLogo = fac.logo; await saveFactionParcel(p); }
+      }
+    }
+
+    fac.updatedAt = getUnixTime();
+    await saveFaction(fac);
+    res.json({ status: "OK", faction: serializeFactionPublic(fac) });
+  });
+});
+
+// 11. Website: líder gerencia membros (KICK, SET_SUBLEADER, SET_CAPANGA, SET_LEADER)
+app.post("/faction/web/manage", async (req, res) => {
+  const { legacyName, password, targetUuid, action } = req.body;
+  const fac = authenticateFactionLeader(legacyName, password);
+  if (!fac) return res.status(401).json({ status: "ERROR", message: "Não autorizado." });
+
+  const cleanTarget = String(targetUuid || "").trim().toLowerCase();
+  const act = String(action || "").toUpperCase().trim();
+
+  await withLock("FACTION_GLOBAL_LOCK", async () => {
+    const member = fac.members[cleanTarget];
+    if (!member || cleanTarget === fac.leaderUuid) {
+      return res.status(400).json({ status: "ERROR", message: "Membro alvo inválido." });
+    }
+
+    const now = getUnixTime();
+    if (act === "KICK") {
+      delete fac.members[cleanTarget];
+    } else if (act === "SET_SUBLEADER") {
+      member.role = "subleader";
+    } else if (act === "SET_CAPANGA") {
+      member.role = "capanga";
+    } else if (act === "SET_LEADER") {
+      const oldLeader = fac.leaderUuid;
+      const newPassword = generateFactionPassword(cleanTarget, now);
+      fac.members[oldLeader].role = "subleader";
+      member.role = "leader";
+      fac.leaderUuid = cleanTarget;
+      fac.leaderName = member.legacyName;
+      fac.password = newPassword;
+      fac.updatedAt = now;
+      await saveFaction(fac);
+      return res.json({
+        status: "OK",
+        transferred: true,
+        newLeaderLogin: member.legacyName,
+        newLeaderPassword: newPassword
+      });
+    } else {
+      return res.status(400).json({ status: "ERROR", message: "Ação inválida." });
+    }
+
+    fac.updatedAt = now;
+    await saveFaction(fac);
+    res.json({ status: "OK", members: Object.values(fac.members) });
+  });
+});
+
+// 12. Website: líder deleta a facção
+app.post("/faction/web/delete", async (req, res) => {
+  const { legacyName, password } = req.body;
+  const fac = authenticateFactionLeader(legacyName, password);
+  if (!fac) return res.status(401).json({ status: "ERROR", message: "Não autorizado." });
+
+  await withLock("FACTION_GLOBAL_LOCK", async () => {
+    await deleteFactionFromDb(fac.id);
+    res.json({ status: "OK" });
+  });
+});
+
+// 13. Website Público: dados completos para o mapa interativo (polígonos, cores, logos e membros)
+app.get("/faction/web/map", (req, res) => {
+  const factions = [];
+  for (const fac of FACTIONS.values()) {
+    factions.push(serializeFactionPublic(fac));
+  }
+  factions.sort((a, b) => b.totalArea - a.totalArea);
+
+  const parcels = Array.from(FACTION_PARCELS.values());
+  res.json({
+    status: "OK",
+    totalFactions: factions.length,
+    totalParcels: parcels.length,
+    factions,
+    parcels
+  });
+});
+
+// 14. Website Público: listagem de facções com contagem de membros
+app.get("/faction/web/factions", (req, res) => {
+  const factions = [];
+  for (const fac of FACTIONS.values()) {
+    factions.push(serializeFactionPublic(fac));
+  }
+  factions.sort((a, b) => b.memberCount - a.memberCount);
+  res.json({ status: "OK", factions });
+});
 
 app.get("/", (req, res) => res.json({ status: "ok" }));
 app.listen(PORT, () => console.log("API running on port", PORT));
