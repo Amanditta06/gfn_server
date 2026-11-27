@@ -3416,11 +3416,36 @@ async function saveFactionBlacklist() {
 // --------------------------------------------------------
 // CAPTURAS ATIVAS (PISCAR ROSA/ROXO NO MAPA + ALERTA DE ATAQUE)
 // --------------------------------------------------------
+function reportFailedCapture(cap) {
+  if (!cap || !cap.attackerFacName) return;
+  const pName = cap.parcelName || "Parcel";
+  const reg = cap.regionName || "Unknown Region";
+  let text = "";
+
+  if (cap.isNeutral) {
+    text = `❌ ${cap.attackerFacName} tried to take control of "${pName}" in ${reg}, but failed!`;
+  } else if (cap.isAllySteal && cap.defenderFacName) {
+    text = `🛡 ${cap.attackerFacName} tried to steal "${pName}" in ${reg} from ally ${cap.defenderFacName}, but failed!`;
+  } else if (cap.defenderFacName) {
+    text = `🛡 ${cap.attackerFacName} tried to take control of "${pName}" in ${reg} from ${cap.defenderFacName}, but failed!`;
+  } else {
+    text = `❌ ${cap.attackerFacName} tried to take control of "${pName}" in ${reg}, but failed!`;
+  }
+
+  pushFactionNews("CAPTURE_FAILED", text, {
+    regionName: reg,
+    parcelUuid: cap.parcelUuid || "",
+    debounceKey: `fail_${cap.parcelUuid}_${cap.attackerFacId}`,
+    debounceSec: 25
+  }).catch(() => {});
+}
+
 function pruneStaleActiveCaptures() {
   const now = getUnixTime();
   for (const [pUuid, cap] of FACTION_ACTIVE_CAPTURES.entries()) {
     if ((now - (cap.lastPingAt || 0)) > FACTION_CAPTURE_TTL) {
       FACTION_ACTIVE_CAPTURES.delete(pUuid);
+      reportFailedCapture(cap);
     }
   }
 }
@@ -4665,11 +4690,12 @@ app.post("/faction/capture-ping", requireToken, async (req, res) => {
     return res.status(400).json({ status: "ERROR", message: "Invalid capture ping." });
   }
 
-  // Encerrar alerta caso o jogador tenha parado a captura
+  // Captura cancelada/interrompida pelo jogador (Stop, saiu da parcela, voou, etc.)
   if (active === 0 || active === false || active === "0") {
     const existingCap = FACTION_ACTIVE_CAPTURES.get(cleanParcel);
     if (existingCap && existingCap.attackerFacId === cleanFacId) {
       FACTION_ACTIVE_CAPTURES.delete(cleanParcel);
+      reportFailedCapture(existingCap);
     }
     return res.json({ status: "OK", cleared: 1 });
   }
@@ -4685,6 +4711,13 @@ app.post("/faction/capture-ping", requireToken, async (req, res) => {
 
   const now = getUnixTime();
   const existingParcel = FACTION_PARCELS.get(cleanParcel);
+
+  // Ignora ping atrasado caso esta facção já tenha acabado de conquistar a parcela
+  if (existingParcel && existingParcel.factionId === attackerFac.id) {
+    FACTION_ACTIVE_CAPTURES.delete(cleanParcel);
+    return res.json({ status: "OK", alreadyOwned: 1 });
+  }
+
   const defenderFac = (existingParcel && FACTIONS.has(existingParcel.factionId))
     ? FACTIONS.get(existingParcel.factionId)
     : null;
@@ -4720,7 +4753,6 @@ app.post("/faction/capture-ping", requireToken, async (req, res) => {
     y: Math.max(0, Math.min(256, parseFloat(centerY) || 128))
   };
 
-  // Se o LSL enviou o contorno (ex.: parcela neutra sendo tomada), calcula polígonos exatos para piscar no mapa
   if (isNeutral && typeof gridRows === "string" && gridRows.trim() !== "" && borders.length === 0) {
     const geom = buildParcelGeometryFromGrid(gridRows);
     if (geom.borders.length > 0) {
@@ -4748,26 +4780,24 @@ app.post("/faction/capture-ping", requireToken, async (req, res) => {
     lastPingAt: now
   });
 
-  // Publica no mural de notícias quando a ação começa (sem spam, debounce de 90s)
   if (isNewAttack) {
     if (isNeutral) {
-      // Parcela neutra: sem anúncio de "sendo atacada", apenas notícia de tomada de área neutra
       await pushFactionNews(
         "NEUTRAL_CLAIMING",
-        `🏴 ${attackerFac.name} started claiming neutral turf "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm)!`,
-        { regionName: cleanReg, parcelUuid: cleanParcel, debounceKey: `cap_${cleanParcel}_${attackerFac.id}`, debounceSec: 90 }
+        `🏴 ${attackerFac.name} started claiming "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm)!`,
+        { regionName: cleanReg, parcelUuid: cleanParcel, debounceKey: `cap_${cleanParcel}_${attackerFac.id}`, debounceSec: 20 }
       );
     } else if (isAllySteal) {
       await pushFactionNews(
         "ALLY_STEAL_START",
-        `🔪 BETRAYAL IN PROGRESS! ${attackerFac.name} is stealing "${cleanPName}" in ${cleanReg} from ally ${defenderFac.name}!`,
-        { regionName: cleanReg, parcelUuid: cleanParcel, debounceKey: `cap_${cleanParcel}_${attackerFac.id}`, debounceSec: 90 }
+        `🔪 BETRAYAL IN PROGRESS! ${attackerFac.name} is trying to steal "${cleanPName}" in ${cleanReg} from ally ${defenderFac.name}!`,
+        { regionName: cleanReg, parcelUuid: cleanParcel, debounceKey: `cap_${cleanParcel}_${attackerFac.id}`, debounceSec: 20 }
       );
     } else {
       await pushFactionNews(
         "UNDER_ATTACK",
         `🚨 TURF UNDER ATTACK! ${attackerFac.name} is attacking ${defenderFac.name}'s turf "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm)!`,
-        { regionName: cleanReg, parcelUuid: cleanParcel, debounceKey: `cap_${cleanParcel}_${attackerFac.id}`, debounceSec: 90 }
+        { regionName: cleanReg, parcelUuid: cleanParcel, debounceKey: `cap_${cleanParcel}_${attackerFac.id}`, debounceSec: 20 }
       );
     }
   }
@@ -4807,7 +4837,6 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
       return res.json({ status: "OK", deduplicated: 1, factionName: fac.name });
     }
 
-    // Verifica Escudo de Pós-Conquista (6 horas)
     const prevParcel = FACTION_PARCELS.get(cleanParcel);
     if (prevParcel && prevParcel.factionId !== cleanFacId && (prevParcel.shieldUntil || 0) > now) {
       const rem = prevParcel.shieldUntil - now;
@@ -4825,6 +4854,11 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
     const lvl = computeFactionLevelInfo(fac.xp || 0);
     const { totalArea: existingArea } = getFactionTerritoryStats(fac.id, cleanParcel);
     if ((existingArea + finalArea) > lvl.maxSqm) {
+      const activeCap = FACTION_ACTIVE_CAPTURES.get(cleanParcel);
+      if (activeCap && activeCap.attackerFacId === cleanFacId) {
+        FACTION_ACTIVE_CAPTURES.delete(cleanParcel);
+        reportFailedCapture(activeCap);
+      }
       return res.json({
         status: "SQM_LIMIT",
         message: `Territory limit exceeded! Level ${lvl.level} capacity is ${lvl.maxSqm.toLocaleString("en-US")} sqm (currently using ${existingArea.toLocaleString("en-US")} sqm; this parcel needs ${finalArea.toLocaleString("en-US")} sqm). Level up or abandon a territory on the website.`
@@ -4872,11 +4906,11 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
     await saveFactionParcel(parcelObj);
     const updatedStats = getFactionTerritoryStats(fac.id);
 
-    // Publica conquista no mural de notícias
+    // Publica notícia de conquista bem-sucedida na Street News
     if (wasAllySteal && prevOwnerFac) {
       await pushFactionNews(
         "ALLY_STOLEN",
-        `🐍 BETRAYAL! ${fac.name} STOLE "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm) from ally ${prevOwnerFac.name}!`,
+        `🐍 BETRAYAL! ${fac.name} just took control of "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm) by stealing it from ally ${prevOwnerFac.name}!`,
         { regionName: cleanReg, parcelUuid: cleanParcel }
       );
       if (prevOwnerFac.leaderUuid) {
@@ -4888,13 +4922,13 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
     } else if (prevOwnerFac) {
       await pushFactionNews(
         "CONQUERED",
-        `🔥 ${fac.name} SEIZED "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm) from ${prevOwnerFac.name}!`,
+        `🔥 ${fac.name} just took control of "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm) from ${prevOwnerFac.name}!`,
         { regionName: cleanReg, parcelUuid: cleanParcel }
       );
     } else {
       await pushFactionNews(
         "CLAIMED_NEUTRAL",
-        `🏴 ${fac.name} claimed neutral turf "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm)!`,
+        `🏴 ${fac.name} just took control of "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm)!`,
         { regionName: cleanReg, parcelUuid: cleanParcel }
       );
     }
