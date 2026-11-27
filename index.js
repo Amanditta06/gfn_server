@@ -3311,21 +3311,39 @@ app.post("/outdoor/web/admin/delete-image", async (req, res) => {
 ///////////////////////////////////////////////////////////////////
 
 // ========================================================
-// STREET CONQUESTERS — FACTION, TERRITORY, XP & CARGO LINK
+// STREET CONQUESTERS — FACTION, TERRITORY, ALLIANCES, SHIELD, NEWS & BLACKLIST
 // ========================================================
-const FACTIONS = new Map();               // factionId -> factionObj
-const FACTION_BY_MEMBER = new Map();      // memberUuid -> factionId
-const FACTION_BY_LEADER_NAME = new Map(); // leaderLegacyNameLower -> factionId
-const FACTION_PARCELS = new Map();        // parcelUuid -> parcelObj
+const FACTIONS = new Map();                 // factionId -> factionObj
+const FACTION_BY_MEMBER = new Map();        // memberUuid -> factionId
+const FACTION_BY_LEADER_NAME = new Map();   // leaderLegacyNameLower -> factionId
+const FACTION_BY_PERM_ID = new Map();       // permId (hash imutável) -> factionId
+const FACTION_PARCELS = new Map();          // parcelUuid -> parcelObj
 const FACTION_CONQUER_DEBOUNCE = new Map(); // parcelUuid -> { factionId, time }
 
-// XP & Capacity Tuning
-const FACTION_BASE_SQM_LIMIT = 4096;
-const FACTION_SQM_PER_LEVEL  = 1024;
-const FACTION_XP_PER_1K_ALLY    = 5.0;   // Pouco XP (mesma facção)
-const FACTION_XP_PER_1K_NEUTRAL = 15.0;   // XP médio (vendedor sem facção)
-const FACTION_XP_PER_1K_RIVAL   = 30.0;  // Bastante XP (facção rival)
-const FACTION_MAX_RIVAL_PENALTY_PCT = 60.0;
+// Novos sistemas: Alianças, Capturas ao Vivo, Notícias e Blacklist
+const ALLIANCES = new Map();                // allianceId -> { id, members: [permId], kickVotes: {}, createdAt }
+const ALLIANCE_BY_PERM_ID = new Map();      // permId -> allianceId
+let ALLIANCE_INVITES = [];                  // [{ id, fromPermId, toPermId, allianceId, createdAt }]
+
+const FACTION_ACTIVE_CAPTURES = new Map();  // parcelUuid -> captura/ataque em andamento
+const FACTION_NEWS_DEBOUNCE = new Map();    // key -> unixTime
+let FACTION_NEWS = [];                      // [{ id, type, text, regionName, parcelUuid, time }]
+const FACTION_BLACKLIST = new Map();        // parcelUuid -> { parcelUuid, regionName, reason, addedAt }
+
+// --------------------------------------------------------
+// CONFIGURAÇÕES DE BALANCEAMENTO (fácil de ajustar depois)
+// --------------------------------------------------------
+const FACTION_BASE_SQM_LIMIT = 4096;        // Limite no Nível 0
+const FACTION_SQM_PER_LEVEL  = 1024;        // +1024 sqm a cada nível
+const FACTION_SHIELD_SECONDS = 6 * 3600;    // 6 horas de Escudo de Pós-Conquista (21600s)
+const FACTION_CAPTURE_TTL    = 15;          // Segundos sem sinal para encerrar o piscar no mapa
+const FACTION_NEWS_MAX_ITEMS = 30;          // Máximo de notícias guardadas para o mural
+
+const FACTION_XP_PER_1K_ALLY    = 2.0;      // Pouco XP (mesma facção ou aliada)
+const FACTION_XP_PER_1K_NEUTRAL = 5.0;      // XP médio (vendedor sem facção)
+const FACTION_XP_PER_1K_RIVAL   = 10.0;     // Bastante XP (vendedor rival)
+const FACTION_ALLY_CARGO_BONUS_MULT = 0.25; // Aliado ganha só 25% do bônus normal no terreno aliado (incentiva ser rival)
+const FACTION_MAX_RIVAL_PENALTY_PCT = 60.0; // Máximo de perda de carga em território rival
 
 // Short 10-char password hashed from uuid + unixTime + GFNF
 function generateFactionPassword(avatarUuid, unixTime) {
@@ -3334,6 +3352,16 @@ function generateFactionPassword(avatarUuid, unixTime) {
     .update(`${String(avatarUuid).trim().toLowerCase()}${unixTime}GFNF`)
     .digest("hex")
     .slice(0, 10)
+    .toUpperCase();
+}
+
+// ID imutável da facção (hash do nome + unix time de criação/reset) — usado nas alianças
+function generateFactionPermId(factionName, unixTime) {
+  return crypto
+    .createHash("sha256")
+    .update(`${String(factionName || "").trim().toLowerCase()}|${unixTime}|SC_PERM_ID`)
+    .digest("hex")
+    .slice(0, 16)
     .toUpperCase();
 }
 
@@ -3351,7 +3379,56 @@ function sanitizeFactionLogo(raw) {
   return null;
 }
 
-// RPG XP Curve: Level 0->1 = 50 XP, scaling x1.35 per level
+// --------------------------------------------------------
+// MURAL DE NOTÍCIAS (TV CRIME TICKER)
+// --------------------------------------------------------
+async function pushFactionNews(type, text, meta = {}) {
+  const now = getUnixTime();
+  if (meta.debounceKey) {
+    const last = FACTION_NEWS_DEBOUNCE.get(meta.debounceKey) || 0;
+    if ((now - last) < (meta.debounceSec || 90)) return;
+    FACTION_NEWS_DEBOUNCE.set(meta.debounceKey, now);
+  }
+
+  const item = {
+    id: `n_${now}_${crypto.randomBytes(2).toString("hex")}`,
+    type: String(type || "INFO"),
+    text: String(text || "").slice(0, 220),
+    regionName: meta.regionName || "",
+    parcelUuid: meta.parcelUuid || "",
+    time: now
+  };
+
+  FACTION_NEWS.unshift(item);
+  if (FACTION_NEWS.length > FACTION_NEWS_MAX_ITEMS) {
+    FACTION_NEWS = FACTION_NEWS.slice(0, FACTION_NEWS_MAX_ITEMS);
+  }
+  await dbSet("FACTION_NEWS", JSON.stringify(FACTION_NEWS));
+}
+
+// --------------------------------------------------------
+// BLACKLIST DE PARCELAS
+// --------------------------------------------------------
+async function saveFactionBlacklist() {
+  await dbSet("FACTION_BLACKLIST", JSON.stringify(Array.from(FACTION_BLACKLIST.values())));
+}
+
+// --------------------------------------------------------
+// CAPTURAS ATIVAS (PISCAR ROSA/ROXO NO MAPA + ALERTA DE ATAQUE)
+// --------------------------------------------------------
+function pruneStaleActiveCaptures() {
+  const now = getUnixTime();
+  for (const [pUuid, cap] of FACTION_ACTIVE_CAPTURES.entries()) {
+    if ((now - (cap.lastPingAt || 0)) > FACTION_CAPTURE_TTL) {
+      FACTION_ACTIVE_CAPTURES.delete(pUuid);
+    }
+  }
+}
+setInterval(pruneStaleActiveCaptures, 15000);
+
+// --------------------------------------------------------
+// HELPERS DE LEVEL, XP E ALIANÇAS
+// --------------------------------------------------------
 function getFactionXpStep(level) {
   return Math.round(50 * Math.pow(1.35, level));
 }
@@ -3392,7 +3469,138 @@ function getFactionTerritoryStats(factionId, excludeParcelUuid = "") {
   return { parcelCount, totalArea };
 }
 
-// Called inside GFN /action "cargo sell" — modifies cargo value & awards faction XP
+function getFactionByPermId(permId) {
+  const facId = FACTION_BY_PERM_ID.get(String(permId || "").toUpperCase());
+  return facId ? FACTIONS.get(facId) : null;
+}
+
+function getFactionAlliance(facOrPermId) {
+  const permId = typeof facOrPermId === "string" ? facOrPermId : facOrPermId?.permId;
+  if (!permId) return null;
+  const allyId = ALLIANCE_BY_PERM_ID.get(permId);
+  return allyId ? (ALLIANCES.get(allyId) || null) : null;
+}
+
+function areFactionsAllied(facIdA, facIdB) {
+  if (!facIdA || !facIdB || facIdA === facIdB) return false;
+  const facA = FACTIONS.get(facIdA);
+  const facB = FACTIONS.get(facIdB);
+  if (!facA || !facB || !facA.permId || !facB.permId) return false;
+  const allyA = ALLIANCE_BY_PERM_ID.get(facA.permId);
+  const allyB = ALLIANCE_BY_PERM_ID.get(facB.permId);
+  return Boolean(allyA && allyB && allyA === allyB);
+}
+
+function getAllianceMemberFactions(fac) {
+  if (!fac) return [];
+  const ally = getFactionAlliance(fac);
+  if (!ally) return [fac];
+  const list = [];
+  for (const pid of (ally.members || [])) {
+    const memberFac = getFactionByPermId(pid);
+    if (memberFac) list.push(memberFac);
+  }
+  return list.length > 0 ? list : [fac];
+}
+
+function getAllianceTerritoryStats(fac) {
+  const memberFacs = getAllianceMemberFactions(fac);
+  let parcelCount = 0;
+  let totalArea = 0;
+  for (const mf of memberFacs) {
+    const st = getFactionTerritoryStats(mf.id);
+    parcelCount += st.parcelCount;
+    totalArea += st.totalArea;
+  }
+  return { parcelCount, totalArea, factionCount: memberFacs.length };
+}
+
+function rebuildAllianceIndexes() {
+  ALLIANCE_BY_PERM_ID.clear();
+  for (const ally of ALLIANCES.values()) {
+    for (const pid of (ally.members || [])) {
+      ALLIANCE_BY_PERM_ID.set(pid, ally.id);
+    }
+  }
+}
+
+async function saveAlliance(ally) {
+  ALLIANCES.set(ally.id, ally);
+  rebuildAllianceIndexes();
+  await dbSet(`alliance_${ally.id}`, JSON.stringify(ally));
+}
+
+async function deleteAllianceFromDb(allianceId) {
+  ALLIANCES.delete(allianceId);
+  rebuildAllianceIndexes();
+  await db.query("DELETE FROM kvstore WHERE id=$1", [`alliance_${allianceId}`]);
+}
+
+async function saveAllianceInvites() {
+  await dbSet("FACTION_ALLIANCE_INVITES", JSON.stringify(ALLIANCE_INVITES));
+}
+
+async function removePermIdFromAlliancesAndInvites(permId) {
+  if (!permId) return;
+
+  // Limpa convites envolvendo esta facção
+  const beforeLen = ALLIANCE_INVITES.length;
+  ALLIANCE_INVITES = ALLIANCE_INVITES.filter(inv => inv.fromPermId !== permId && inv.toPermId !== permId);
+  if (ALLIANCE_INVITES.length !== beforeLen) {
+    await saveAllianceInvites();
+  }
+
+  // Remove da aliança atual (se estiver em alguma)
+  const ally = getFactionAlliance(permId);
+  if (!ally) return;
+
+  ally.members = (ally.members || []).filter(p => p !== permId);
+  if (ally.kickVotes) {
+    delete ally.kickVotes[permId];
+    for (const targetPid of Object.keys(ally.kickVotes)) {
+      ally.kickVotes[targetPid].voters = (ally.kickVotes[targetPid].voters || []).filter(v => v !== permId);
+      if (ally.kickVotes[targetPid].voters.length === 0) {
+        delete ally.kickVotes[targetPid];
+      }
+    }
+  }
+
+  if (ally.members.length < 2) {
+    await deleteAllianceFromDb(ally.id);
+  } else {
+    await saveAlliance(ally);
+  }
+}
+
+async function grantXpToFaction(facId, xpAmount) {
+  if (!facId || xpAmount <= 0) return;
+  const liveFac = FACTIONS.get(facId);
+  if (!liveFac) return;
+
+  const prevInfo = computeFactionLevelInfo(liveFac.xp || 0);
+  liveFac.xp = Math.round(((Number(liveFac.xp) || 0) + xpAmount) * 100) / 100;
+  const newInfo = computeFactionLevelInfo(liveFac.xp);
+  liveFac.level = newInfo.level;
+  liveFac.updatedAt = getUnixTime();
+  await saveFaction(liveFac);
+
+  if (newInfo.level > prevInfo.level) {
+    if (liveFac.leaderUuid) {
+      await addPlayerMessage(
+        liveFac.leaderUuid,
+        `🎉 [STREET CONQUESTERS] Your faction "${liveFac.name}" reached LEVEL ${newInfo.level}! Territory capacity increased to ${newInfo.maxSqm.toLocaleString("en-US")} sqm.`
+      );
+    }
+    await pushFactionNews(
+      "LEVEL_UP",
+      `⭐ ${liveFac.name} reached LEVEL ${newInfo.level} (Max turf: ${newInfo.maxSqm.toLocaleString("en-US")} sqm)!`
+    );
+  }
+}
+
+// --------------------------------------------------------
+// INTEGRAÇÃO COM VENDA DE CARGA GFN (COM REGRAS DE ALIANÇA)
+// --------------------------------------------------------
 async function applyFactionCargoEffect(userUuid, parcelUuid, baseCargoValue, currentPrice) {
   const cleanParcel = String(parcelUuid || "").trim().toLowerCase();
   const cleanUser = String(userUuid || "").trim().toLowerCase();
@@ -3400,77 +3608,104 @@ async function applyFactionCargoEffect(userUuid, parcelUuid, baseCargoValue, cur
 
   const parcelObj = FACTION_PARCELS.get(cleanParcel);
   if (!parcelObj || !FACTIONS.has(parcelObj.factionId)) {
-    return currentPrice; // Neutral territory -> no changes
+    return currentPrice; // Território neutro -> sem mudanças
   }
 
   const ownerFac = FACTIONS.get(parcelObj.factionId);
-  const { totalArea: ownerTotalSqm } = getFactionTerritoryStats(ownerFac.id);
+  const { totalArea: ownerOwnSqm } = getFactionTerritoryStats(ownerFac.id);
+  const ownerAlliance = getFactionAlliance(ownerFac);
+  const { totalArea: ownerAllianceSqm } = getAllianceTerritoryStats(ownerFac);
 
   const sellerFacId = FACTION_BY_MEMBER.get(cleanUser);
   const sellerFac = (sellerFacId && FACTIONS.has(sellerFacId)) ? FACTIONS.get(sellerFacId) : null;
 
+  const isSameFaction = Boolean(sellerFac && sellerFac.id === ownerFac.id);
+  const isAlliedFaction = Boolean(sellerFac && areFactionsAllied(sellerFac.id, ownerFac.id));
+
   let finalPrice = currentPrice;
   let xpRatePer1k = FACTION_XP_PER_1K_NEUTRAL;
+  let sellerIsOutsideAlliance = false;
 
-  if (sellerFac && sellerFac.id === ownerFac.id) {
-    // SAME FACTION: +1% per 1,000 sqm controlled by the faction
+  if (isSameFaction) {
+    // MESMA FACÇÃO: bônus completo (+1% por 1.000 sqm da própria facção)
     xpRatePer1k = FACTION_XP_PER_1K_ALLY;
-    const bonusPct = ownerTotalSqm / 1000.0;
+    const bonusPct = ownerOwnSqm / 1000.0;
     const bonusAmount = Math.round(currentPrice * (bonusPct / 100.0));
     if (bonusAmount > 0) {
       finalPrice = Math.min(MAX_TRANSACTION, currentPrice + bonusAmount);
       await addPlayerMessage(
         userUuid,
-        `🏴 [STREET CONQUESTERS] Friendly territory (${ownerFac.name})! +${bonusPct.toFixed(1)}% faction bonus (+${bonusAmount} F₵) from ${ownerTotalSqm.toLocaleString("en-US")} sqm controlled.`
+        `🏴 [STREET CONQUESTERS] Friendly territory (${ownerFac.name})! +${bonusPct.toFixed(1)}% faction bonus (+${bonusAmount} F₵) from ${ownerOwnSqm.toLocaleString("en-US")} sqm controlled.`
       );
     }
-  } else if (sellerFac && sellerFac.id !== ownerFac.id) {
-    // RIVAL FACTION: dynamic penalty up to 60% based on SQM advantage (neutral if seller >= owner)
-    xpRatePer1k = FACTION_XP_PER_1K_RIVAL;
-    const { totalArea: sellerTotalSqm } = getFactionTerritoryStats(sellerFac.id);
-
-    if (sellerTotalSqm >= ownerTotalSqm) {
+  } else if (isAlliedFaction) {
+    // FACÇÃO ALIADA: território amigo, mas com compensação bem menor (25% do bônus normal)
+    xpRatePer1k = FACTION_XP_PER_1K_ALLY;
+    const reducedBonusPct = (ownerOwnSqm / 1000.0) * FACTION_ALLY_CARGO_BONUS_MULT;
+    const bonusAmount = Math.round(currentPrice * (reducedBonusPct / 100.0));
+    if (bonusAmount > 0) {
+      finalPrice = Math.min(MAX_TRANSACTION, currentPrice + bonusAmount);
       await addPlayerMessage(
         userUuid,
-        `🛡 [STREET CONQUESTERS] Rival territory (${ownerFac.name}), but your faction's territory (${sellerTotalSqm.toLocaleString("en-US")} sqm) neutralized their cargo tax!`
+        `🤝 [STREET CONQUESTERS] Allied territory (${ownerFac.name})! Reduced allied bonus: +${reducedBonusPct.toFixed(2)}% (+${bonusAmount} F₵).`
       );
     } else {
-      const sqmDiff = ownerTotalSqm - sellerTotalSqm;
+      await addPlayerMessage(
+        userUuid,
+        `🤝 [STREET CONQUESTERS] Allied territory (${ownerFac.name})! Safe passage (no rival cargo tax).`
+      );
+    }
+  } else if (sellerFac) {
+    // FACÇÃO RIVAL (FORA DA ALIANÇA): compara SQM da aliança/facção do vendedor vs dona do terreno
+    xpRatePer1k = FACTION_XP_PER_1K_RIVAL;
+    sellerIsOutsideAlliance = true;
+    const { totalArea: sellerPowerSqm } = getAllianceTerritoryStats(sellerFac);
+
+    if (sellerPowerSqm >= ownerAllianceSqm) {
+      await addPlayerMessage(
+        userUuid,
+        `🛡 [STREET CONQUESTERS] Rival territory (${ownerFac.name}), but your territorial power (${sellerPowerSqm.toLocaleString("en-US")} sqm) neutralized their cargo tax!`
+      );
+    } else {
+      const sqmDiff = ownerAllianceSqm - sellerPowerSqm;
       const penaltyPct = Math.min(FACTION_MAX_RIVAL_PENALTY_PCT, sqmDiff / 1000.0);
       const penaltyAmount = Math.round(currentPrice * (penaltyPct / 100.0));
       if (penaltyAmount > 0) {
         finalPrice = Math.max(0, currentPrice - penaltyAmount);
         await addPlayerMessage(
           userUuid,
-          `⚔ [STREET CONQUESTERS] Rival territory (${ownerFac.name})! -${penaltyPct.toFixed(1)}% cargo tax (-${penaltyAmount} F₵) due to territorial disadvantage (${sellerTotalSqm.toLocaleString("en-US")} vs ${ownerTotalSqm.toLocaleString("en-US")} sqm).`
+          `⚔ [STREET CONQUESTERS] Rival territory (${ownerFac.name})! -${penaltyPct.toFixed(1)}% cargo tax (-${penaltyAmount} F₵) due to territorial disadvantage (${sellerPowerSqm.toLocaleString("en-US")} vs ${ownerAllianceSqm.toLocaleString("en-US")} sqm).`
         );
       }
     }
   } else {
-    // NEUTRAL PLAYER (no faction): unchanged payout, medium XP for controlling faction
+    // VENDEDOR NEUTRO (sem facção): valor da carga normal, XP médio para a dona + split reduzido para aliadas
     xpRatePer1k = FACTION_XP_PER_1K_NEUTRAL;
+    sellerIsOutsideAlliance = true;
   }
 
-  // Convert normal cargo value into XP for the territory's controlling faction
+  // Distribuição de XP:
+  // - Dona real da parcela ganha 100% do XP normal
+  // - Outras facções da aliança (quando vendedor é de fora da aliança) ganham (XP * 0.5) / totalDeFaccoesNaAlianca
   const safeBase = Math.max(0, Number(baseCargoValue) || 0);
   const xpGain = Math.round(((safeBase / 1000.0) * xpRatePer1k) * 100) / 100;
 
   if (xpGain > 0) {
     await withLock("FACTION_GLOBAL_LOCK", async () => {
-      const liveFac = FACTIONS.get(ownerFac.id);
-      if (!liveFac) return;
-      const prevInfo = computeFactionLevelInfo(liveFac.xp || 0);
-      liveFac.xp = Math.round(((Number(liveFac.xp) || 0) + xpGain) * 100) / 100;
-      const newInfo = computeFactionLevelInfo(liveFac.xp);
-      liveFac.level = newInfo.level;
-      liveFac.updatedAt = getUnixTime();
-      await saveFaction(liveFac);
+      await grantXpToFaction(ownerFac.id, xpGain);
 
-      if (newInfo.level > prevInfo.level && liveFac.leaderUuid) {
-        await addPlayerMessage(
-          liveFac.leaderUuid,
-          `🎉 [STREET CONQUESTERS] Your faction "${liveFac.name}" reached LEVEL ${newInfo.level}! Territory capacity increased to ${newInfo.maxSqm.toLocaleString("en-US")} sqm.`
-        );
+      if (sellerIsOutsideAlliance && ownerAlliance && Array.isArray(ownerAlliance.members) && ownerAlliance.members.length > 1) {
+        const allianceSize = ownerAlliance.members.length;
+        const sharedXp = Math.round(((xpGain * 0.5) / allianceSize) * 100) / 100;
+        if (sharedXp > 0) {
+          for (const allyPermId of ownerAlliance.members) {
+            if (allyPermId === ownerFac.permId) continue;
+            const allyFac = getFactionByPermId(allyPermId);
+            if (allyFac) {
+              await grantXpToFaction(allyFac.id, sharedXp);
+            }
+          }
+        }
       }
     });
   }
@@ -3659,9 +3894,13 @@ function buildParcelGeometryFromGrid(gridRowsStr) {
 function rebuildFactionIndexes() {
   FACTION_BY_MEMBER.clear();
   FACTION_BY_LEADER_NAME.clear();
+  FACTION_BY_PERM_ID.clear();
   for (const fac of FACTIONS.values()) {
     if (fac.leaderName) {
       FACTION_BY_LEADER_NAME.set(normalizeLegacyName(fac.leaderName).toLowerCase(), fac.id);
+    }
+    if (fac.permId) {
+      FACTION_BY_PERM_ID.set(fac.permId, fac.id);
     }
     for (const mUuid of Object.keys(fac.members || {})) {
       FACTION_BY_MEMBER.set(mUuid.toLowerCase(), fac.id);
@@ -3676,13 +3915,21 @@ async function saveFaction(fac) {
 }
 
 async function deleteFactionFromDb(factionId) {
+  const existing = FACTIONS.get(factionId);
+  const oldPermId = existing ? existing.permId : "";
+
   FACTIONS.delete(factionId);
   rebuildFactionIndexes();
   await db.query("DELETE FROM kvstore WHERE id=$1", [`faction_${factionId}`]);
 
+  if (oldPermId) {
+    await removePermIdFromAlliancesAndInvites(oldPermId);
+  }
+
   for (const [pUuid, pObj] of FACTION_PARCELS.entries()) {
     if (pObj.factionId === factionId) {
       FACTION_PARCELS.delete(pUuid);
+      FACTION_ACTIVE_CAPTURES.delete(pUuid);
       await db.query("DELETE FROM kvstore WHERE id=$1", [`faction_parcel_${pUuid}`]);
     }
   }
@@ -3695,6 +3942,7 @@ async function saveFactionParcel(parcelObj) {
 
 async function deleteFactionParcelFromDb(parcelUuid) {
   FACTION_PARCELS.delete(parcelUuid);
+  FACTION_ACTIVE_CAPTURES.delete(parcelUuid);
   await db.query("DELETE FROM kvstore WHERE id=$1", [`faction_parcel_${parcelUuid}`]);
 }
 
@@ -3704,21 +3952,43 @@ async function initFactionSystem() {
     FACTIONS.clear();
     FACTION_BY_MEMBER.clear();
     FACTION_BY_LEADER_NAME.clear();
+    FACTION_BY_PERM_ID.clear();
     FACTION_PARCELS.clear();
+    ALLIANCES.clear();
+    ALLIANCE_BY_PERM_ID.clear();
+    ALLIANCE_INVITES = [];
+    FACTION_NEWS = [];
+    FACTION_BLACKLIST.clear();
 
+    const bootNow = getUnixTime();
+    let migratedPermIds = 0;
+
+    // 1. Carrega facções e gera permId imutável para qualquer facção que ainda não tenha
     const fq = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'faction_%' AND id NOT LIKE 'faction_parcel_%'");
     for (const row of fq.rows) {
       try {
         const fac = JSON.parse(row.value);
         if (fac && fac.id) {
-          if (typeof fac.xp !== "number") fac.xp = 0;
+          let modified = false;
+          if (typeof fac.xp !== "number") { fac.xp = 0; modified = true; }
           fac.level = computeFactionLevelInfo(fac.xp).level;
+
+          if (!fac.permId) {
+            fac.permId = generateFactionPermId(fac.name || fac.id, bootNow + migratedPermIds);
+            migratedPermIds++;
+            modified = true;
+          }
+
           FACTIONS.set(fac.id, fac);
+          if (modified) {
+            await dbSet(`faction_${fac.id}`, JSON.stringify(fac));
+          }
         }
       } catch (e) {}
     }
     rebuildFactionIndexes();
 
+    // 2. Carrega parcelas conquistadas
     const pq = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'faction_parcel_%'");
     for (const row of pq.rows) {
       try {
@@ -3727,7 +3997,62 @@ async function initFactionSystem() {
       } catch (e) {}
     }
 
-    console.log(`[STREET-CONQUESTERS] Loaded ${FACTIONS.size} factions and ${FACTION_PARCELS.size} conquered parcels.`);
+    // 3. Carrega alianças
+    const aq = await db.query("SELECT id, value FROM kvstore WHERE id LIKE 'alliance_%'");
+    for (const row of aq.rows) {
+      try {
+        const ally = JSON.parse(row.value);
+        if (ally && ally.id && Array.isArray(ally.members)) {
+          // Mantém apenas permIds de facções que ainda existem
+          const validMembers = ally.members.filter(pid => FACTION_BY_PERM_ID.has(pid));
+          if (validMembers.length >= 2) {
+            ally.members = validMembers;
+            if (!ally.kickVotes) ally.kickVotes = {};
+            ALLIANCES.set(ally.id, ally);
+          } else {
+            await db.query("DELETE FROM kvstore WHERE id=$1", [row.id]);
+          }
+        }
+      } catch (e) {}
+    }
+    rebuildAllianceIndexes();
+
+    // 4. Carrega convites de aliança pendentes
+    const invRaw = await dbGet("FACTION_ALLIANCE_INVITES");
+    if (invRaw) {
+      try {
+        const parsedInv = JSON.parse(invRaw);
+        if (Array.isArray(parsedInv)) {
+          ALLIANCE_INVITES = parsedInv.filter(i => FACTION_BY_PERM_ID.has(i.fromPermId) && FACTION_BY_PERM_ID.has(i.toPermId));
+        }
+      } catch (e) {}
+    }
+
+    // 5. Carrega mural de notícias
+    const newsRaw = await dbGet("FACTION_NEWS");
+    if (newsRaw) {
+      try {
+        const parsedNews = JSON.parse(newsRaw);
+        if (Array.isArray(parsedNews)) FACTION_NEWS = parsedNews.slice(0, FACTION_NEWS_MAX_ITEMS);
+      } catch (e) {}
+    }
+
+    // 6. Carrega blacklist de parcelas
+    const blRaw = await dbGet("FACTION_BLACKLIST");
+    if (blRaw) {
+      try {
+        const parsedBl = JSON.parse(blRaw);
+        if (Array.isArray(parsedBl)) {
+          for (const entry of parsedBl) {
+            if (entry && entry.parcelUuid) {
+              FACTION_BLACKLIST.set(String(entry.parcelUuid).toLowerCase(), entry);
+            }
+          }
+        }
+      } catch (e) {}
+    }
+
+    console.log(`[STREET-CONQUESTERS] Loaded ${FACTIONS.size} factions (${migratedPermIds} new permIds), ${FACTION_PARCELS.size} parcels, ${ALLIANCES.size} alliances, ${FACTION_BLACKLIST.size} blacklisted.`);
   } catch (e) {
     console.error("Error in initFactionSystem:", e);
   }
@@ -3737,9 +4062,20 @@ function serializeFactionPublic(fac) {
   const membersArr = Object.values(fac.members || {});
   const { parcelCount, totalArea } = getFactionTerritoryStats(fac.id);
   const lvl = computeFactionLevelInfo(fac.xp || 0);
+  const ally = getFactionAlliance(fac);
+
+  const allies = [];
+  if (ally) {
+    for (const pid of ally.members) {
+      if (pid === fac.permId) continue;
+      const other = getFactionByPermId(pid);
+      if (other) allies.push({ permId: other.permId, id: other.id, name: other.name, logo: other.logo || "" });
+    }
+  }
 
   return {
     id: fac.id,
+    permId: fac.permId,
     name: fac.name,
     logo: fac.logo || "",
     leaderUuid: fac.leaderUuid,
@@ -3754,12 +4090,104 @@ function serializeFactionPublic(fac) {
     progressPct: lvl.progressPct,
     maxSqm: lvl.maxSqm,
     cargoBonusPct: Math.round((totalArea / 1000.0) * 100) / 100,
+    allianceId: ally ? ally.id : "",
+    allies,
     createdAt: fac.createdAt
   };
 }
 
-// 1. LSL: sync player faction state (includes level, XP, used SQM and max SQM)
+function serializeAllianceForLeader(fac) {
+  const ally = getFactionAlliance(fac);
+
+  const incomingInvites = ALLIANCE_INVITES
+    .filter(inv => inv.toPermId === fac.permId)
+    .map(inv => {
+      const fromFac = getFactionByPermId(inv.fromPermId);
+      return {
+        id: inv.id,
+        fromPermId: inv.fromPermId,
+        fromName: fromFac ? fromFac.name : "Unknown Faction",
+        fromLeader: fromFac ? fromFac.leaderName : "",
+        createdAt: inv.createdAt
+      };
+    });
+
+  const outgoingInvites = ALLIANCE_INVITES
+    .filter(inv => inv.fromPermId === fac.permId)
+    .map(inv => {
+      const toFac = getFactionByPermId(inv.toPermId);
+      return {
+        id: inv.id,
+        toPermId: inv.toPermId,
+        toName: toFac ? toFac.name : "Unknown Faction",
+        createdAt: inv.createdAt
+      };
+    });
+
+  if (!ally) {
+    return {
+      inAlliance: false,
+      id: "",
+      members: [],
+      kickVotes: [],
+      incomingInvites,
+      outgoingInvites
+    };
+  }
+
+  const membersDetailed = [];
+  for (const pid of ally.members) {
+    const mf = getFactionByPermId(pid);
+    if (!mf) continue;
+    const st = getFactionTerritoryStats(mf.id);
+    membersDetailed.push({
+      permId: mf.permId,
+      id: mf.id,
+      name: mf.name,
+      leaderName: mf.leaderName,
+      logo: mf.logo || "",
+      level: computeFactionLevelInfo(mf.xp || 0).level,
+      totalArea: st.totalArea,
+      isSelf: mf.permId === fac.permId
+    });
+  }
+
+  const otherMembersCount = Math.max(1, ally.members.length - 1);
+  const votesNeeded = Math.floor(otherMembersCount / 2) + 1;
+
+  const kickVotesList = [];
+  for (const [targetPid, voteObj] of Object.entries(ally.kickVotes || {})) {
+    const targetFac = getFactionByPermId(targetPid);
+    if (!targetFac) continue;
+    const voters = Array.isArray(voteObj.voters) ? voteObj.voters : [];
+    kickVotesList.push({
+      targetPermId: targetPid,
+      targetName: targetFac.name,
+      votesCurrent: voters.length,
+      votesNeeded,
+      iVoted: voters.includes(fac.permId)
+    });
+  }
+
+  return {
+    inAlliance: true,
+    id: ally.id,
+    createdAt: ally.createdAt,
+    members: membersDetailed,
+    votesNeeded,
+    kickVotes: kickVotesList,
+    incomingInvites,
+    outgoingInvites
+  };
+}
+
+// ========================================================
+// LSL ENDPOINTS
+// ========================================================
+
+// 1. LSL: sync player faction state (inclui permId, aliança e alerta de território sob ataque)
 app.get("/faction/player", requireToken, async (req, res) => {
+  pruneStaleActiveCaptures();
   const cleanUuid = String(req.query.uuid || "").trim().toLowerCase();
   const cleanName = normalizeLegacyName(req.query.legacyName || "");
   if (!cleanUuid) return res.status(400).json({ status: "ERROR", message: "Missing UUID." });
@@ -3781,11 +4209,28 @@ app.get("/faction/player", requireToken, async (req, res) => {
 
   const { totalArea } = getFactionTerritoryStats(fac.id);
   const lvl = computeFactionLevelInfo(fac.xp || 0);
+  const ally = getFactionAlliance(fac);
+
+  // Verifica se algum território desta facção está sendo atacado agora
+  let alertRegion = "";
+  let alertAttacker = "";
+  let alertSlurl = "";
+  for (const cap of FACTION_ACTIVE_CAPTURES.values()) {
+    if (!cap.isNeutral && cap.defenderFacId === fac.id) {
+      alertRegion = cap.regionName || "Unknown";
+      alertAttacker = cap.attackerFacName || "Rivals";
+      const cx = Math.round(cap.center?.x || 128);
+      const cy = Math.round(cap.center?.y || 128);
+      alertSlurl = `secondlife://${encodeURIComponent(alertRegion)}/${cx}/${cy}/25`;
+      break;
+    }
+  }
 
   res.json({
     status: "OK",
     inFaction: 1,
     factionId: fac.id,
+    permId: fac.permId,
     factionName: fac.name,
     logo: fac.logo || "",
     role: member.role,
@@ -3796,11 +4241,16 @@ app.get("/faction/player", requireToken, async (req, res) => {
     currentLevelXp: lvl.currentLevelXp,
     nextLevelXp: lvl.nextLevelXp,
     totalArea,
-    maxSqm: lvl.maxSqm
+    maxSqm: lvl.maxSqm,
+    allianceId: ally ? ally.id : "",
+    allyCount: ally ? Math.max(0, ally.members.length - 1) : 0,
+    alertRegion,
+    alertAttacker,
+    alertSlurl
   });
 });
 
-// 2. LSL: create faction
+// 2. LSL: create faction (gera permId imutável no momento da criação)
 app.post("/faction/create", requireToken, async (req, res) => {
   const { uuid, legacyName, factionName } = req.body;
   const cleanUuid = String(uuid || "").trim().toLowerCase();
@@ -3826,10 +4276,12 @@ app.post("/faction/create", requireToken, async (req, res) => {
 
     const now = getUnixTime();
     const factionId = `fac_${now}_${crypto.randomBytes(3).toString("hex")}`;
+    const permId = generateFactionPermId(cleanFacName, now);
     const password = generateFactionPassword(cleanUuid, now);
 
     const newFac = {
       id: factionId,
+      permId,
       name: cleanFacName,
       logo: "",
       leaderUuid: cleanUuid,
@@ -3855,6 +4307,7 @@ app.post("/faction/create", requireToken, async (req, res) => {
     res.json({
       status: "OK",
       factionId: newFac.id,
+      permId: newFac.permId,
       factionName: newFac.name,
       role: "leader",
       leaderUuid: cleanUuid,
@@ -3870,7 +4323,7 @@ app.post("/faction/create", requireToken, async (req, res) => {
   });
 });
 
-// 3. LSL: leader updates faction name, logo or password
+// 3. LSL: leader updates faction name, logo or password (permId NUNCA muda)
 app.post("/faction/update", requireToken, async (req, res) => {
   const { uuid, factionName, logo, password } = req.body;
   const cleanUuid = String(uuid || "").trim().toLowerCase();
@@ -4142,28 +4595,191 @@ app.post("/faction/manage", requireToken, async (req, res) => {
   });
 });
 
-// 7. LSL: query current parcel owner
+// 7. LSL: query current parcel status (dono, blacklist, escudo 6h e se é território aliado)
 app.get("/faction/parcel-status", requireToken, (req, res) => {
   const parcelUuid = String(req.query.parcelUuid || "").trim().toLowerCase();
+  const viewerFactionId = String(req.query.factionId || "").trim();
   if (!parcelUuid) return res.status(400).json({ status: "ERROR" });
+
+  if (FACTION_BLACKLIST.has(parcelUuid)) {
+    return res.json({
+      status: "OK",
+      blacklisted: 1,
+      owned: 0,
+      factionId: "",
+      factionName: "",
+      isAlly: 0,
+      shielded: 0,
+      shieldRemaining: 0,
+      shieldText: ""
+    });
+  }
 
   const pObj = FACTION_PARCELS.get(parcelUuid);
   if (!pObj || !FACTIONS.has(pObj.factionId)) {
-    return res.json({ status: "OK", owned: 0, factionId: "", factionName: "" });
+    return res.json({
+      status: "OK",
+      blacklisted: 0,
+      owned: 0,
+      factionId: "",
+      factionName: "",
+      isAlly: 0,
+      shielded: 0,
+      shieldRemaining: 0,
+      shieldText: ""
+    });
   }
 
+  const now = getUnixTime();
   const fac = FACTIONS.get(pObj.factionId);
+  const shieldRemaining = Math.max(0, (pObj.shieldUntil || 0) - now);
+  const isAlly = viewerFactionId ? (areFactionsAllied(viewerFactionId, fac.id) ? 1 : 0) : 0;
+
   res.json({
     status: "OK",
+    blacklisted: 0,
     owned: 1,
     factionId: fac.id,
+    ownerPermId: fac.permId,
     factionName: fac.name,
     area: pObj.area,
-    colorHex: pObj.colorHex
+    colorHex: pObj.colorHex,
+    isAlly,
+    shielded: shieldRemaining > 0 ? 1 : 0,
+    shieldRemaining,
+    shieldText: shieldRemaining > 0 ? formatRemainingShort(shieldRemaining) : ""
   });
 });
 
-// 8. LSL: register parcel conquest (enforces faction level SQM limit)
+// 7B. LSL: reporta início/progresso/parada de captura (faz mapa piscar rosa/roxo + mural de notícias)
+app.post("/faction/capture-ping", requireToken, async (req, res) => {
+  pruneStaleActiveCaptures();
+  const {
+    parcelUuid, parcelName, regionName, regionCorner, area,
+    factionId, progress, active, centerX, centerY, gridRows
+  } = req.body;
+
+  const cleanParcel = String(parcelUuid || "").trim().toLowerCase();
+  const cleanFacId = String(factionId || "").trim();
+  if (!isValidUuid(cleanParcel) || !cleanFacId) {
+    return res.status(400).json({ status: "ERROR", message: "Invalid capture ping." });
+  }
+
+  // Encerrar alerta caso o jogador tenha parado a captura
+  if (active === 0 || active === false || active === "0") {
+    const existingCap = FACTION_ACTIVE_CAPTURES.get(cleanParcel);
+    if (existingCap && existingCap.attackerFacId === cleanFacId) {
+      FACTION_ACTIVE_CAPTURES.delete(cleanParcel);
+    }
+    return res.json({ status: "OK", cleared: 1 });
+  }
+
+  if (FACTION_BLACKLIST.has(cleanParcel)) {
+    return res.json({ status: "BLACKLISTED", message: "This parcel is protected/blacklisted and cannot be conquered." });
+  }
+
+  const attackerFac = FACTIONS.get(cleanFacId);
+  if (!attackerFac) {
+    return res.json({ status: "ERROR", message: "Faction not found." });
+  }
+
+  const now = getUnixTime();
+  const existingParcel = FACTION_PARCELS.get(cleanParcel);
+  const defenderFac = (existingParcel && FACTIONS.has(existingParcel.factionId))
+    ? FACTIONS.get(existingParcel.factionId)
+    : null;
+
+  if (existingParcel && (existingParcel.shieldUntil || 0) > now) {
+    const rem = existingParcel.shieldUntil - now;
+    return res.json({
+      status: "SHIELDED",
+      shieldRemaining: rem,
+      shieldText: formatRemainingShort(rem),
+      message: `Territory is protected by a post-conquest shield (${formatRemainingShort(rem)} left).`
+    });
+  }
+
+  const isNeutral = !defenderFac;
+  const isAllySteal = Boolean(defenderFac && areFactionsAllied(attackerFac.id, defenderFac.id));
+  const cleanReg = sanitizeRegionName(regionName || existingParcel?.regionName || "Unknown Region");
+  const cleanPName = stripControlChars(parcelName || existingParcel?.parcelName || "Parcel").trim().slice(0, 64);
+  const finalArea = Math.max(16, parseInt(area, 10) || existingParcel?.area || 16);
+
+  let cornerObj = existingParcel?.regionCorner || { x: 0, y: 0 };
+  if (typeof regionCorner === "string" && regionCorner.includes(",")) {
+    const cp = regionCorner.split(",");
+    cornerObj = { x: parseInt(cp[0], 10) || 0, y: parseInt(cp[1], 10) || 0 };
+  }
+
+  const prevCap = FACTION_ACTIVE_CAPTURES.get(cleanParcel);
+  const isNewAttack = !prevCap || prevCap.attackerFacId !== attackerFac.id;
+
+  let borders = existingParcel?.borders || prevCap?.borders || [];
+  let center = existingParcel?.center || prevCap?.center || {
+    x: Math.max(0, Math.min(256, parseFloat(centerX) || 128)),
+    y: Math.max(0, Math.min(256, parseFloat(centerY) || 128))
+  };
+
+  // Se o LSL enviou o contorno (ex.: parcela neutra sendo tomada), calcula polígonos exatos para piscar no mapa
+  if (isNeutral && typeof gridRows === "string" && gridRows.trim() !== "" && borders.length === 0) {
+    const geom = buildParcelGeometryFromGrid(gridRows);
+    if (geom.borders.length > 0) {
+      borders = geom.borders;
+      center = geom.center;
+    }
+  }
+
+  FACTION_ACTIVE_CAPTURES.set(cleanParcel, {
+    parcelUuid: cleanParcel,
+    parcelName: cleanPName,
+    regionName: cleanReg,
+    regionCorner: cornerObj,
+    area: finalArea,
+    borders,
+    center,
+    attackerFacId: attackerFac.id,
+    attackerFacName: attackerFac.name,
+    defenderFacId: defenderFac ? defenderFac.id : "",
+    defenderFacName: defenderFac ? defenderFac.name : "",
+    isNeutral,
+    isAllySteal,
+    progress: Math.max(0, Math.min(100, Math.round((parseFloat(progress) || 0) * 10) / 10)),
+    startedAt: prevCap ? prevCap.startedAt : now,
+    lastPingAt: now
+  });
+
+  // Publica no mural de notícias quando a ação começa (sem spam, debounce de 90s)
+  if (isNewAttack) {
+    if (isNeutral) {
+      // Parcela neutra: sem anúncio de "sendo atacada", apenas notícia de tomada de área neutra
+      await pushFactionNews(
+        "NEUTRAL_CLAIMING",
+        `🏴 ${attackerFac.name} started claiming neutral turf "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm)!`,
+        { regionName: cleanReg, parcelUuid: cleanParcel, debounceKey: `cap_${cleanParcel}_${attackerFac.id}`, debounceSec: 90 }
+      );
+    } else if (isAllySteal) {
+      await pushFactionNews(
+        "ALLY_STEAL_START",
+        `🔪 BETRAYAL IN PROGRESS! ${attackerFac.name} is stealing "${cleanPName}" in ${cleanReg} from ally ${defenderFac.name}!`,
+        { regionName: cleanReg, parcelUuid: cleanParcel, debounceKey: `cap_${cleanParcel}_${attackerFac.id}`, debounceSec: 90 }
+      );
+    } else {
+      await pushFactionNews(
+        "UNDER_ATTACK",
+        `🚨 TURF UNDER ATTACK! ${attackerFac.name} is attacking ${defenderFac.name}'s turf "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm)!`,
+        { regionName: cleanReg, parcelUuid: cleanParcel, debounceKey: `cap_${cleanParcel}_${attackerFac.id}`, debounceSec: 90 }
+      );
+    }
+  }
+
+  res.json({
+    status: "OK",
+    isNeutral: isNeutral ? 1 : 0,
+    isAllySteal: isAllySteal ? 1 : 0
+  });
+});
+
+// 8. LSL: register parcel conquest (verifica blacklist, escudo 6h, limite SQM e aplica novo escudo de 6h)
 app.post("/faction/conquer", requireToken, async (req, res) => {
   const { factionId, winnerUuid, regionName, regionCorner, parcelUuid, parcelName, area, gridRows } = req.body;
   const cleanParcel = String(parcelUuid || "").trim().toLowerCase();
@@ -4172,6 +4788,10 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
 
   if (!isValidUuid(cleanParcel) || !cleanFacId) {
     return res.status(400).json({ status: "ERROR", message: "Invalid conquest payload." });
+  }
+
+  if (FACTION_BLACKLIST.has(cleanParcel)) {
+    return res.json({ status: "BLACKLISTED", message: "This parcel is blacklisted and cannot be conquered." });
   }
 
   await withLock(`FACTION_PARCEL_${cleanParcel}`, async () => {
@@ -4187,6 +4807,17 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
       return res.json({ status: "OK", deduplicated: 1, factionName: fac.name });
     }
 
+    // Verifica Escudo de Pós-Conquista (6 horas)
+    const prevParcel = FACTION_PARCELS.get(cleanParcel);
+    if (prevParcel && prevParcel.factionId !== cleanFacId && (prevParcel.shieldUntil || 0) > now) {
+      const rem = prevParcel.shieldUntil - now;
+      return res.json({
+        status: "SHIELDED",
+        shieldRemaining: rem,
+        message: `This territory is shielded for ${formatRemainingShort(rem)}.`
+      });
+    }
+
     const geom = buildParcelGeometryFromGrid(gridRows);
     const finalArea = Math.max(16, parseInt(area, 10) || geom.scannedArea || 16);
 
@@ -4200,7 +4831,13 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
       });
     }
 
+    const prevOwnerFac = (prevParcel && prevParcel.factionId !== fac.id && FACTIONS.has(prevParcel.factionId))
+      ? FACTIONS.get(prevParcel.factionId)
+      : null;
+    const wasAllySteal = Boolean(prevOwnerFac && areFactionsAllied(fac.id, prevOwnerFac.id));
+
     FACTION_CONQUER_DEBOUNCE.set(cleanParcel, { factionId: cleanFacId, time: now });
+    FACTION_ACTIVE_CAPTURES.delete(cleanParcel);
 
     const colorHex = computeParcelThermalColor(finalArea);
 
@@ -4211,10 +4848,14 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
       cornerY = parseInt(cp[1], 10) || 0;
     }
 
+    const cleanReg = sanitizeRegionName(regionName || "Unknown Region");
+    const cleanPName = stripControlChars(parcelName || "Parcel").trim().slice(0, 64);
+    const shieldUntil = now + FACTION_SHIELD_SECONDS;
+
     const parcelObj = {
       parcelUuid: cleanParcel,
-      parcelName: stripControlChars(parcelName || "Parcel").trim().slice(0, 64),
-      regionName: sanitizeRegionName(regionName || "Unknown Region"),
+      parcelName: cleanPName,
+      regionName: cleanReg,
       regionCorner: { x: cornerX, y: cornerY },
       factionId: fac.id,
       factionName: fac.name,
@@ -4224,11 +4865,39 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
       center: geom.center,
       borders: geom.borders,
       conqueredBy: cleanWinner,
-      conqueredAt: now
+      conqueredAt: now,
+      shieldUntil
     };
 
     await saveFactionParcel(parcelObj);
     const updatedStats = getFactionTerritoryStats(fac.id);
+
+    // Publica conquista no mural de notícias
+    if (wasAllySteal && prevOwnerFac) {
+      await pushFactionNews(
+        "ALLY_STOLEN",
+        `🐍 BETRAYAL! ${fac.name} STOLE "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm) from ally ${prevOwnerFac.name}!`,
+        { regionName: cleanReg, parcelUuid: cleanParcel }
+      );
+      if (prevOwnerFac.leaderUuid) {
+        await addPlayerMessage(
+          prevOwnerFac.leaderUuid,
+          `🐍 [STREET CONQUESTERS] BETRAYAL! Your ally "${fac.name}" stole your turf "${cleanPName}" in ${cleanReg}! You can leave or vote to kick them on the website.`
+        );
+      }
+    } else if (prevOwnerFac) {
+      await pushFactionNews(
+        "CONQUERED",
+        `🔥 ${fac.name} SEIZED "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm) from ${prevOwnerFac.name}!`,
+        { regionName: cleanReg, parcelUuid: cleanParcel }
+      );
+    } else {
+      await pushFactionNews(
+        "CLAIMED_NEUTRAL",
+        `🏴 ${fac.name} claimed neutral turf "${cleanPName}" in ${cleanReg} (${finalArea.toLocaleString("en-US")} sqm)!`,
+        { regionName: cleanReg, parcelUuid: cleanParcel }
+      );
+    }
 
     res.json({
       status: "OK",
@@ -4239,8 +4908,61 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
       maxSqm: lvl.maxSqm,
       colorHex,
       center: geom.center,
-      polygonCount: geom.borders.length
+      polygonCount: geom.borders.length,
+      shieldUntil,
+      shieldHours: 6,
+      wasAllySteal: wasAllySteal ? 1 : 0
     });
+  });
+});
+
+// ========================================================
+// ADMIN ENDPOINTS — BLACKLIST DE PARCELAS (requireToken)
+// ========================================================
+
+app.post("/faction/admin/blacklist-add", requireToken, async (req, res) => {
+  const { parcelUuid, regionName, reason } = req.body;
+  const cleanParcel = String(parcelUuid || "").trim().toLowerCase();
+  if (!isValidUuid(cleanParcel)) {
+    return res.status(400).json({ status: "ERROR", message: "Invalid parcel UUID." });
+  }
+
+  await withLock(`FACTION_PARCEL_${cleanParcel}`, async () => {
+    const entry = {
+      parcelUuid: cleanParcel,
+      regionName: sanitizeRegionName(regionName || ""),
+      reason: stripControlChars(reason || "Protected by Admin").trim().slice(0, 120),
+      addedAt: getUnixTime()
+    };
+    FACTION_BLACKLIST.set(cleanParcel, entry);
+    await saveFactionBlacklist();
+
+    // Se alguma facção dominava esta parcela, remove imediatamente
+    if (FACTION_PARCELS.has(cleanParcel)) {
+      await deleteFactionParcelFromDb(cleanParcel);
+    }
+    FACTION_ACTIVE_CAPTURES.delete(cleanParcel);
+
+    res.json({ status: "OK", blacklisted: entry, totalBlacklisted: FACTION_BLACKLIST.size });
+  });
+});
+
+app.post("/faction/admin/blacklist-remove", requireToken, async (req, res) => {
+  const cleanParcel = String(req.body.parcelUuid || "").trim().toLowerCase();
+  if (!isValidUuid(cleanParcel)) {
+    return res.status(400).json({ status: "ERROR", message: "Invalid parcel UUID." });
+  }
+
+  const existed = FACTION_BLACKLIST.delete(cleanParcel);
+  if (existed) await saveFactionBlacklist();
+  res.json({ status: "OK", removed: existed ? 1 : 0, totalBlacklisted: FACTION_BLACKLIST.size });
+});
+
+app.get("/faction/admin/blacklist-list", requireToken, (req, res) => {
+  res.json({
+    status: "OK",
+    count: FACTION_BLACKLIST.size,
+    parcels: Array.from(FACTION_BLACKLIST.values())
   });
 });
 
@@ -4267,9 +4989,15 @@ app.post("/faction/web/login", (req, res) => {
     return res.status(401).json({ status: "ERROR", message: "Invalid credentials or you are no longer the faction leader." });
   }
 
+  const now = getUnixTime();
   const parcels = [];
   for (const p of FACTION_PARCELS.values()) {
-    if (p.factionId === fac.id) parcels.push(p);
+    if (p.factionId === fac.id) {
+      parcels.push({
+        ...p,
+        shieldRemaining: Math.max(0, (p.shieldUntil || 0) - now)
+      });
+    }
   }
 
   res.json({
@@ -4277,7 +5005,8 @@ app.post("/faction/web/login", (req, res) => {
     faction: {
       ...serializeFactionPublic(fac),
       members: Object.values(fac.members || {}),
-      parcels
+      parcels,
+      alliance: serializeAllianceForLeader(fac)
     }
   });
 });
@@ -4392,6 +5121,220 @@ app.post("/faction/web/abandon-parcel", async (req, res) => {
   });
 });
 
+// --------------------------------------------------------
+// WEBSITE ENDPOINTS — SISTEMA DE ALIANÇAS (BASEADO NO permId)
+// --------------------------------------------------------
+
+// Enviar convite de aliança digitando o nome atual da facção alvo
+app.post("/faction/web/alliance/invite", async (req, res) => {
+  const { legacyName, password, targetFactionName } = req.body;
+  const fac = authenticateFactionLeader(legacyName, password);
+  if (!fac) return res.status(401).json({ status: "ERROR", message: "Unauthorized." });
+
+  const searchName = sanitizeFactionName(targetFactionName).toLowerCase();
+  if (!searchName) return res.status(400).json({ status: "ERROR", message: "Enter a faction name." });
+
+  await withLock("FACTION_GLOBAL_LOCK", async () => {
+    let targetFac = null;
+    for (const f of FACTIONS.values()) {
+      if (f.name.toLowerCase() === searchName) { targetFac = f; break; }
+    }
+
+    if (!targetFac) {
+      return res.status(404).json({ status: "ERROR", message: `Faction "${targetFactionName}" not found.` });
+    }
+    if (targetFac.permId === fac.permId) {
+      return res.status(400).json({ status: "ERROR", message: "You cannot form an alliance with your own faction." });
+    }
+
+    const myAlly = getFactionAlliance(fac);
+    const targetAlly = getFactionAlliance(targetFac);
+
+    if (myAlly && targetAlly && myAlly.id === targetAlly.id) {
+      return res.status(400).json({ status: "ERROR", message: "You are already allied with this faction." });
+    }
+    if (targetAlly) {
+      return res.status(400).json({ status: "ERROR", message: `"${targetFac.name}" is already in another alliance.` });
+    }
+
+    const dup = ALLIANCE_INVITES.find(i =>
+      (i.fromPermId === fac.permId && i.toPermId === targetFac.permId) ||
+      (i.fromPermId === targetFac.permId && i.toPermId === fac.permId)
+    );
+    if (dup) {
+      return res.status(400).json({ status: "ERROR", message: "There is already a pending alliance request between these factions." });
+    }
+
+    const invite = {
+      id: `inv_${getUnixTime()}_${crypto.randomBytes(2).toString("hex")}`,
+      fromPermId: fac.permId,
+      toPermId: targetFac.permId,
+      allianceId: myAlly ? myAlly.id : "",
+      createdAt: getUnixTime()
+    };
+
+    ALLIANCE_INVITES.push(invite);
+    await saveAllianceInvites();
+
+    res.json({
+      status: "OK",
+      message: `Alliance request sent to "${targetFac.name}".`,
+      alliance: serializeAllianceForLeader(fac)
+    });
+  });
+});
+
+// Aceitar ou recusar convite pendente de aliança
+app.post("/faction/web/alliance/respond", async (req, res) => {
+  const { legacyName, password, inviteId, accept } = req.body;
+  const fac = authenticateFactionLeader(legacyName, password);
+  if (!fac) return res.status(401).json({ status: "ERROR", message: "Unauthorized." });
+
+  await withLock("FACTION_GLOBAL_LOCK", async () => {
+    const idx = ALLIANCE_INVITES.findIndex(i => i.id === String(inviteId) && i.toPermId === fac.permId);
+    if (idx === -1) {
+      return res.status(404).json({ status: "ERROR", message: "Alliance request not found or already handled." });
+    }
+
+    const inv = ALLIANCE_INVITES[idx];
+    ALLIANCE_INVITES.splice(idx, 1);
+
+    if (!accept) {
+      await saveAllianceInvites();
+      return res.json({ status: "OK", accepted: false, alliance: serializeAllianceForLeader(fac) });
+    }
+
+    if (getFactionAlliance(fac)) {
+      await saveAllianceInvites();
+      return res.status(400).json({ status: "ERROR", message: "You are already in an alliance. Leave it first." });
+    }
+
+    const fromFac = getFactionByPermId(inv.fromPermId);
+    if (!fromFac) {
+      await saveAllianceInvites();
+      return res.status(404).json({ status: "ERROR", message: "The inviting faction no longer exists." });
+    }
+
+    let ally = getFactionAlliance(fromFac);
+    if (ally) {
+      if (!ally.members.includes(fac.permId)) ally.members.push(fac.permId);
+      await saveAlliance(ally);
+      await pushFactionNews("ALLIANCE_JOIN", `🤝 ${fac.name} joined ${fromFac.name}'s street alliance!`);
+    } else {
+      const now = getUnixTime();
+      ally = {
+        id: `ally_${now}_${crypto.randomBytes(3).toString("hex")}`,
+        members: [fromFac.permId, fac.permId],
+        kickVotes: {},
+        createdAt: now
+      };
+      await saveAlliance(ally);
+      await pushFactionNews("ALLIANCE_FORMED", `🤝 ALLIANCE FORMED! ${fromFac.name} and ${fac.name} joined forces!`);
+    }
+
+    // Remove outros convites recebidos por esta facção (já entrou em uma aliança)
+    ALLIANCE_INVITES = ALLIANCE_INVITES.filter(i => i.toPermId !== fac.permId);
+    await saveAllianceInvites();
+
+    res.json({
+      status: "OK",
+      accepted: true,
+      alliance: serializeAllianceForLeader(fac)
+    });
+  });
+});
+
+// Cancelar convite enviado
+app.post("/faction/web/alliance/cancel-invite", async (req, res) => {
+  const { legacyName, password, inviteId } = req.body;
+  const fac = authenticateFactionLeader(legacyName, password);
+  if (!fac) return res.status(401).json({ status: "ERROR", message: "Unauthorized." });
+
+  await withLock("FACTION_GLOBAL_LOCK", async () => {
+    const before = ALLIANCE_INVITES.length;
+    ALLIANCE_INVITES = ALLIANCE_INVITES.filter(i => !(i.id === String(inviteId) && i.fromPermId === fac.permId));
+    if (ALLIANCE_INVITES.length !== before) await saveAllianceInvites();
+    res.json({ status: "OK", alliance: serializeAllianceForLeader(fac) });
+  });
+});
+
+// Sair da aliança a qualquer momento
+app.post("/faction/web/alliance/leave", async (req, res) => {
+  const { legacyName, password } = req.body;
+  const fac = authenticateFactionLeader(legacyName, password);
+  if (!fac) return res.status(401).json({ status: "ERROR", message: "Unauthorized." });
+
+  await withLock("FACTION_GLOBAL_LOCK", async () => {
+    const ally = getFactionAlliance(fac);
+    if (!ally) return res.status(400).json({ status: "ERROR", message: "Your faction is not in an alliance." });
+
+    await removePermIdFromAlliancesAndInvites(fac.permId);
+    await pushFactionNews("ALLIANCE_LEAVE", `💔 ${fac.name} left their street alliance.`);
+
+    res.json({ status: "OK", alliance: serializeAllianceForLeader(fac) });
+  });
+});
+
+// Abrir ou participar de votação para expulsar uma gangue da aliança
+app.post("/faction/web/alliance/kick-vote", async (req, res) => {
+  const { legacyName, password, targetPermId } = req.body;
+  const fac = authenticateFactionLeader(legacyName, password);
+  if (!fac) return res.status(401).json({ status: "ERROR", message: "Unauthorized." });
+
+  const cleanTargetPid = String(targetPermId || "").trim().toUpperCase();
+
+  await withLock("FACTION_GLOBAL_LOCK", async () => {
+    const ally = getFactionAlliance(fac);
+    if (!ally) return res.status(400).json({ status: "ERROR", message: "Your faction is not in an alliance." });
+
+    if (ally.members.length < 3) {
+      return res.status(400).json({ status: "ERROR", message: "An alliance with only 2 gangs does not need a vote — simply click Leave Alliance." });
+    }
+    if (cleanTargetPid === fac.permId) {
+      return res.status(400).json({ status: "ERROR", message: "You cannot vote to kick your own faction." });
+    }
+    if (!ally.members.includes(cleanTargetPid)) {
+      return res.status(404).json({ status: "ERROR", message: "Target faction is not in your alliance." });
+    }
+
+    if (!ally.kickVotes) ally.kickVotes = {};
+    if (!ally.kickVotes[cleanTargetPid]) {
+      ally.kickVotes[cleanTargetPid] = { openedBy: fac.permId, openedAt: getUnixTime(), voters: [] };
+    }
+
+    const voteObj = ally.kickVotes[cleanTargetPid];
+    if (!voteObj.voters.includes(fac.permId)) {
+      voteObj.voters.push(fac.permId);
+    }
+
+    const otherMembersCount = ally.members.length - 1;
+    const votesNeeded = Math.floor(otherMembersCount / 2) + 1;
+    const targetFac = getFactionByPermId(cleanTargetPid);
+    const targetName = targetFac ? targetFac.name : "Unknown Gang";
+
+    if (voteObj.voters.length >= votesNeeded) {
+      await removePermIdFromAlliancesAndInvites(cleanTargetPid);
+      await pushFactionNews("ALLIANCE_KICK", `👢 ${targetName} was voted out of their street alliance!`);
+      return res.json({
+        status: "OK",
+        kicked: true,
+        targetName,
+        alliance: serializeAllianceForLeader(fac)
+      });
+    }
+
+    await saveAlliance(ally);
+    res.json({
+      status: "OK",
+      kicked: false,
+      targetName,
+      votesCurrent: voteObj.voters.length,
+      votesNeeded,
+      alliance: serializeAllianceForLeader(fac)
+    });
+  });
+});
+
 app.post("/faction/web/delete", async (req, res) => {
   const { legacyName, password } = req.body;
   const fac = authenticateFactionLeader(legacyName, password);
@@ -4403,20 +5346,47 @@ app.post("/faction/web/delete", async (req, res) => {
   });
 });
 
+// Mapa público completo: facções, parcelas (+ escudo), alianças, capturas piscando e mural de notícias
 app.get("/faction/web/map", (req, res) => {
+  pruneStaleActiveCaptures();
+  const now = getUnixTime();
+
   const factions = [];
   for (const fac of FACTIONS.values()) {
     factions.push(serializeFactionPublic(fac));
   }
   factions.sort((a, b) => b.totalArea - a.totalArea || b.level - a.level);
 
-  const parcels = Array.from(FACTION_PARCELS.values());
+  const parcels = [];
+  for (const p of FACTION_PARCELS.values()) {
+    const shieldRemaining = Math.max(0, (p.shieldUntil || 0) - now);
+    parcels.push({
+      ...p,
+      shieldRemaining,
+      shielded: shieldRemaining > 0
+    });
+  }
+
+  const alliances = [];
+  for (const ally of ALLIANCES.values()) {
+    const memberNames = ally.members.map(pid => {
+      const mf = getFactionByPermId(pid);
+      return mf ? { permId: mf.permId, id: mf.id, name: mf.name } : null;
+    }).filter(Boolean);
+    if (memberNames.length >= 2) {
+      alliances.push({ id: ally.id, members: memberNames });
+    }
+  }
+
   res.json({
     status: "OK",
     totalFactions: factions.length,
     totalParcels: parcels.length,
     factions,
-    parcels
+    parcels,
+    alliances,
+    activeCaptures: Array.from(FACTION_ACTIVE_CAPTURES.values()),
+    news: FACTION_NEWS
   });
 });
 
