@@ -3321,7 +3321,7 @@ const FACTION_CONQUER_DEBOUNCE = new Map(); // parcelUuid -> { factionId, time }
 
 // XP & Capacity Tuning
 const FACTION_BASE_SQM_LIMIT = 4096;
-const FACTION_SQM_PER_LEVEL  = 512;
+const FACTION_SQM_PER_LEVEL  = 1024;
 const FACTION_XP_PER_1K_ALLY    = 5.0;   // Pouco XP (mesma facção)
 const FACTION_XP_PER_1K_NEUTRAL = 15.0;   // XP médio (vendedor sem facção)
 const FACTION_XP_PER_1K_RIVAL   = 30.0;  // Bastante XP (facção rival)
