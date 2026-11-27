@@ -3338,11 +3338,11 @@ const FACTION_BASE_SQM_LIMIT = 4096;        // Limite no Nível 0
 const FACTION_SQM_PER_LEVEL  = 1024;        // +1024 sqm a cada nível
 const FACTION_SHIELD_SECONDS = 6 * 3600;    // 6 horas de Escudo de Pós-Conquista (21600s)
 const FACTION_CAPTURE_TTL    = 15;          // Segundos sem sinal para encerrar o piscar no mapa
-const FACTION_NEWS_MAX_ITEMS = 30;          // Máximo de notícias guardadas para o mural
+const FACTION_NEWS_MAX_ITEMS = 5;          // Máximo de notícias guardadas para o mural
 
-const FACTION_XP_PER_1K_ALLY    = 2.0;      // Pouco XP (mesma facção ou aliada)
-const FACTION_XP_PER_1K_NEUTRAL = 5.0;      // XP médio (vendedor sem facção)
-const FACTION_XP_PER_1K_RIVAL   = 10.0;     // Bastante XP (vendedor rival)
+const FACTION_XP_PER_1K_ALLY    = 8.0;      // Pouco XP (mesma facção ou aliada)
+const FACTION_XP_PER_1K_NEUTRAL = 20.0;     // XP médio (vendedor sem facção)
+const FACTION_XP_PER_1K_RIVAL   = 40.0;     // Bastante XP (vendedor rival)
 const FACTION_ALLY_CARGO_BONUS_MULT = 0.25; // Aliado ganha só 25% do bônus normal no terreno aliado (incentiva ser rival)
 const FACTION_MAX_RIVAL_PENALTY_PCT = 60.0; // Máximo de perda de carga em território rival
 
