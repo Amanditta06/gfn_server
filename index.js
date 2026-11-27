@@ -4072,14 +4072,10 @@ async function initFactionSystem() {
       } catch (e) {}
     }
 
-    // 5. Carrega mural de notícias
-    const newsRaw = await dbGet("FACTION_NEWS");
-    if (newsRaw) {
-      try {
-        const parsedNews = JSON.parse(newsRaw);
-        if (Array.isArray(parsedNews)) FACTION_NEWS = parsedNews.slice(0, FACTION_NEWS_MAX_ITEMS);
-      } catch (e) {}
-    }
+    // 5. Apaga todo o mural de notícias a cada restart/rebuild do servidor
+    FACTION_NEWS = [];
+    FACTION_NEWS_DEBOUNCE.clear();
+    await db.query("DELETE FROM kvstore WHERE id = 'FACTION_NEWS'");
 
     // 6. Carrega blacklist de parcelas
     const blRaw = await dbGet("FACTION_BLACKLIST");
