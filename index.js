@@ -1880,6 +1880,10 @@ app.post("/action", requireToken, async (req, res) => {
             await addPlayerMessage(user, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +15% every 10 minutes sem deliveries.`);
         }
 
+        if (savedParcelForAffinity && savedParcelForAffinity.length >= 36) {
+            price = await applyFactionCargoEffect(user, savedParcelForAffinity, baseCargoValue, price);
+        }
+        
         let recebido = 0; let boost_m = 1.0; let currentWeek = getCurrentWeek();
 
         if (player.P_W !== currentWeek) { player.P = 0; player.P_W = currentWeek; }
@@ -1980,6 +1984,7 @@ app.post("/action", requireToken, async (req, res) => {
       else if (safeTopic === "cargo sell") {
         let price = parseInt(content) || 0;
         if (price > MAX_TRANSACTION) price = MAX_TRANSACTION;
+        const baseCargoValue = price;
 
         let demandMult = 1.0; let targetParcel = null;
 
