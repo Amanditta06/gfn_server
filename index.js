@@ -1879,10 +1879,6 @@ app.post("/action", requireToken, async (req, res) => {
             let lostPercent = Math.round((1.0 - demandMult) * 100);
             await addPlayerMessage(user, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +15% every 10 minutes sem deliveries.`);
         }
-
-        if (savedParcelForAffinity && savedParcelForAffinity.length >= 36) {
-            price = await applyFactionCargoEffect(user, savedParcelForAffinity, baseCargoValue, price);
-        }
         
         let recebido = 0; let boost_m = 1.0; let currentWeek = getCurrentWeek();
 
@@ -2006,6 +2002,10 @@ app.post("/action", requireToken, async (req, res) => {
             price = Math.round(price * demandMult);
             let lostPercent = Math.round((1.0 - demandMult) * 100);
             await addPlayerMessage(user, `📉 [DEMAND ALERT] This location is saturated! Payout reduced by ${lostPercent}% (${demandMult}x). Demand recovers +15% every 10 minutes without deliveries.`);
+        }
+
+        if (savedParcelForAffinity && savedParcelForAffinity.length >= 36) {
+            price = await applyFactionCargoEffect(user, savedParcelForAffinity, baseCargoValue, price);
         }
 
         let recebido = 0; let boost_m = 1.0; let currentWeek = getCurrentWeek();
@@ -3870,9 +3870,9 @@ app.post("/faction/create", requireToken, async (req, res) => {
   });
 });
 
-// 3. LSL: leader updates faction name or logo
+// 3. LSL: leader updates faction name, logo or password
 app.post("/faction/update", requireToken, async (req, res) => {
-  const { uuid, factionName, logo } = req.body;
+  const { uuid, factionName, logo, password } = req.body;
   const cleanUuid = String(uuid || "").trim().toLowerCase();
 
   await withLock("FACTION_GLOBAL_LOCK", async () => {
@@ -3916,6 +3916,14 @@ app.post("/faction/update", requireToken, async (req, res) => {
       }
     }
 
+    if (password !== undefined) {
+      const cleanPass = stripControlChars(password).trim();
+      if (cleanPass.length < 4 || cleanPass.length > 24) {
+        return res.json({ status: "ERROR", message: "Password must be 4 to 24 characters." });
+      }
+      fac.password = cleanPass;
+    }
+
     fac.updatedAt = getUnixTime();
     await saveFaction(fac);
 
@@ -3924,6 +3932,7 @@ app.post("/faction/update", requireToken, async (req, res) => {
       factionId: fac.id,
       factionName: fac.name,
       logo: fac.logo,
+      newPassword: password !== undefined ? fac.password : "",
       memberCount: Object.keys(fac.members).length
     });
   });
@@ -4241,13 +4250,13 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
 
 function authenticateFactionLeader(legacyName, password) {
   const lookup = normalizeLegacyName(legacyName).toLowerCase();
-  const pass = String(password || "").trim().toUpperCase();
+  const pass = String(password || "").trim();
   if (!lookup || !pass) return null;
 
   const facId = FACTION_BY_LEADER_NAME.get(lookup);
   if (!facId) return null;
   const fac = FACTIONS.get(facId);
-  if (!fac || String(fac.password || "").toUpperCase() !== pass) return null;
+  if (!fac || fac.password !== pass) return null;
   return fac;
 }
 
