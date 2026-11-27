@@ -3329,7 +3329,8 @@ const FACTION_ACTIVE_CAPTURES = new Map();  // parcelUuid -> captura/ataque em a
 const FACTION_NEWS_DEBOUNCE = new Map();    // key -> unixTime
 let FACTION_NEWS = [];                      // [{ id, type, text, regionName, parcelUuid, time }]
 const FACTION_BLACKLIST = new Map();        // parcelUuid -> { parcelUuid, regionName, reason, addedAt }
-
+const FACTION_WEB_SESSIONS = new Map();     // token -> { token, deviceHash, facId, leaderUuid, passwordSnapshot, expiresAt }
+const FACTION_REMEMBER_SECONDS = 7 * 24 * 3600; // 7 dias
 // --------------------------------------------------------
 // CONFIGURAÇÕES DE BALANCEAMENTO (fácil de ajustar depois)
 // --------------------------------------------------------
@@ -3427,7 +3428,41 @@ async function pushFactionNews(type, text, meta = {}) {
 async function saveFactionBlacklist() {
   await dbSet("FACTION_BLACKLIST", JSON.stringify(Array.from(FACTION_BLACKLIST.values())));
 }
+function getClientDeviceHash(req) {
+  const rawIp = String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "").split(",")[0].trim();
+  const ua = String(req.headers["user-agent"] || "").trim();
+  if (!rawIp && !ua) return "";
+  return crypto.createHash("sha256").update(`${rawIp}|${ua}|SC_DEV`).digest("hex").slice(0, 32);
+}
 
+async function saveFactionWebSessions() {
+  const now = getUnixTime();
+  const valid = [];
+  for (const [k, s] of FACTION_WEB_SESSIONS.entries()) {
+    if ((s.expiresAt || 0) > now) valid.push(s);
+    else FACTION_WEB_SESSIONS.delete(k);
+  }
+  await dbSet("FACTION_WEB_SESSIONS", JSON.stringify(valid));
+}
+
+function buildLeaderFactionPayload(fac) {
+  const now = getUnixTime();
+  const parcels = [];
+  for (const p of FACTION_PARCELS.values()) {
+    if (p.factionId === fac.id) {
+      parcels.push({
+        ...p,
+        shieldRemaining: Math.max(0, (p.shieldUntil || 0) - now)
+      });
+    }
+  }
+  return {
+    ...serializeFactionPublic(fac),
+    members: Object.values(fac.members || {}),
+    parcels,
+    alliance: serializeAllianceForLeader(fac)
+  };
+}
 // --------------------------------------------------------
 // CAPTURAS ATIVAS (PISCAR ROSA/ROXO NO MAPA + ALERTA DE ATAQUE)
 // --------------------------------------------------------
@@ -4003,7 +4038,8 @@ async function initFactionSystem() {
     ALLIANCE_INVITES = [];
     FACTION_NEWS = [];
     FACTION_BLACKLIST.clear();
-
+    FACTION_WEB_SESSIONS.clear();
+    
     const bootNow = getUnixTime();
     let migratedPermIds = 0;
 
@@ -4091,7 +4127,21 @@ async function initFactionSystem() {
         }
       } catch (e) {}
     }
-
+    // 7. Carrega dispositivos lembrados (auto-login de 7 dias)
+    const sessRaw = await dbGet("FACTION_WEB_SESSIONS");
+    if (sessRaw) {
+      try {
+        const parsedSess = JSON.parse(sessRaw);
+        if (Array.isArray(parsedSess)) {
+          for (const s of parsedSess) {
+            if (s && s.token && (s.expiresAt || 0) > bootNow) {
+              FACTION_WEB_SESSIONS.set(s.token, s);
+            }
+          }
+        }
+      } catch (e) {}
+    }
+    
     console.log(`[STREET-CONQUESTERS] Loaded ${FACTIONS.size} factions (${migratedPermIds} new permIds), ${FACTION_PARCELS.size} parcels, ${ALLIANCES.size} alliances, ${FACTION_BLACKLIST.size} blacklisted.`);
   } catch (e) {
     console.error("Error in initFactionSystem:", e);
@@ -5050,33 +5100,108 @@ function authenticateFactionLeader(legacyName, password) {
   return fac;
 }
 
-app.post("/faction/web/login", (req, res) => {
-  const { legacyName, password } = req.body;
+app.post("/faction/web/login", async (req, res) => {
+  const { legacyName, password, remember } = req.body;
   const fac = authenticateFactionLeader(legacyName, password);
   if (!fac) {
     return res.status(401).json({ status: "ERROR", message: "Invalid credentials or you are no longer the faction leader." });
   }
 
-  const now = getUnixTime();
-  const parcels = [];
-  for (const p of FACTION_PARCELS.values()) {
-    if (p.factionId === fac.id) {
-      parcels.push({
-        ...p,
-        shieldRemaining: Math.max(0, (p.shieldUntil || 0) - now)
-      });
+  let sessionToken = "";
+  const deviceHash = getClientDeviceHash(req);
+
+  if (remember === true) {
+    const now = getUnixTime();
+    if (deviceHash) {
+      for (const [t, s] of FACTION_WEB_SESSIONS.entries()) {
+        if (s.deviceHash === deviceHash) FACTION_WEB_SESSIONS.delete(t);
+      }
     }
+    sessionToken = crypto.randomBytes(24).toString("hex");
+    FACTION_WEB_SESSIONS.set(sessionToken, {
+      token: sessionToken,
+      deviceHash,
+      facId: fac.id,
+      leaderUuid: fac.leaderUuid,
+      passwordSnapshot: fac.password,
+      expiresAt: now + FACTION_REMEMBER_SECONDS
+    });
+    await saveFactionWebSessions();
+  } else if (remember === false && deviceHash) {
+    let changed = false;
+    for (const [t, s] of FACTION_WEB_SESSIONS.entries()) {
+      if (s.deviceHash === deviceHash) {
+        FACTION_WEB_SESSIONS.delete(t);
+        changed = true;
+      }
+    }
+    if (changed) await saveFactionWebSessions();
   }
 
   res.json({
     status: "OK",
-    faction: {
-      ...serializeFactionPublic(fac),
-      members: Object.values(fac.members || {}),
-      parcels,
-      alliance: serializeAllianceForLeader(fac)
-    }
+    sessionToken,
+    faction: buildLeaderFactionPayload(fac)
   });
+});
+
+app.post("/faction/web/auto-login", async (req, res) => {
+  const token = String(req.body?.sessionToken || "").trim();
+  const deviceHash = getClientDeviceHash(req);
+  const now = getUnixTime();
+
+  let matched = null;
+  if (token && FACTION_WEB_SESSIONS.has(token)) {
+    const s = FACTION_WEB_SESSIONS.get(token);
+    if ((s.expiresAt || 0) > now) matched = s;
+  }
+
+  // Fallback pelo dispositivo (funciona mesmo em Google Sites / iframes sem localStorage)
+  if (!matched && deviceHash) {
+    for (const s of FACTION_WEB_SESSIONS.values()) {
+      if (s.deviceHash === deviceHash && (s.expiresAt || 0) > now) {
+        if (!matched || s.expiresAt > matched.expiresAt) matched = s;
+      }
+    }
+  }
+
+  if (!matched) {
+    return res.json({ status: "NO_SESSION" });
+  }
+
+  const fac = FACTIONS.get(matched.facId);
+  if (!fac || fac.leaderUuid !== matched.leaderUuid || fac.password !== matched.passwordSnapshot) {
+    FACTION_WEB_SESSIONS.delete(matched.token);
+    await saveFactionWebSessions();
+    return res.json({ status: "NO_SESSION" });
+  }
+
+  res.json({
+    status: "OK",
+    sessionToken: matched.token,
+    legacyName: fac.leaderName,
+    password: fac.password,
+    faction: buildLeaderFactionPayload(fac)
+  });
+});
+
+app.post("/faction/web/logout", async (req, res) => {
+  const token = String(req.body?.sessionToken || "").trim();
+  const deviceHash = getClientDeviceHash(req);
+  let changed = false;
+
+  if (token && FACTION_WEB_SESSIONS.delete(token)) changed = true;
+  if (deviceHash) {
+    for (const [t, s] of FACTION_WEB_SESSIONS.entries()) {
+      if (s.deviceHash === deviceHash) {
+        FACTION_WEB_SESSIONS.delete(t);
+        changed = true;
+      }
+    }
+  }
+
+  if (changed) await saveFactionWebSessions();
+  res.json({ status: "OK" });
 });
 
 app.post("/faction/web/update", async (req, res) => {
