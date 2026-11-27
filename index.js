@@ -3306,19 +3306,22 @@ app.post("/outdoor/web/admin/delete-image", async (req, res) => {
 ///////////////////////////////////////////////////////////////////
 
 // ========================================================
-// GFNF FACTION & TERRITORY CONQUEST SYSTEM
+// STREET CONQUESTERS — FACTION & TERRITORY CONQUEST SYSTEM
 // ========================================================
-const FACTIONS = new Map();             // factionId -> factionObj
-const FACTION_BY_MEMBER = new Map();    // memberUuid -> factionId
+const FACTIONS = new Map();               // factionId -> factionObj
+const FACTION_BY_MEMBER = new Map();      // memberUuid -> factionId
 const FACTION_BY_LEADER_NAME = new Map(); // leaderLegacyNameLower -> factionId
-const FACTION_PARCELS = new Map();      // parcelUuid -> parcelObj
+const FACTION_PARCELS = new Map();        // parcelUuid -> parcelObj
 const FACTION_CONQUER_DEBOUNCE = new Map(); // parcelUuid -> { factionId, time }
 
+// Short 10-char password hashed from uuid + unixTime + GFNF
 function generateFactionPassword(avatarUuid, unixTime) {
   return crypto
     .createHash("md5")
     .update(`${String(avatarUuid).trim().toLowerCase()}${unixTime}GFNF`)
-    .digest("hex");
+    .digest("hex")
+    .slice(0, 10)
+    .toUpperCase();
 }
 
 function sanitizeFactionName(raw) {
@@ -3335,11 +3338,11 @@ function sanitizeFactionLogo(raw) {
   return null;
 }
 
-// Espectro térmico logarítmico: 16 sqm (azul frio #0A2EFF) -> 65.536 sqm (vermelho #F50A0A)
+// Logarithmic thermal spectrum: 16 sqm (cold blue #0A2EFF) -> 65,536 sqm (hot red #F50A0A)
 function computeParcelThermalColor(areaSqm) {
   const clamped = Math.max(16, Math.min(65536, Number(areaSqm) || 16));
   const t = Math.max(0, Math.min(1, (Math.log2(clamped) - 4.0) / 12.0));
-  const hue = 230.0 * (1.0 - t); // 230 (azul frio) -> 0 (vermelho quente)
+  const hue = 230.0 * (1.0 - t);
   const sat = 0.92;
   const light = 0.50;
 
@@ -3359,7 +3362,7 @@ function computeParcelThermalColor(areaSqm) {
   return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
 }
 
-// Decodifica bitmask 64x64 enviada pelo LSL e extrai polígonos exatos + centro interno garantido
+// Decodes 64x64 bitmask from LSL and extracts exact polygon borders + guaranteed interior center
 function buildParcelGeometryFromGrid(gridRowsStr) {
   const grid = Array.from({ length: 64 }, () => new Uint8Array(64));
   let insideCount = 0;
@@ -3387,7 +3390,6 @@ function buildParcelGeometryFromGrid(gridRowsStr) {
     return { borders: [], center: { x: 128, y: 128 }, scannedArea: 0 };
   }
 
-  // 1. Extrai arestas direcionadas (CCW) entre células internas (1) e externas (0)
   const edgesByStart = new Map();
   const addEdge = (x1, y1, x2, y2) => {
     const k = `${x1},${y1}`;
@@ -3405,7 +3407,6 @@ function buildParcelGeometryFromGrid(gridRowsStr) {
     }
   }
 
-  // 2. Encadeia arestas em loops fechados (resolvendo quinas tocando na diagonal)
   const borders = [];
   for (const edgeList of edgesByStart.values()) {
     for (const startEdge of edgeList) {
@@ -3427,13 +3428,12 @@ function buildParcelGeometryFromGrid(gridRowsStr) {
         if (available.length === 1) {
           curr = available[0];
         } else {
-          // Prefere curva à direita para separar polígonos que tocam apenas no vértice
           let best = available[0];
           let bestScore = -99;
           for (const cand of available) {
             const dxOut = cand.x2 - cand.x1;
             const dyOut = cand.y2 - cand.y1;
-            const cross = dxIn * dyOut - dyIn * dxOut; // -1 = direita, 0 = reto, +1 = esquerda
+            const cross = dxIn * dyOut - dyIn * dxOut;
             const score = cross < 0 ? 3 : (cross === 0 ? 2 : 1);
             if (score > bestScore) { bestScore = score; best = cand; }
           }
@@ -3442,7 +3442,6 @@ function buildParcelGeometryFromGrid(gridRowsStr) {
         guard++;
       }
 
-      // 3. Simplifica vértices colineares e converte para metros (0..256)
       if (rawLoop.length >= 3) {
         const simplified = [];
         const n = rawLoop.length;
@@ -3460,7 +3459,6 @@ function buildParcelGeometryFromGrid(gridRowsStr) {
     }
   }
 
-  // 4. Centro interno garantido (célula mais distante das bordas, desempate pelo centroide)
   let sumX = 0, sumY = 0;
   const dist = Array.from({ length: 64 }, () => new Int16Array(64).fill(-1));
   const queue = [];
@@ -3542,7 +3540,6 @@ async function deleteFactionFromDb(factionId) {
   rebuildFactionIndexes();
   await db.query("DELETE FROM kvstore WHERE id=$1", [`faction_${factionId}`]);
 
-  // Remove domínio das parcelas que pertenciam à facção deletada
   for (const [pUuid, pObj] of FACTION_PARCELS.entries()) {
     if (pObj.factionId === factionId) {
       FACTION_PARCELS.delete(pUuid);
@@ -3581,7 +3578,7 @@ async function initFactionSystem() {
       } catch (e) {}
     }
 
-    console.log(`[GFNF-FACTION] Loaded ${FACTIONS.size} factions and ${FACTION_PARCELS.size} conquered parcels.`);
+    console.log(`[STREET-CONQUESTERS] Loaded ${FACTIONS.size} factions and ${FACTION_PARCELS.size} conquered parcels.`);
   } catch (e) {
     console.error("Error in initFactionSystem:", e);
   }
@@ -3610,11 +3607,11 @@ function serializeFactionPublic(fac) {
   };
 }
 
-// 1. LSL: sincroniza estado da facção do jogador
+// 1. LSL: sync player faction state
 app.get("/faction/player", requireToken, async (req, res) => {
   const cleanUuid = String(req.query.uuid || "").trim().toLowerCase();
   const cleanName = normalizeLegacyName(req.query.legacyName || "");
-  if (!cleanUuid) return res.status(400).json({ status: "ERROR", message: "missing uuid" });
+  if (!cleanUuid) return res.status(400).json({ status: "ERROR", message: "Missing UUID." });
 
   const facId = FACTION_BY_MEMBER.get(cleanUuid);
   if (!facId || !FACTIONS.has(facId)) {
@@ -3644,7 +3641,7 @@ app.get("/faction/player", requireToken, async (req, res) => {
   });
 });
 
-// 2. LSL: criar nova facção
+// 2. LSL: create faction
 app.post("/faction/create", requireToken, async (req, res) => {
   const { uuid, legacyName, factionName } = req.body;
   const cleanUuid = String(uuid || "").trim().toLowerCase();
@@ -3652,19 +3649,19 @@ app.post("/faction/create", requireToken, async (req, res) => {
   const cleanFacName = sanitizeFactionName(factionName);
 
   if (!isValidUuid(cleanUuid) || !cleanUser) {
-    return res.status(400).json({ status: "ERROR", message: "Dados do avatar inválidos." });
+    return res.status(400).json({ status: "ERROR", message: "Invalid avatar data." });
   }
   if (cleanFacName.length < 2) {
-    return res.status(400).json({ status: "ERROR", message: "O nome da facção deve ter entre 2 e 32 caracteres." });
+    return res.status(400).json({ status: "ERROR", message: "Faction name must be between 2 and 32 characters." });
   }
 
   await withLock("FACTION_GLOBAL_LOCK", async () => {
     if (FACTION_BY_MEMBER.has(cleanUuid)) {
-      return res.json({ status: "ERROR", message: "Você já pertence a uma facção." });
+      return res.json({ status: "ERROR", message: "You already belong to a faction." });
     }
     for (const f of FACTIONS.values()) {
       if (f.name.toLowerCase() === cleanFacName.toLowerCase()) {
-        return res.json({ status: "ERROR", message: "Já existe uma facção com esse nome." });
+        return res.json({ status: "ERROR", message: "A faction with that name already exists." });
       }
     }
 
@@ -3706,7 +3703,7 @@ app.post("/faction/create", requireToken, async (req, res) => {
   });
 });
 
-// 3. LSL: líder altera nome ou logo da facção
+// 3. LSL: leader updates faction name or logo
 app.post("/faction/update", requireToken, async (req, res) => {
   const { uuid, factionName, logo } = req.body;
   const cleanUuid = String(uuid || "").trim().toLowerCase();
@@ -3714,23 +3711,22 @@ app.post("/faction/update", requireToken, async (req, res) => {
   await withLock("FACTION_GLOBAL_LOCK", async () => {
     const facId = FACTION_BY_MEMBER.get(cleanUuid);
     const fac = facId ? FACTIONS.get(facId) : null;
-    if (!fac) return res.json({ status: "ERROR", message: "Você não está em uma facção." });
+    if (!fac) return res.json({ status: "ERROR", message: "You are not in a faction." });
     if (fac.leaderUuid !== cleanUuid) {
-      return res.json({ status: "ERROR", message: "Apenas o líder pode alterar as configurações da facção." });
+      return res.json({ status: "ERROR", message: "Only the faction leader can update settings." });
     }
 
     if (factionName !== undefined) {
       const cleanFacName = sanitizeFactionName(factionName);
       if (cleanFacName.length < 2) {
-        return res.json({ status: "ERROR", message: "Nome inválido (mínimo 2 caracteres)." });
+        return res.json({ status: "ERROR", message: "Invalid name (minimum 2 characters)." });
       }
       for (const f of FACTIONS.values()) {
         if (f.id !== fac.id && f.name.toLowerCase() === cleanFacName.toLowerCase()) {
-          return res.json({ status: "ERROR", message: "Já existe outra facção com esse nome." });
+          return res.json({ status: "ERROR", message: "Another faction already uses that name." });
         }
       }
       fac.name = cleanFacName;
-      // Atualiza nome nas parcelas já conquistadas
       for (const p of FACTION_PARCELS.values()) {
         if (p.factionId === fac.id) {
           p.factionName = fac.name;
@@ -3742,7 +3738,7 @@ app.post("/faction/update", requireToken, async (req, res) => {
     if (logo !== undefined) {
       const parsedLogo = sanitizeFactionLogo(logo);
       if (parsedLogo === null) {
-        return res.json({ status: "ERROR", message: "Logo inválida. Informe um UUID de textura do SL, URL http(s) válida ou NONE para remover." });
+        return res.json({ status: "ERROR", message: "Invalid logo. Enter an SL Texture UUID, valid http(s) URL, or NONE to clear." });
       }
       fac.logo = parsedLogo;
       for (const p of FACTION_PARCELS.values()) {
@@ -3766,16 +3762,16 @@ app.post("/faction/update", requireToken, async (req, res) => {
   });
 });
 
-// 4. LSL: líder deleta a facção
+// 4. LSL: leader deletes faction
 app.post("/faction/delete", requireToken, async (req, res) => {
   const cleanUuid = String(req.body.uuid || "").trim().toLowerCase();
 
   await withLock("FACTION_GLOBAL_LOCK", async () => {
     const facId = FACTION_BY_MEMBER.get(cleanUuid);
     const fac = facId ? FACTIONS.get(facId) : null;
-    if (!fac) return res.json({ status: "ERROR", message: "Você não está em uma facção." });
+    if (!fac) return res.json({ status: "ERROR", message: "You are not in a faction." });
     if (fac.leaderUuid !== cleanUuid) {
-      return res.json({ status: "ERROR", message: "Apenas o líder pode deletar a facção." });
+      return res.json({ status: "ERROR", message: "Only the faction leader can delete the faction." });
     }
 
     const oldName = fac.name;
@@ -3784,16 +3780,16 @@ app.post("/faction/delete", requireToken, async (req, res) => {
   });
 });
 
-// 5. LSL: membro (não-líder) sai da facção
+// 5. LSL: non-leader member leaves faction
 app.post("/faction/leave", requireToken, async (req, res) => {
   const cleanUuid = String(req.body.uuid || "").trim().toLowerCase();
 
   await withLock("FACTION_GLOBAL_LOCK", async () => {
     const facId = FACTION_BY_MEMBER.get(cleanUuid);
     const fac = facId ? FACTIONS.get(facId) : null;
-    if (!fac) return res.json({ status: "ERROR", message: "Você não está em uma facção." });
+    if (!fac) return res.json({ status: "ERROR", message: "You are not in a faction." });
     if (fac.leaderUuid === cleanUuid) {
-      return res.json({ status: "ERROR", message: "O líder não pode sair da facção. Passe a liderança para outro membro primeiro." });
+      return res.json({ status: "ERROR", message: "The leader cannot leave the faction. Transfer leadership to another member first." });
     }
 
     delete fac.members[cleanUuid];
@@ -3803,7 +3799,7 @@ app.post("/faction/leave", requireToken, async (req, res) => {
   });
 });
 
-// 6. LSL: gerenciamento de membros (Recrutar, Demitir, Cargos e Transferência de Liderança)
+// 6. LSL: member management (Recruit, Kick, Roles & Leadership Transfer)
 app.post("/faction/manage", requireToken, async (req, res) => {
   const { actorUuid, targetUuid, targetName, action } = req.body;
   const cleanActor = String(actorUuid || "").trim().toLowerCase();
@@ -3812,45 +3808,44 @@ app.post("/faction/manage", requireToken, async (req, res) => {
   const act = String(action || "").toUpperCase().trim();
 
   if (!isValidUuid(cleanActor) || !isValidUuid(cleanTarget)) {
-    return res.status(400).json({ status: "ERROR", message: "UUID inválido." });
+    return res.status(400).json({ status: "ERROR", message: "Invalid UUID." });
   }
   if (cleanActor === cleanTarget) {
-    return res.json({ status: "ERROR", message: "Você não pode aplicar essa ação em si mesmo." });
+    return res.json({ status: "ERROR", message: "You cannot perform this action on yourself." });
   }
 
   await withLock("FACTION_GLOBAL_LOCK", async () => {
     const facId = FACTION_BY_MEMBER.get(cleanActor);
     const fac = facId ? FACTIONS.get(facId) : null;
     if (!fac || !fac.members[cleanActor]) {
-      return res.json({ status: "ERROR", message: "Você não pertence a uma facção." });
+      return res.json({ status: "ERROR", message: "You do not belong to a faction." });
     }
 
     const actorRole = fac.members[cleanActor].role;
     if (actorRole !== "leader" && actorRole !== "subleader") {
-      return res.json({ status: "ERROR", message: "Você não tem permissão para gerenciar membros." });
+      return res.json({ status: "ERROR", message: "You do not have permission to manage members." });
     }
 
     const targetFacId = FACTION_BY_MEMBER.get(cleanTarget);
     const targetMember = fac.members[cleanTarget];
     const now = getUnixTime();
 
-    // Sublíder não pode fazer nada contra o líder
     if (actorRole === "subleader" && cleanTarget === fac.leaderUuid) {
-      return res.json({ status: "ERROR", message: "Sublíderes não podem executar ações contra o líder." });
+      return res.json({ status: "ERROR", message: "Sub-Leaders cannot perform actions against the Leader." });
     }
 
     if (act === "RECRUIT") {
       if (targetFacId === fac.id) {
-        return res.json({ status: "ERROR", message: "Este jogador já está na sua facção." });
+        return res.json({ status: "ERROR", message: "This player is already in your faction." });
       }
       if (targetFacId && FACTIONS.has(targetFacId)) {
-        return res.json({ status: "ERROR", message: "Este jogador já pertence a outra facção." });
+        return res.json({ status: "ERROR", message: "This player already belongs to another faction." });
       }
 
       fac.members[cleanTarget] = {
         uuid: cleanTarget,
         legacyName: cleanTargetName || cleanTarget,
-        role: "capanga",
+        role: "enforcer",
         joinedAt: now
       };
       fac.updatedAt = now;
@@ -3868,12 +3863,12 @@ app.post("/faction/manage", requireToken, async (req, res) => {
     }
 
     if (!targetMember) {
-      return res.json({ status: "ERROR", message: "Este jogador não é membro da sua facção." });
+      return res.json({ status: "ERROR", message: "This player is not a member of your faction." });
     }
 
     if (act === "KICK") {
       if (cleanTarget === fac.leaderUuid) {
-        return res.json({ status: "ERROR", message: "O líder não pode ser demitido." });
+        return res.json({ status: "ERROR", message: "The leader cannot be kicked." });
       }
       const kickedName = targetMember.legacyName;
       delete fac.members[cleanTarget];
@@ -3891,30 +3886,30 @@ app.post("/faction/manage", requireToken, async (req, res) => {
       });
     }
 
-    if (act === "SET_CAPANGA") {
+    if (act === "SET_ENFORCER" || act === "SET_CAPANGA") {
       if (cleanTarget === fac.leaderUuid) {
-        return res.json({ status: "ERROR", message: "Não é possível rebaixar o líder diretamente." });
+        return res.json({ status: "ERROR", message: "Cannot demote the leader directly." });
       }
-      targetMember.role = "capanga";
+      targetMember.role = "enforcer";
       if (cleanTargetName) targetMember.legacyName = cleanTargetName;
       fac.updatedAt = now;
       await saveFaction(fac);
 
       return res.json({
         status: "OK",
-        action: act,
+        action: "SET_ENFORCER",
         factionId: fac.id,
         factionName: fac.name,
         targetUuid: cleanTarget,
         targetName: targetMember.legacyName,
-        newRole: "capanga",
+        newRole: "enforcer",
         memberCount: Object.keys(fac.members).length
       });
     }
 
     if (act === "SET_SUBLEADER") {
       if (actorRole !== "leader") {
-        return res.json({ status: "ERROR", message: "Apenas o líder pode promover alguém a sublíder." });
+        return res.json({ status: "ERROR", message: "Only the leader can promote someone to Sub-Leader." });
       }
       targetMember.role = "subleader";
       if (cleanTargetName) targetMember.legacyName = cleanTargetName;
@@ -3935,13 +3930,12 @@ app.post("/faction/manage", requireToken, async (req, res) => {
 
     if (act === "SET_LEADER") {
       if (actorRole !== "leader") {
-        return res.json({ status: "ERROR", message: "Apenas o líder atual pode transferir a liderança." });
+        return res.json({ status: "ERROR", message: "Only the current leader can transfer leadership." });
       }
 
       const finalTargetName = cleanTargetName || targetMember.legacyName;
       const newPassword = generateFactionPassword(cleanTarget, now);
 
-      // Antigo líder vira sublíder automaticamente e perde acesso ao site
       fac.members[cleanActor].role = "subleader";
       targetMember.role = "leader";
       targetMember.legacyName = finalTargetName;
@@ -3968,11 +3962,11 @@ app.post("/faction/manage", requireToken, async (req, res) => {
       });
     }
 
-    return res.status(400).json({ status: "ERROR", message: "Ação desconhecida." });
+    return res.status(400).json({ status: "ERROR", message: "Unknown action." });
   });
 });
 
-// 7. LSL: consulta quem domina a parcela atual
+// 7. LSL: query current parcel owner
 app.get("/faction/parcel-status", requireToken, (req, res) => {
   const parcelUuid = String(req.query.parcelUuid || "").trim().toLowerCase();
   if (!parcelUuid) return res.status(400).json({ status: "ERROR" });
@@ -3993,7 +3987,7 @@ app.get("/faction/parcel-status", requireToken, (req, res) => {
   });
 });
 
-// 8. LSL: registra conquista de parcela + contorno preciso + cor térmica + centro da logo
+// 8. LSL: register parcel conquest + exact borders + thermal color + logo center
 app.post("/faction/conquer", requireToken, async (req, res) => {
   const { factionId, winnerUuid, regionName, regionCorner, parcelUuid, parcelName, area, gridRows } = req.body;
   const cleanParcel = String(parcelUuid || "").trim().toLowerCase();
@@ -4001,14 +3995,14 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
   const cleanFacId = String(factionId || "").trim();
 
   if (!isValidUuid(cleanParcel) || !cleanFacId) {
-    return res.status(400).json({ status: "ERROR", message: "Dados de conquista inválidos." });
+    return res.status(400).json({ status: "ERROR", message: "Invalid conquest payload." });
   }
 
   await withLock(`FACTION_PARCEL_${cleanParcel}`, async () => {
     const fac = FACTIONS.get(cleanFacId);
-    if (!fac) return res.json({ status: "ERROR", message: "Facção não encontrada." });
+    if (!fac) return res.json({ status: "ERROR", message: "Faction not found." });
     if (cleanWinner && !fac.members[cleanWinner]) {
-      return res.json({ status: "ERROR", message: "Jogador vencedor não pertence a esta facção." });
+      return res.json({ status: "ERROR", message: "Winner does not belong to this faction." });
     }
 
     const now = getUnixTime();
@@ -4060,27 +4054,26 @@ app.post("/faction/conquer", requireToken, async (req, res) => {
 });
 
 // ========================================================
-// GFNF WEBSITE ENDPOINTS (MAPA + PAINEL DO LÍDER)
+// STREET CONQUESTERS WEBSITE ENDPOINTS
 // ========================================================
 
 function authenticateFactionLeader(legacyName, password) {
   const lookup = normalizeLegacyName(legacyName).toLowerCase();
-  const pass = String(password || "").trim();
+  const pass = String(password || "").trim().toUpperCase();
   if (!lookup || !pass) return null;
 
   const facId = FACTION_BY_LEADER_NAME.get(lookup);
   if (!facId) return null;
   const fac = FACTIONS.get(facId);
-  if (!fac || fac.password !== pass) return null;
+  if (!fac || String(fac.password || "").toUpperCase() !== pass) return null;
   return fac;
 }
 
-// 9. Website: login exclusivo do líder atual
 app.post("/faction/web/login", (req, res) => {
   const { legacyName, password } = req.body;
   const fac = authenticateFactionLeader(legacyName, password);
   if (!fac) {
-    return res.status(401).json({ status: "ERROR", message: "Credenciais inválidas ou você não é mais o líder da facção." });
+    return res.status(401).json({ status: "ERROR", message: "Invalid credentials or you are no longer the faction leader." });
   }
 
   const parcels = [];
@@ -4098,19 +4091,18 @@ app.post("/faction/web/login", (req, res) => {
   });
 });
 
-// 10. Website: líder altera nome/logo
 app.post("/faction/web/update", async (req, res) => {
   const { legacyName, password, factionName, logo } = req.body;
   const fac = authenticateFactionLeader(legacyName, password);
-  if (!fac) return res.status(401).json({ status: "ERROR", message: "Não autorizado." });
+  if (!fac) return res.status(401).json({ status: "ERROR", message: "Unauthorized." });
 
   await withLock("FACTION_GLOBAL_LOCK", async () => {
     if (factionName !== undefined) {
       const cleanName = sanitizeFactionName(factionName);
-      if (cleanName.length < 2) return res.status(400).json({ status: "ERROR", message: "Nome muito curto." });
+      if (cleanName.length < 2) return res.status(400).json({ status: "ERROR", message: "Faction name is too short." });
       for (const f of FACTIONS.values()) {
         if (f.id !== fac.id && f.name.toLowerCase() === cleanName.toLowerCase()) {
-          return res.status(400).json({ status: "ERROR", message: "Nome já em uso." });
+          return res.status(400).json({ status: "ERROR", message: "Faction name already in use." });
         }
       }
       fac.name = cleanName;
@@ -4121,7 +4113,7 @@ app.post("/faction/web/update", async (req, res) => {
 
     if (logo !== undefined) {
       const parsedLogo = sanitizeFactionLogo(logo);
-      if (parsedLogo === null) return res.status(400).json({ status: "ERROR", message: "Logo inválida." });
+      if (parsedLogo === null) return res.status(400).json({ status: "ERROR", message: "Invalid logo format." });
       fac.logo = parsedLogo;
       for (const p of FACTION_PARCELS.values()) {
         if (p.factionId === fac.id) { p.factionLogo = fac.logo; await saveFactionParcel(p); }
@@ -4134,11 +4126,10 @@ app.post("/faction/web/update", async (req, res) => {
   });
 });
 
-// 11. Website: líder gerencia membros (KICK, SET_SUBLEADER, SET_CAPANGA, SET_LEADER)
 app.post("/faction/web/manage", async (req, res) => {
   const { legacyName, password, targetUuid, action } = req.body;
   const fac = authenticateFactionLeader(legacyName, password);
-  if (!fac) return res.status(401).json({ status: "ERROR", message: "Não autorizado." });
+  if (!fac) return res.status(401).json({ status: "ERROR", message: "Unauthorized." });
 
   const cleanTarget = String(targetUuid || "").trim().toLowerCase();
   const act = String(action || "").toUpperCase().trim();
@@ -4146,7 +4137,7 @@ app.post("/faction/web/manage", async (req, res) => {
   await withLock("FACTION_GLOBAL_LOCK", async () => {
     const member = fac.members[cleanTarget];
     if (!member || cleanTarget === fac.leaderUuid) {
-      return res.status(400).json({ status: "ERROR", message: "Membro alvo inválido." });
+      return res.status(400).json({ status: "ERROR", message: "Invalid target member." });
     }
 
     const now = getUnixTime();
@@ -4154,8 +4145,8 @@ app.post("/faction/web/manage", async (req, res) => {
       delete fac.members[cleanTarget];
     } else if (act === "SET_SUBLEADER") {
       member.role = "subleader";
-    } else if (act === "SET_CAPANGA") {
-      member.role = "capanga";
+    } else if (act === "SET_ENFORCER" || act === "SET_CAPANGA") {
+      member.role = "enforcer";
     } else if (act === "SET_LEADER") {
       const oldLeader = fac.leaderUuid;
       const newPassword = generateFactionPassword(cleanTarget, now);
@@ -4173,7 +4164,7 @@ app.post("/faction/web/manage", async (req, res) => {
         newLeaderPassword: newPassword
       });
     } else {
-      return res.status(400).json({ status: "ERROR", message: "Ação inválida." });
+      return res.status(400).json({ status: "ERROR", message: "Invalid action." });
     }
 
     fac.updatedAt = now;
@@ -4182,11 +4173,10 @@ app.post("/faction/web/manage", async (req, res) => {
   });
 });
 
-// 12. Website: líder deleta a facção
 app.post("/faction/web/delete", async (req, res) => {
   const { legacyName, password } = req.body;
   const fac = authenticateFactionLeader(legacyName, password);
-  if (!fac) return res.status(401).json({ status: "ERROR", message: "Não autorizado." });
+  if (!fac) return res.status(401).json({ status: "ERROR", message: "Unauthorized." });
 
   await withLock("FACTION_GLOBAL_LOCK", async () => {
     await deleteFactionFromDb(fac.id);
@@ -4194,7 +4184,6 @@ app.post("/faction/web/delete", async (req, res) => {
   });
 });
 
-// 13. Website Público: dados completos para o mapa interativo (polígonos, cores, logos e membros)
 app.get("/faction/web/map", (req, res) => {
   const factions = [];
   for (const fac of FACTIONS.values()) {
@@ -4212,7 +4201,6 @@ app.get("/faction/web/map", (req, res) => {
   });
 });
 
-// 14. Website Público: listagem de facções com contagem de membros
 app.get("/faction/web/factions", (req, res) => {
   const factions = [];
   for (const fac of FACTIONS.values()) {
@@ -4221,6 +4209,8 @@ app.get("/faction/web/factions", (req, res) => {
   factions.sort((a, b) => b.memberCount - a.memberCount);
   res.json({ status: "OK", factions });
 });
+
+//////////////////////////////////////////////////////////////////////////////////////////
 
 app.get("/", (req, res) => res.json({ status: "ok" }));
 app.listen(PORT, () => console.log("API running on port", PORT));
